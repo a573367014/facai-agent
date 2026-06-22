@@ -1,0 +1,21 @@
+{
+  "name": "fastify-react-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @agent/api",
+    "dev:api": "npm run dev -w @agent/api",
+    "dev:web": "npm run dev -w @agent/web",
+    "build": "npm run build -w @agent/api && npm run build -w @agent/web",
+    "test": "npm run test -w @agent/api && npm run test -w @agent/web",
+    "typecheck": "npm run typecheck -w @agent/api && npm run typecheck -w @agent/web"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
