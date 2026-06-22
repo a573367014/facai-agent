@@ -1,4 +1,4 @@
-# Fastify React Agent
+# facai-agent
 
 一个基于 Node.js Fastify 和 React 的工具调用型 Agent Demo。
 
