@@ -1,9 +1,12 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 
 const originalFetch = globalThis.fetch;
+const stylesPath = join(process.cwd(), "src/styles.css");
 
 function createSseResponse(events: string[]): Response {
   const encoder = new TextEncoder();
@@ -26,13 +29,15 @@ function createStoredSseResponse(runId: string, events: Array<Record<string, unk
       start(controller) {
         const blocks = events
           .map((event, index) => {
+            const seq = index + 1;
             const storedEvent = {
-              id: index + 1,
+              id: `event_${seq}`,
+              seq,
               runId,
               event,
               createdAt: "2026-06-22T00:00:00.000Z"
             };
-            return `id: ${index + 1}\ndata: ${JSON.stringify(storedEvent)}\n\n`;
+            return `id: ${seq}\ndata: ${JSON.stringify(storedEvent)}\n\n`;
           })
           .join("");
         controller.enqueue(encoder.encode(blocks));
@@ -46,10 +51,18 @@ afterEach(() => {
   cleanup();
   globalThis.fetch = originalFetch;
   localStorage.clear();
+  window.history.replaceState(null, "", "/");
   vi.restoreAllMocks();
 });
 
 describe("App", () => {
+  it("消息列让对话面板铺满可用高度", () => {
+    const styles = readFileSync(stylesPath, "utf8");
+
+    expect(styles).toMatch(/\.response-column\s*{[^}]*grid-template-rows:\s*minmax\(0,\s*1fr\);/s);
+    expect(styles).not.toContain("grid-template-rows: auto minmax(0, 1fr)");
+  });
+
   it("使用全屏三栏工作台布局", () => {
     globalThis.fetch = vi.fn().mockResolvedValueOnce({
       ok: true
@@ -61,9 +74,11 @@ describe("App", () => {
     expect(container.querySelector(".control-column")).toBeInTheDocument();
     expect(container.querySelector(".response-column")).toBeInTheDocument();
     expect(container.querySelector(".trace-column")).toBeInTheDocument();
+    expect(screen.queryByText("Runtime")).not.toBeInTheDocument();
   });
 
-  it("提交任务并展示回答和步骤", async () => {
+  it("提交任务并展示回答和可折叠工具过程", async () => {
+    window.history.replaceState(null, "", "/");
     globalThis.fetch = vi
       .fn()
       .mockResolvedValueOnce({
@@ -104,6 +119,28 @@ describe("App", () => {
               {
                 id: 1,
                 runId: "run_1",
+                event: {
+                  type: "tool_start",
+                  iteration: 0,
+                  toolName: "calculator",
+                  arguments: { expression: "12 * 9" }
+                },
+                createdAt: "2026-06-22T00:00:00.500Z"
+              },
+              {
+                id: 2,
+                runId: "run_1",
+                event: {
+                  type: "tool_result",
+                  iteration: 0,
+                  toolName: "calculator",
+                  result: { value: 108 }
+                },
+                createdAt: "2026-06-22T00:00:00.800Z"
+              },
+              {
+                id: 3,
+                runId: "run_1",
                 event: { type: "final_answer", answer: "结果是 108", steps },
                 createdAt: "2026-06-22T00:00:01.000Z"
               }
@@ -119,8 +156,50 @@ describe("App", () => {
     await userEvent.click(screen.getByRole("button", { name: "运行" }));
 
     await waitFor(() => expect(screen.getAllByText("结果是 108").length).toBeGreaterThan(0));
-    expect(screen.getByText("calculator")).toBeInTheDocument();
+    expect(window.location.search).toBe("?sessionId=session_1");
+    expect(screen.getByText("工具过程")).toBeInTheDocument();
+    expect(screen.queryByText("工具步骤")).not.toBeInTheDocument();
     expect(screen.getAllByText(/"expression": "12 \* 9"/).length).toBeGreaterThan(0);
+  });
+
+  it("打开带 sessionId 的地址时优先恢复 URL 里的会话", async () => {
+    window.history.replaceState(null, "", "/?sessionId=session_from_url");
+    localStorage.setItem("agent.sessionId", "session_from_storage");
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          session: {
+            id: "session_from_url",
+            title: "URL 会话",
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:00.000Z"
+          },
+          runs: [
+            {
+              id: "run_from_url",
+              sessionId: "session_from_url",
+              input: "从 URL 恢复",
+              status: "completed",
+              answer: "URL 会话回答",
+              steps: [],
+              createdAt: "2026-06-22T00:00:00.000Z",
+              updatedAt: "2026-06-22T00:00:01.000Z",
+              completedAt: "2026-06-22T00:00:01.000Z"
+            }
+          ]
+        })
+      } as Response);
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("URL 会话回答")).toBeInTheDocument());
+    expect(localStorage.getItem("agent.sessionId")).toBe("session_from_url");
+    expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/sessions/session_from_url");
   });
 
   it("流式运行并展示 trace 时间线", async () => {
@@ -178,7 +257,7 @@ describe("App", () => {
     expect(screen.getByText("工具结果：calculator")).toBeInTheDocument();
   });
 
-  it("流式运行时用 answer_delta 实时展示答案", async () => {
+  it("流式运行时用 answer_chunk 实时展示答案", async () => {
     globalThis.fetch = vi
       .fn()
       .mockResolvedValueOnce({
@@ -188,7 +267,7 @@ describe("App", () => {
         ok: true,
         json: async () => ({
           session: { id: "session_1" },
-          run: { id: "run_1", sessionId: "session_1", status: "running", input: "你好" }
+          run: { id: "run_1", sessionId: "session_1", status: "running", input: "用户问题" }
         })
       } as Response)
       .mockResolvedValueOnce(
@@ -196,8 +275,7 @@ describe("App", () => {
           { type: "iteration_start", iteration: 0 },
           { type: "agent_state", iteration: 0, state: "thinking", label: "模型思考中" },
           { type: "llm_start", iteration: 0 },
-          { type: "answer_delta", iteration: 0, delta: "你" },
-          { type: "answer_delta", iteration: 0, delta: "好" }
+          { type: "answer_chunk", iteration: 0, text: "分块答案" }
         ])
       );
 
@@ -205,7 +283,7 @@ describe("App", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "流式运行" }));
 
-    await waitFor(() => expect(screen.getAllByText("你好").length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getAllByText("分块答案").length).toBeGreaterThan(0));
     expect(screen.getByText("请求模型")).toBeInTheDocument();
   });
 
@@ -239,17 +317,11 @@ describe("App", () => {
             {
               id: 2,
               runId: "run_1",
-              event: { type: "answer_delta", iteration: 0, delta: "恢" },
+              event: { type: "answer_chunk", iteration: 0, text: "恢复" },
               createdAt: "2026-06-22T00:00:00.000Z"
             },
             {
               id: 3,
-              runId: "run_1",
-              event: { type: "answer_delta", iteration: 0, delta: "复" },
-              createdAt: "2026-06-22T00:00:00.000Z"
-            },
-            {
-              id: 4,
               runId: "run_1",
               event: { type: "final_answer", answer: "恢复", steps: [] },
               createdAt: "2026-06-22T00:00:00.000Z"

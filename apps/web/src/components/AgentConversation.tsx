@@ -1,7 +1,6 @@
 import { Bot, CircleAlert, Loader2, UserRound, Wrench } from "lucide-react";
 import { useEffect, useRef } from "react";
 import type { AgentState, AgentStep, AgentStreamEvent } from "../api/agent-client";
-import { AgentSteps } from "./AgentSteps";
 
 export type ChatMessageStatus = "running" | "completed" | "failed";
 
@@ -140,7 +139,7 @@ export function AgentConversation({ messages, isActive, error }: AgentConversati
                 <div className="chat-avatar" aria-hidden="true">
                   {message.role === "user" ? <UserRound size={18} /> : <Bot size={18} />}
                 </div>
-                <div className="chat-content">
+                <div className={`chat-content ${message.role}`}>
                   <div className={`chat-bubble ${message.role}`}>
                     <div className="chat-meta">
                       <strong>{message.role === "user" ? "你" : "Agent"}</strong>
@@ -162,25 +161,23 @@ export function AgentConversation({ messages, isActive, error }: AgentConversati
                     ) : null}
 
                     {toolEvents.length > 0 ? (
-                      <div className="tool-events">
-                        <div className="tool-events-title">
-                          <Wrench size={14} />
-                          工具过程
+                      <details className="tool-events">
+                        <summary className="tool-events-title">
+                          <span className="tool-events-label">
+                            <Wrench size={14} />
+                            工具过程
+                          </span>
+                          <span className="tool-events-count">{toolEvents.length}</span>
+                        </summary>
+                        <div className="tool-events-body">
+                          {toolEvents.map((event, index) => (
+                            <details className="tool-event" key={`${event.type}-${index}`}>
+                              <summary>{getToolEventText(event)}</summary>
+                              <pre>{JSON.stringify(getToolEventPayload(event), null, 2)}</pre>
+                            </details>
+                          ))}
                         </div>
-                        {toolEvents.map((event, index) => (
-                          <details className="tool-event" key={`${event.type}-${index}`}>
-                            <summary>{getToolEventText(event)}</summary>
-                            <pre>{JSON.stringify(getToolEventPayload(event), null, 2)}</pre>
-                          </details>
-                        ))}
-                      </div>
-                    ) : null}
-
-                    {message.role === "assistant" && message.steps?.length ? (
-                      <div className="tool-section compact-tools">
-                        <div className="section-title">工具步骤</div>
-                        <AgentSteps steps={message.steps} />
-                      </div>
+                      </details>
                     ) : null}
                   </div>
                 </div>

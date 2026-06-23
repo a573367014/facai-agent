@@ -109,7 +109,9 @@ function formatSseEvent(event: AgentStreamEvent): string {
 }
 
 function formatStoredSseEvent(event: StoredAgentEvent): string {
-  return `id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`;
+  // SSE 协议里的 id 是断线续传游标。这里用 seq，而不是事件唯一 id，
+  // 因为客户端的 after 参数表达的是“从第几个事件之后继续”。
+  return `id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`;
 }
 
 function isTerminalStoredEvent(event: StoredAgentEvent): boolean {
@@ -193,7 +195,9 @@ export async function registerAgentRoutes(
 
     reply.raw.writeHead(200, buildSseHeaders(reply.getHeaders()));
 
-    const sentEventIds = new Set<number>();
+    // 同一个请求会先回放历史事件，再订阅实时事件。
+    // 如果回放和订阅边界刚好撞上，用 seq 去重可以避免重复推送。
+    const sentEventSeqs = new Set<number>();
     let ended = false;
     let unsubscribe = () => {};
     const finish = () => {
@@ -206,11 +210,12 @@ export async function registerAgentRoutes(
       reply.raw.end();
     };
     const writeStoredEvent = (event: StoredAgentEvent) => {
-      if (ended || event.id <= after || sentEventIds.has(event.id)) {
+      // after 是客户端已经收到的最后一个 seq，只发送 seq 更大的事件。
+      if (ended || event.seq <= after || sentEventSeqs.has(event.seq)) {
         return;
       }
 
-      sentEventIds.add(event.id);
+      sentEventSeqs.add(event.seq);
       reply.raw.write(formatStoredSseEvent(event));
 
       if (isTerminalStoredEvent(event)) {

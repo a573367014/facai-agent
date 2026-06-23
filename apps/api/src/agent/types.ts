@@ -57,6 +57,7 @@ export type AgentStreamEvent =
   | { type: "agent_state"; iteration: number; state: AgentState; label: string }
   | { type: "llm_start"; iteration: number }
   | { type: "answer_delta"; iteration: number; delta: string }
+  | { type: "answer_chunk"; iteration: number; text: string }
   | { type: "llm_response"; iteration: number; content?: string; toolCalls?: ToolCall[] }
   | { type: "tool_call_ready"; iteration: number; toolCallId: string; toolName: string; arguments: JsonObject }
   | { type: "tool_start"; iteration: number; toolName: string; arguments: JsonObject }

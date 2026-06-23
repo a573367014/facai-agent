@@ -1,8 +1,7 @@
 import { AppError } from "../errors/app-error.js";
 import type { AgentService } from "./agent-service.js";
 import type { AgentErrorDetail, AgentMessage, AgentRunInput } from "./types.js";
-import type { AgentRunEventListener } from "./run-store.js";
-import { InMemoryAgentRunStore } from "./run-store.js";
+import type { AgentRunEventListener, AgentRunStore } from "./run-store.js";
 
 function toErrorDetail(error: unknown): AgentErrorDetail {
   if (error instanceof AppError) {
@@ -18,7 +17,7 @@ function toErrorDetail(error: unknown): AgentErrorDetail {
 export class AgentRunCoordinator {
   constructor(
     private readonly agentService: AgentService,
-    private readonly store: InMemoryAgentRunStore
+    private readonly store: AgentRunStore
   ) {}
 
   createSession(title?: string) {

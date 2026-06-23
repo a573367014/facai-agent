@@ -156,10 +156,55 @@ describe("agent routes", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.headers["content-type"]).toContain("text/event-stream");
-    expect(response.body).toContain("id:");
+    expect(response.body).toContain("id: 1");
+    expect(response.body).toContain("\"id\":\"event_");
+    expect(response.body).toContain("\"seq\":");
     expect(response.body).toContain(`"runId":"${run.id}"`);
     expect(response.body).toContain("\"type\":\"final_answer\"");
     expect(response.body).toContain("\"answer\":\"测试回答\"");
+  });
+
+  it("GET /agents/runs/:runId/events 会把高频 answer_delta 合并成 answer_chunk", async () => {
+    const deltaParts = ["这", "是", "一", "段", "需", "要", "合", "并", "的", "流", "式", "回", "答"];
+    const registry = new ToolRegistry();
+    const provider: LlmProvider = {
+      complete: async () => {
+        throw new Error("streaming path should be used");
+      },
+      completeStream: async (_request, onDelta) => {
+        for (const part of deltaParts) {
+          await onDelta(part);
+        }
+
+        return { content: deltaParts.join("") };
+      }
+    };
+    const app = await buildApp({
+      agentService: new AgentService({ provider, toolRegistry: registry, defaultMaxIterations: 4 })
+    });
+    const createResponse = await app.inject({
+      method: "POST",
+      url: "/agents/runs",
+      payload: { input: "生成一段话" }
+    });
+    const { run } = createResponse.json() as { run: { id: string } };
+
+    await waitForRun(app, run.id);
+
+    const snapshotResponse = await app.inject({
+      method: "GET",
+      url: `/agents/runs/${run.id}`
+    });
+    const snapshot = snapshotResponse.json() as {
+      events: Array<{ event: { type: string; text?: string; delta?: string } }>;
+    };
+    const answerDeltaEvents = snapshot.events.filter((event) => event.event.type === "answer_delta");
+    const answerChunkEvents = snapshot.events.filter((event) => event.event.type === "answer_chunk");
+
+    expect(answerDeltaEvents).toEqual([]);
+    expect(answerChunkEvents.length).toBeGreaterThan(0);
+    expect(answerChunkEvents.length).toBeLessThan(deltaParts.length);
+    expect(answerChunkEvents.map((event) => event.event.text).join("")).toBe(deltaParts.join(""));
   });
 
   it("同一 session 的后续 run 会带上历史问答", async () => {

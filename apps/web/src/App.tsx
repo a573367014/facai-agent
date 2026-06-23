@@ -12,13 +12,13 @@ import {
 import { AgentConversation, type ChatMessage } from "./components/AgentConversation";
 import { AgentTimeline } from "./components/AgentTimeline";
 import { AgentRunForm } from "./components/AgentRunForm";
-import { AgentRunOverview } from "./components/AgentRunOverview";
 import "./styles.css";
 
 const defaultInput = "计算 12 * 9，然后告诉我现在几点";
 const activeRunIdKey = "agent.activeRunId";
-const activeEventIdKey = "agent.activeEventId";
+const activeEventSeqKey = "agent.activeEventSeq";
 const sessionIdKey = "agent.sessionId";
+const sessionIdQueryKey = "sessionId";
 
 function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === "AbortError";
@@ -98,6 +98,33 @@ function wait(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function readSessionIdFromUrl(): string | undefined {
+  const sessionId = new URLSearchParams(window.location.search).get(sessionIdQueryKey)?.trim();
+  return sessionId || undefined;
+}
+
+function writeSessionIdToUrl(sessionId: string) {
+  const url = new URL(window.location.href);
+
+  if (url.searchParams.get(sessionIdQueryKey) === sessionId) {
+    return;
+  }
+
+  url.searchParams.set(sessionIdQueryKey, sessionId);
+  window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function clearSessionIdFromUrl(sessionId?: string) {
+  const url = new URL(window.location.href);
+
+  if (sessionId && url.searchParams.get(sessionIdQueryKey) !== sessionId) {
+    return;
+  }
+
+  url.searchParams.delete(sessionIdQueryKey);
+  window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
 async function waitForRunResult(runId: string): Promise<AgentRunDetailResponse> {
   for (let attempt = 0; attempt < 80; attempt += 1) {
     const snapshot = await getAgentRun(runId);
@@ -141,11 +168,14 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const sessionId = localStorage.getItem(sessionIdKey);
+    const sessionId = readSessionIdFromUrl() ?? localStorage.getItem(sessionIdKey) ?? undefined;
 
     if (!sessionId) {
       return;
     }
+
+    localStorage.setItem(sessionIdKey, sessionId);
+    writeSessionIdToUrl(sessionId);
 
     let cancelled = false;
 
@@ -158,6 +188,7 @@ export default function App() {
       .catch((sessionError) => {
         if (!cancelled) {
           localStorage.removeItem(sessionIdKey);
+          clearSessionIdFromUrl(sessionId);
           setError(sessionError instanceof Error ? sessionError.message : "会话恢复失败");
         }
       });
@@ -190,6 +221,7 @@ export default function App() {
           return;
         }
 
+        rememberSession(snapshot.run.sessionId);
         setMessages((currentMessages) => replaceRunMessages(currentMessages, createRunMessages(snapshot.run)));
         setEvents([]);
 
@@ -201,7 +233,7 @@ export default function App() {
           applyStoredEvent(storedEvent);
         }
 
-        const lastEventId = snapshot.events[snapshot.events.length - 1]?.id ?? 0;
+        const lastEventSeq = snapshot.events[snapshot.events.length - 1]?.seq ?? 0;
 
         if (snapshot.run.status !== "running") {
           clearActiveRun();
@@ -210,7 +242,7 @@ export default function App() {
 
         await streamAgentRunEvents(
           runId,
-          lastEventId,
+          lastEventSeq,
           (storedEvent) => {
             if (!cancelled) {
               applyStoredEvent(storedEvent);
@@ -239,7 +271,12 @@ export default function App() {
 
   function clearActiveRun() {
     localStorage.removeItem(activeRunIdKey);
-    localStorage.removeItem(activeEventIdKey);
+    localStorage.removeItem(activeEventSeqKey);
+  }
+
+  function rememberSession(sessionId: string) {
+    localStorage.setItem(sessionIdKey, sessionId);
+    writeSessionIdToUrl(sessionId);
   }
 
   function upsertRun(run: AgentRunRecord) {
@@ -259,10 +296,10 @@ export default function App() {
       updateAssistantMessage(runId, (message) => {
         const nextEvents = [...(message.events ?? []), event];
 
-        if (event.type === "answer_delta") {
+        if (event.type === "answer_delta" || event.type === "answer_chunk") {
           return {
             ...message,
-            content: message.content + event.delta,
+            content: message.content + (event.type === "answer_delta" ? event.delta : event.text),
             status: "running",
             events: nextEvents
           };
@@ -307,18 +344,19 @@ export default function App() {
   }
 
   function applyStoredEvent(storedEvent: StoredAgentEvent) {
-    localStorage.setItem(activeEventIdKey, String(storedEvent.id));
+    localStorage.setItem(activeEventSeqKey, String(storedEvent.seq));
     applyAgentEvent(storedEvent.event, storedEvent.runId);
   }
 
   async function startRunWithCurrentSession(submittedInput: string) {
-    const sessionId = localStorage.getItem(sessionIdKey) ?? undefined;
+    const sessionId = readSessionIdFromUrl() ?? localStorage.getItem(sessionIdKey) ?? undefined;
 
     try {
       return await startAgentRun(submittedInput, maxIterations, sessionId);
     } catch (error) {
       if (sessionId) {
         localStorage.removeItem(sessionIdKey);
+        clearSessionIdFromUrl(sessionId);
         return startAgentRun(submittedInput, maxIterations);
       }
 
@@ -339,7 +377,7 @@ export default function App() {
 
     try {
       const { session, run } = await startRunWithCurrentSession(submittedInput);
-      localStorage.setItem(sessionIdKey, session.id);
+      rememberSession(session.id);
       upsertRun(run);
       setInput("");
 
@@ -377,9 +415,9 @@ export default function App() {
 
     try {
       const { session, run } = await startRunWithCurrentSession(submittedInput);
-      localStorage.setItem(sessionIdKey, session.id);
+      rememberSession(session.id);
       localStorage.setItem(activeRunIdKey, run.id);
-      localStorage.setItem(activeEventIdKey, "0");
+      localStorage.setItem(activeEventSeqKey, "0");
       upsertRun(run);
       setInput("");
       await streamAgentRunEvents(run.id, 0, applyStoredEvent);
@@ -415,7 +453,6 @@ export default function App() {
         </aside>
 
         <section className="response-column">
-          <AgentRunOverview events={events} isActive={isRunning || isStreaming} />
           <AgentConversation messages={messages} isActive={isRunning || isStreaming} error={error} />
         </section>
 

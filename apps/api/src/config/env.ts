@@ -6,7 +6,9 @@ const envSchema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_BASE_URL: z.string().url().default("https://api.openai.com/v1"),
   OPENAI_MODEL: z.string().optional(),
-  AGENT_MAX_ITERATIONS: z.coerce.number().int().min(1).max(8).default(4)
+  AGENT_MAX_ITERATIONS: z.coerce.number().int().min(1).max(8).default(4),
+  AGENT_STORE: z.enum(["memory", "sqlite"]).default("memory"),
+  AGENT_SQLITE_PATH: z.string().default("./data/agent.sqlite")
 });
 
 export type Env = z.infer<typeof envSchema>;

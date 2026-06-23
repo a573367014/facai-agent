@@ -48,6 +48,7 @@ export type AgentStreamEvent =
   | { type: "agent_state"; iteration: number; state: AgentState; label: string }
   | { type: "llm_start"; iteration: number }
   | { type: "answer_delta"; iteration: number; delta: string }
+  | { type: "answer_chunk"; iteration: number; text: string }
   | { type: "llm_response"; iteration: number; content?: string; toolCalls?: ToolCallPayload[] }
   | { type: "tool_call_ready"; iteration: number; toolCallId: string; toolName: string; arguments: Record<string, unknown> }
   | { type: "tool_start"; iteration: number; toolName: string; arguments: Record<string, unknown> }
@@ -57,7 +58,8 @@ export type AgentStreamEvent =
   | { type: "error"; code: string; message: string };
 
 export interface StoredAgentEvent {
-  id: number;
+  id: string;
+  seq: number;
   runId: string;
   event: AgentStreamEvent;
   createdAt: string;

@@ -6,7 +6,8 @@ const originalFetch = globalThis.fetch;
 function createStoredSseResponse(runId: string): Response {
   const encoder = new TextEncoder();
   const storedEvent = {
-    id: 1,
+    id: "event_1",
+    seq: 1,
     runId,
     event: { type: "answer_delta", iteration: 0, delta: "恢复中" },
     createdAt: "2026-06-22T00:00:00.000Z"
@@ -58,7 +59,8 @@ describe("main", () => {
             },
             events: [
               {
-                id: 1,
+                id: "event_1",
+                seq: 1,
                 runId: "run_1",
                 event: { type: "answer_delta", iteration: 0, delta: "恢复中" },
                 createdAt: "2026-06-22T00:00:00.000Z"

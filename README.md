@@ -13,6 +13,8 @@
 
 - `OPENAI_API_KEY`
 - `OPENAI_MODEL`
+- `AGENT_STORE`：`memory` 或 `sqlite`
+- `AGENT_SQLITE_PATH`：SQLite 文件路径，默认 `./data/agent.sqlite`
 
 ## 安装
 
@@ -22,13 +24,19 @@ npm install
 
 ## 开发
 
-启动 API：
+同时启动 API 和 Web：
+
+```bash
+npm run dev
+```
+
+也可以单独启动 API：
 
 ```bash
 npm run dev:api
 ```
 
-启动 Web：
+单独启动 Web：
 
 ```bash
 npm run dev:web

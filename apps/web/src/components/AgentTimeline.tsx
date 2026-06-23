@@ -16,6 +16,8 @@ function getEventTitle(event: AgentStreamEvent): string {
       return "请求模型";
     case "answer_delta":
       return "答案片段";
+    case "answer_chunk":
+      return "答案合并片段";
     case "llm_response":
       return "模型响应";
     case "tool_call_ready":
@@ -37,6 +39,8 @@ function getEventSummary(event: AgentStreamEvent): string {
   switch (event.type) {
     case "answer_delta":
       return event.delta;
+    case "answer_chunk":
+      return event.text;
     case "llm_response":
       return event.toolCalls?.length ? `返回 ${event.toolCalls.length} 个工具调用` : "返回自然语言内容";
     case "tool_call_ready":
