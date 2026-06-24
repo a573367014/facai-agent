@@ -96,12 +96,13 @@ AgentService
 export interface ToolDefinition {
   name: string;
   description: string;
-  parameters: z.ZodTypeAny;
+  parameters: Record<string, unknown>;
+  argumentSchema?: z.ZodTypeAny;
   execute: (input: unknown, context: ToolExecutionContext) => Promise<unknown> | unknown;
 }
 ```
 
-`parameters` 使用 zod schema，既能生成给 LLM 的 JSON schema，也能在真正执行前做运行时校验。
+`parameters` 保留为给 LLM 的 JSON schema，确保 OpenAI-compatible tools payload 不需要额外转换。`argumentSchema` 使用 zod，在真正执行前做运行时校验。
 
 ### 执行上下文
 

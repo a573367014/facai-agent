@@ -1,8 +1,26 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import { AgentService } from "../../src/agent/agent-service.js";
 import type { AgentStreamEvent } from "../../src/agent/types.js";
 import type { LlmProvider } from "../../src/providers/types.js";
+import { ToolAccessPolicy } from "../../src/tools/access-policy.js";
+import { ToolExecutor } from "../../src/tools/executor.js";
 import { ToolRegistry } from "../../src/tools/registry.js";
+
+function createAgentService(
+  provider: LlmProvider,
+  registry: ToolRegistry,
+  defaultMaxIterations = 4,
+  toolAccessPolicy?: ToolAccessPolicy
+) {
+  return new AgentService({
+    provider,
+    toolRegistry: registry,
+    toolAccessPolicy,
+    toolExecutor: new ToolExecutor({ registry, timeoutMs: 100, accessPolicy: toolAccessPolicy }),
+    defaultMaxIterations
+  });
+}
 
 describe("AgentService", () => {
   it("执行工具调用并返回最终答案", async () => {
@@ -32,7 +50,7 @@ describe("AgentService", () => {
       }
     };
 
-    const service = new AgentService({ provider, toolRegistry: registry, defaultMaxIterations: 4 });
+    const service = createAgentService(provider, registry);
 
     await expect(service.run({ input: "计算 12 * 9" })).resolves.toEqual({
       answer: "结果是 108。",
@@ -44,6 +62,38 @@ describe("AgentService", () => {
           result: { value: 108 }
         }
       ]
+    });
+  });
+
+  it("只把权限策略允许的工具暴露给 provider", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "calculator",
+      description: "calculator",
+      parameters: { type: "object", properties: {} },
+      execute: async () => ({ value: 1 })
+    });
+    registry.register({
+      name: "dangerous_tool",
+      description: "dangerous",
+      parameters: { type: "object", properties: {} },
+      execute: async () => ({ ok: true })
+    });
+    const provider: LlmProvider = {
+      complete: async ({ tools }) => ({
+        content: tools.map((tool) => tool.name).join(",")
+      })
+    };
+    const service = createAgentService(
+      provider,
+      registry,
+      4,
+      new ToolAccessPolicy({ allowedToolNames: ["calculator"] })
+    );
+
+    await expect(service.run({ input: "有哪些工具" })).resolves.toEqual({
+      answer: "calculator",
+      steps: []
     });
   });
 
@@ -60,7 +110,7 @@ describe("AgentService", () => {
       parameters: { type: "object", properties: {} },
       execute: async () => ({ ok: true })
     });
-    const service = new AgentService({ provider, toolRegistry: registry, defaultMaxIterations: 1 });
+    const service = createAgentService(provider, registry, 1);
 
     await expect(service.run({ input: "一直调用工具" })).rejects.toMatchObject({
       code: "AGENT_MAX_ITERATIONS",
@@ -72,15 +122,93 @@ describe("AgentService", () => {
     const provider: LlmProvider = {
       complete: async () => ({})
     };
-    const service = new AgentService({
-      provider,
-      toolRegistry: new ToolRegistry(),
-      defaultMaxIterations: 4
-    });
+    const service = createAgentService(provider, new ToolRegistry());
 
     await expect(service.run({ input: "空响应" })).rejects.toMatchObject({
       code: "PROVIDER_BAD_RESPONSE",
       message: "模型响应缺少最终回答或工具调用"
+    });
+  });
+
+  it("可恢复工具错误会作为 tool 观察结果回灌给 provider", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "echo",
+      description: "echo",
+      parameters: {
+        type: "object",
+        properties: { text: { type: "string" } },
+        required: ["text"]
+      },
+      argumentSchema: z.object({ text: z.string().min(1) }),
+      execute: async (args) => ({ text: args.text })
+    });
+    const observedToolContents: string[] = [];
+    const provider: LlmProvider = {
+      complete: async ({ messages }) => {
+        const toolMessages = messages.filter((message) => message.role === "tool");
+
+        if (toolMessages.length > 0) {
+          observedToolContents.push(...toolMessages.map((message) => message.content));
+          return { content: "工具参数不合法，请补充 text 后再试。" };
+        }
+
+        return {
+          toolCalls: [
+            {
+              id: "call_1",
+              name: "echo",
+              arguments: {}
+            }
+          ]
+        };
+      }
+    };
+    const events: AgentStreamEvent[] = [];
+    const service = createAgentService(provider, registry);
+
+    await expect(
+      service.run({
+        input: "调用 echo",
+        onEvent: (event) => {
+          events.push(event);
+        }
+      })
+    ).resolves.toEqual({
+      answer: "工具参数不合法，请补充 text 后再试。",
+      steps: []
+    });
+    expect(JSON.parse(observedToolContents[0])).toEqual({
+      ok: false,
+      error: {
+        code: "TOOL_INVALID_ARGUMENTS",
+        message: "工具 echo 的参数不合法",
+        recoverable: true
+      }
+    });
+    expect(events).toContainEqual({
+      type: "tool_error",
+      iteration: 0,
+      toolCallId: "call_1",
+      toolName: "echo",
+      durationMs: expect.any(Number),
+      error: {
+        code: "TOOL_INVALID_ARGUMENTS",
+        message: "工具 echo 的参数不合法",
+        recoverable: true
+      }
+    });
+    expect(events).toContainEqual({
+      type: "agent_state",
+      iteration: 0,
+      state: "observing",
+      label: "工具错误已写回上下文"
+    });
+    expect(events).not.toContainEqual({
+      type: "agent_state",
+      iteration: 0,
+      state: "failed",
+      label: "工具执行失败"
     });
   });
 
@@ -111,7 +239,7 @@ describe("AgentService", () => {
       }
     };
     const events: AgentStreamEvent[] = [];
-    const service = new AgentService({ provider, toolRegistry: registry, defaultMaxIterations: 4 });
+    const service = createAgentService(provider, registry);
 
     await service.run({
       input: "计算 12 * 9",
@@ -146,6 +274,14 @@ describe("AgentService", () => {
       toolCallId: "call_1",
       toolName: "calculator",
       arguments: { expression: "12 * 9" }
+    });
+    expect(events).toContainEqual({
+      type: "tool_result",
+      iteration: 0,
+      toolCallId: "call_1",
+      toolName: "calculator",
+      result: { value: 108 },
+      durationMs: expect.any(Number)
     });
     expect(events.at(-1)).toMatchObject({
       type: "final_answer",
@@ -185,7 +321,7 @@ describe("AgentService", () => {
       }
     };
     const events: AgentStreamEvent[] = [];
-    const service = new AgentService({ provider, toolRegistry: registry, defaultMaxIterations: 4 });
+    const service = createAgentService(provider, registry);
 
     const result = await service.run({
       input: "计算 12 * 9",
@@ -246,7 +382,7 @@ describe("AgentService", () => {
       })
     };
     const events: AgentStreamEvent[] = [];
-    const service = new AgentService({ provider, toolRegistry: registry, defaultMaxIterations: 4 });
+    const service = createAgentService(provider, registry);
 
     await expect(
       service.run({
@@ -264,10 +400,13 @@ describe("AgentService", () => {
     expect(events).toContainEqual({
       type: "tool_error",
       iteration: 0,
+      toolCallId: "call_1",
       toolName: "calculator",
+      durationMs: expect.any(Number),
       error: {
         code: "TOOL_EXECUTION_ERROR",
-        message: "除数不能为 0"
+        message: "除数不能为 0",
+        recoverable: false
       }
     });
     expect(events).toContainEqual({

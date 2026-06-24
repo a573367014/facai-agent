@@ -1,0 +1,150 @@
+import { ZodError } from "zod";
+import { AppError } from "../errors/app-error.js";
+import { ToolAccessPolicy } from "./access-policy.js";
+import type { ToolRegistry } from "./registry.js";
+import type { JsonObject, ToolExecutionInput, ToolExecutionResult } from "./types.js";
+
+export interface ToolExecutorOptions {
+  registry: ToolRegistry;
+  timeoutMs: number;
+  accessPolicy?: ToolAccessPolicy;
+}
+
+type TimedExecutionResult =
+  | { type: "success"; data: unknown }
+  | { type: "failure"; error: unknown }
+  | { type: "timeout" };
+
+// ToolExecutor 是工具运行时边界：AgentService 不直接执行工具，
+// 而是把工具名、参数和上下文交给这里统一治理。
+// 以后要加权限、审计、重试、取消，都优先放在这一层，而不是塞回 AgentService。
+export class ToolExecutor {
+  private readonly accessPolicy: ToolAccessPolicy;
+
+  constructor(private readonly options: ToolExecutorOptions) {
+    this.accessPolicy = options.accessPolicy ?? ToolAccessPolicy.allowAll();
+  }
+
+  async execute(input: ToolExecutionInput): Promise<ToolExecutionResult> {
+    const startedAt = Date.now();
+    const tool = this.options.registry.getTool(input.toolName);
+
+    // 未知工具通常说明模型产生了不可执行的 tool call。
+    // 这里返回结构化失败，而不是 throw，方便 AgentService 发出 tool_error 事件。
+    if (!tool) {
+      return this.toFailure(startedAt, "TOOL_NOT_FOUND", `未找到工具：${input.toolName}`, false);
+    }
+
+    if (!this.accessPolicy.canUse(input.toolName)) {
+      const error = this.accessPolicy.explainDenied(input.toolName);
+
+      // 权限拒绝要发生在参数校验和 execute 之前，否则一个被禁用的工具仍然可能泄露校验细节，
+      // 或在未来加入副作用工具时出现“先做了一点事再被拒绝”的风险。
+      return this.toFailure(startedAt, error.code, error.message, error.recoverable);
+    }
+
+    let parsedArguments: JsonObject;
+
+    try {
+      // parameters 是给模型看的 JSON Schema，argumentSchema 才是后端真正执行前的校验。
+      // 这一步把“不可信的模型参数”收敛成工具可以相信的 parsedArguments。
+      parsedArguments = tool.argumentSchema ? (tool.argumentSchema.parse(input.arguments) as JsonObject) : input.arguments;
+    } catch (error) {
+      if (error instanceof ZodError) {
+        // 参数错通常可恢复：模型还有机会根据错误换一组参数再调用。
+        return this.toFailure(startedAt, "TOOL_INVALID_ARGUMENTS", `工具 ${input.toolName} 的参数不合法`, true);
+      }
+
+      return this.toFailure(startedAt, "TOOL_EXECUTION_ERROR", this.toMessage(error), false);
+    }
+
+    const controller = new AbortController();
+    const cancelFromParent = () => controller.abort();
+
+    // 外层 signal 预留给后续 run cancel。外层取消时，这里同步取消当前工具；
+    // 如果外层已经取消，也立即把内部 controller 标记为 aborted。
+    if (input.signal?.aborted) {
+      controller.abort();
+    } else {
+      input.signal?.addEventListener("abort", cancelFromParent, { once: true });
+    }
+
+    // Promise.resolve().then(...) 可以同时包住同步工具和异步工具：
+    // 同步 throw 会进入 catch，异步 reject 也会进入 catch，调用方拿到统一结果。
+    const execution = Promise.resolve()
+      .then(() =>
+        tool.execute(parsedArguments, {
+          runId: input.runId,
+          sessionId: input.sessionId,
+          toolCallId: input.toolCallId,
+          signal: controller.signal
+        })
+      )
+      .then<TimedExecutionResult>((data) => ({ type: "success", data }))
+      .catch<TimedExecutionResult>((error) => ({ type: "failure", error }));
+
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    // 超时不是强杀 JavaScript 任务，而是先触发 AbortSignal，再让 race 返回 timeout。
+    // 工具如果支持 context.signal，就能主动停止网络请求、文件读取等耗时操作。
+    const timeout = new Promise<TimedExecutionResult>((resolve) => {
+      timeoutId = setTimeout(() => {
+        controller.abort();
+        resolve({ type: "timeout" });
+      }, this.options.timeoutMs);
+    });
+
+    // 谁先结束就采用谁的结果：工具成功/失败，或者超时。
+    const result = await Promise.race([execution, timeout]);
+
+    // 不论 race 谁赢，都要清理定时器和父 signal 监听，避免长时间运行后堆积监听器。
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+    input.signal?.removeEventListener("abort", cancelFromParent);
+
+    if (result.type === "success") {
+      return {
+        ok: true,
+        data: result.data,
+        durationMs: this.durationSince(startedAt)
+      };
+    }
+
+    if (result.type === "timeout") {
+      // 超时标记为 recoverable，是因为 Agent 后续可以选择换工具、缩小请求范围或提示用户重试。
+      return this.toFailure(startedAt, "TOOL_TIMEOUT", `工具 ${input.toolName} 执行超时`, true);
+    }
+
+    if (result.error instanceof AppError) {
+      // 工具内部主动抛出的 AppError 保留原始 code/message，避免丢掉业务语义。
+      return this.toFailure(startedAt, result.error.code, result.error.message, false);
+    }
+
+    return this.toFailure(startedAt, "TOOL_EXECUTION_ERROR", this.toMessage(result.error), false);
+  }
+
+  private toFailure(
+    startedAt: number,
+    code: string,
+    message: string,
+    recoverable: boolean
+  ): Extract<ToolExecutionResult, { ok: false }> {
+    return {
+      ok: false,
+      error: {
+        code,
+        message,
+        recoverable
+      },
+      durationMs: this.durationSince(startedAt)
+    };
+  }
+
+  private durationSince(startedAt: number) {
+    return Math.max(0, Date.now() - startedAt);
+  }
+
+  private toMessage(error: unknown) {
+    return error instanceof Error ? error.message : "工具执行失败";
+  }
+}

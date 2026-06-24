@@ -1,17 +1,6 @@
-import type { ZodTypeAny } from "zod";
+import type { JsonObject, ToolDefinition } from "../tools/types.js";
 
-export type JsonObject = Record<string, unknown>;
-
-export interface ToolDefinition {
-  name: string;
-  description: string;
-  parameters: JsonObject;
-}
-
-export interface RegisteredTool extends ToolDefinition {
-  argumentSchema?: ZodTypeAny;
-  execute: (args: JsonObject) => Promise<unknown>;
-}
+export type { JsonObject, RegisteredTool, ToolDefinition } from "../tools/types.js";
 
 export interface ToolCall {
   id: string;
@@ -49,6 +38,9 @@ export type AgentState = "thinking" | "calling_tool" | "observing" | "answering"
 export interface AgentErrorDetail {
   code: string;
   message: string;
+  // recoverable 表示“这不是系统终止级错误，LLM 还有机会根据错误观察继续回复或改参重试”。
+  // 例如参数不合法、积分不足适合 recoverable=true；数据库挂了、工具内部异常通常是 false。
+  recoverable?: boolean;
 }
 
 export type AgentStreamEvent =
@@ -60,8 +52,8 @@ export type AgentStreamEvent =
   | { type: "answer_chunk"; iteration: number; text: string }
   | { type: "llm_response"; iteration: number; content?: string; toolCalls?: ToolCall[] }
   | { type: "tool_call_ready"; iteration: number; toolCallId: string; toolName: string; arguments: JsonObject }
-  | { type: "tool_start"; iteration: number; toolName: string; arguments: JsonObject }
-  | { type: "tool_result"; iteration: number; toolName: string; result: unknown }
-  | { type: "tool_error"; iteration: number; toolName: string; error: AgentErrorDetail }
+  | { type: "tool_start"; iteration: number; toolCallId?: string; toolName: string; arguments: JsonObject }
+  | { type: "tool_result"; iteration: number; toolCallId?: string; toolName: string; result: unknown; durationMs?: number }
+  | { type: "tool_error"; iteration: number; toolCallId?: string; toolName: string; durationMs?: number; error: AgentErrorDetail }
   | { type: "final_answer"; answer: string; steps: AgentStep[] }
   | { type: "error"; code: string; message: string };

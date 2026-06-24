@@ -77,6 +77,18 @@ describe("App", () => {
     expect(screen.queryByText("Runtime")).not.toBeInTheDocument();
   });
 
+  it("使用护眼暖色主题变量", () => {
+    const styles = readFileSync(stylesPath, "utf8");
+
+    expect(styles).toContain("--eye-page: #fff2c6;");
+    expect(styles).toContain("--eye-surface: #fff8df;");
+    expect(styles).toContain("--eye-border: #eadfaf;");
+    expect(styles).toContain("--eye-primary: #247a73;");
+    expect(styles).toMatch(/body\s*{[^}]*background:\s*var\(--eye-page\);/s);
+    expect(styles).toMatch(/\.panel\s*{[^}]*background:\s*var\(--eye-surface\);/s);
+    expect(styles).toMatch(/\.primary-button\s*{[^}]*background:\s*var\(--eye-primary\);/s);
+  });
+
   it("提交任务并展示回答和可折叠工具过程", async () => {
     window.history.replaceState(null, "", "/");
     globalThis.fetch = vi
@@ -232,14 +244,17 @@ describe("App", () => {
           {
             type: "tool_start",
             iteration: 0,
+            toolCallId: "call_1",
             toolName: "calculator",
             arguments: { expression: "12 * 9" }
           },
           {
             type: "tool_result",
             iteration: 0,
+            toolCallId: "call_1",
             toolName: "calculator",
-            result: { value: 108 }
+            result: { value: 108 },
+            durationMs: 7
           },
           { type: "final_answer", answer: "结果是 108。", steps: [] }
         ])
@@ -255,6 +270,7 @@ describe("App", () => {
     expect(screen.getByText("准备工具：calculator")).toBeInTheDocument();
     expect(screen.getByText("调用工具：calculator")).toBeInTheDocument();
     expect(screen.getByText("工具结果：calculator")).toBeInTheDocument();
+    expect(screen.getAllByText(/耗时 7ms/).length).toBeGreaterThan(0);
   });
 
   it("流式运行时用 answer_chunk 实时展示答案", async () => {

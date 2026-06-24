@@ -1,17 +1,25 @@
-import { AppError } from "../errors/app-error.js";
+import { AppError, type AppErrorCode } from "../errors/app-error.js";
 import type { LlmProvider } from "../providers/types.js";
+import { ToolAccessPolicy } from "../tools/access-policy.js";
+import type { ToolExecutor } from "../tools/executor.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { SYSTEM_INSTRUCTIONS } from "./instructions.js";
-import type { AgentErrorDetail, AgentMessage, AgentRunInput, AgentRunResult, AgentStep, AgentStreamEvent } from "./types.js";
+import type { AgentMessage, AgentRunInput, AgentRunResult, AgentStep, AgentStreamEvent } from "./types.js";
 
 export interface AgentServiceOptions {
   provider: LlmProvider;
   toolRegistry: ToolRegistry;
+  toolExecutor: ToolExecutor;
+  toolAccessPolicy?: ToolAccessPolicy;
   defaultMaxIterations: number;
 }
 
 export class AgentService {
-  constructor(private readonly options: AgentServiceOptions) {}
+  private readonly toolAccessPolicy: ToolAccessPolicy;
+
+  constructor(private readonly options: AgentServiceOptions) {
+    this.toolAccessPolicy = options.toolAccessPolicy ?? ToolAccessPolicy.allowAll();
+  }
 
   async run(input: AgentRunInput): Promise<AgentRunResult> {
     const maxIterations = input.maxIterations ?? this.options.defaultMaxIterations;
@@ -21,19 +29,11 @@ export class AgentService {
       { role: "user", content: input.input }
     ];
     const steps: AgentStep[] = [];
-    const tools = this.options.toolRegistry.getDefinitions();
+    // LLM 只能看到当前策略允许的工具。这里不是唯一安全边界，
+    // ToolExecutor 执行前还会再检查一次；双层处理能同时减少误调用和阻止越权执行。
+    const tools = this.toolAccessPolicy.filterDefinitions(this.options.toolRegistry.getDefinitions());
     const emit = async (event: AgentStreamEvent) => {
       await input.onEvent?.(event);
-    };
-    const toErrorDetail = (error: unknown): AgentErrorDetail => {
-      if (error instanceof AppError) {
-        return { code: error.code, message: error.message };
-      }
-
-      return {
-        code: "TOOL_EXECUTION_ERROR",
-        message: error instanceof Error ? error.message : "工具执行失败"
-      };
     };
 
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
@@ -77,51 +77,91 @@ export class AgentService {
       }
 
       messages.push({ role: "assistant", content: response.content, toolCalls: response.toolCalls });
+      let hasSuccessfulToolResult = false;
+      let hasRecoverableToolError = false;
 
       for (const toolCall of response.toolCalls) {
         await emit({ type: "agent_state", iteration, state: "calling_tool", label: `调用工具 ${toolCall.name}` });
         await emit({
           type: "tool_start",
           iteration,
+          toolCallId: toolCall.id,
           toolName: toolCall.name,
           arguments: toolCall.arguments
         });
-        let result: unknown;
+        // AgentService 只编排 Agent 流程，不直接校验/执行工具。
+        // 工具治理细节交给 ToolExecutor，这样后续加权限、超时、取消时不会把这里写胖。
+        const execution = await this.options.toolExecutor.execute({
+          toolCallId: toolCall.id,
+          toolName: toolCall.name,
+          arguments: toolCall.arguments
+        });
 
-        try {
-          result = await this.options.toolRegistry.execute(toolCall.name, toolCall.arguments);
-        } catch (error) {
+        if (!execution.ok) {
+          // 工具失败也是 trace 的一部分，所以先发 tool_error，让前端和持久化都能看到失败细节。
+          // 随后抛 AppError，交给外层 run coordinator 把本次 run 标记为 failed。
           await emit({
             type: "tool_error",
             iteration,
+            toolCallId: toolCall.id,
             toolName: toolCall.name,
-            error: toErrorDetail(error)
+            durationMs: execution.durationMs,
+            error: execution.error
           });
-          await emit({ type: "agent_state", iteration, state: "failed", label: "工具执行失败" });
-          throw error;
+
+          if (!execution.error.recoverable) {
+            await emit({ type: "agent_state", iteration, state: "failed", label: "工具执行失败" });
+            throw new AppError(execution.error.code as AppErrorCode, execution.error.message, 500);
+          }
+
+          hasRecoverableToolError = true;
+          // 可恢复失败不是 run 的终点，而是一次“工具观察结果”。
+          // 例如参数不合法、积分不足这类情况，LLM 需要知道失败原因，再把它整合成用户能理解的话。
+          // UI 仍然依赖 tool_error 事件展示结构化操作，比如购买按钮；LLM 只负责自然语言解释。
+          messages.push({
+            role: "tool",
+            toolCallId: toolCall.id,
+            name: toolCall.name,
+            content: JSON.stringify({
+              ok: false,
+              error: execution.error
+            })
+          });
+          continue;
         }
 
+        hasSuccessfulToolResult = true;
         steps.push({
           type: "tool_call",
           toolName: toolCall.name,
           arguments: toolCall.arguments,
-          result
+          result: execution.data
         });
         await emit({
           type: "tool_result",
           iteration,
+          toolCallId: toolCall.id,
           toolName: toolCall.name,
-          result
+          result: execution.data,
+          durationMs: execution.durationMs
         });
+        // 工具结果必须以 role=tool 写回 messages，再交给 LLM 继续推理。
+        // 前端看到 tool_result 只是运行过程展示；最终自然语言答案仍由 LLM 基于工具结果整合生成。
         messages.push({
           role: "tool",
           toolCallId: toolCall.id,
           name: toolCall.name,
-          content: JSON.stringify(result)
+          content: JSON.stringify(execution.data)
         });
       }
 
-      await emit({ type: "agent_state", iteration, state: "observing", label: "工具结果已写回上下文" });
+      const observationLabel =
+        hasRecoverableToolError && hasSuccessfulToolResult
+          ? "工具结果和错误已写回上下文"
+          : hasRecoverableToolError
+            ? "工具错误已写回上下文"
+            : "工具结果已写回上下文";
+      await emit({ type: "agent_state", iteration, state: "observing", label: observationLabel });
       await emit({ type: "iteration_end", iteration, outcome: "tool_calls" });
     }
 

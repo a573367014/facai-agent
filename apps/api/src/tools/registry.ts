@@ -1,7 +1,7 @@
-import { ZodError } from "zod";
-import type { JsonObject, RegisteredTool, ToolDefinition } from "../agent/types.js";
-import { AppError } from "../errors/app-error.js";
+import type { RegisteredTool, ToolDefinition } from "./types.js";
 
+// ToolRegistry 只是“工具目录”：负责登记工具、按名称查工具、给 LLM 暴露工具定义。
+// 它不负责执行、超时、错误包装；这些运行时职责放在 ToolExecutor。
 export class ToolRegistry {
   private readonly tools = new Map<string, RegisteredTool>();
 
@@ -9,35 +9,17 @@ export class ToolRegistry {
     this.tools.set(tool.name, tool);
   }
 
+  getTool(name: string): RegisteredTool | undefined {
+    return this.tools.get(name);
+  }
+
+  // 给模型的定义只包含 name/description/parameters。
+  // execute、argumentSchema 是后端内部能力，不能出现在 LLM tools payload 里。
   getDefinitions(): ToolDefinition[] {
     return [...this.tools.values()].map(({ name, description, parameters }) => ({
       name,
       description,
       parameters
     }));
-  }
-
-  async execute(name: string, args: JsonObject): Promise<unknown> {
-    const tool = this.tools.get(name);
-
-    if (!tool) {
-      throw new AppError("TOOL_NOT_FOUND", `未找到工具：${name}`, 404);
-    }
-
-    try {
-      const parsedArgs = tool.argumentSchema ? tool.argumentSchema.parse(args) : args;
-      return await tool.execute(parsedArgs as JsonObject);
-    } catch (error) {
-      if (error instanceof AppError) {
-        throw error;
-      }
-
-      if (error instanceof ZodError) {
-        throw new AppError("TOOL_ARGUMENT_INVALID", `工具 ${name} 的参数不合法`, 400);
-      }
-
-      const message = error instanceof Error ? error.message : "工具执行失败";
-      throw new AppError("TOOL_EXECUTION_ERROR", message, 500);
-    }
   }
 }

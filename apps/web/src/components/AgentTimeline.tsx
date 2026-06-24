@@ -47,9 +47,15 @@ function getEventSummary(event: AgentStreamEvent): string {
     case "tool_start":
       return JSON.stringify(event.arguments);
     case "tool_result":
-      return JSON.stringify(event.result);
+      return [event.durationMs !== undefined ? `耗时 ${event.durationMs}ms` : null, JSON.stringify(event.result)].filter(Boolean).join(" · ");
     case "tool_error":
-      return `${event.error.code}: ${event.error.message}`;
+      return [
+        event.durationMs !== undefined ? `耗时 ${event.durationMs}ms` : null,
+        event.error.recoverable !== undefined ? (event.error.recoverable ? "可恢复" : "不可恢复") : null,
+        `${event.error.code}: ${event.error.message}`
+      ]
+        .filter(Boolean)
+        .join(" · ");
     case "final_answer":
       return event.answer;
     case "error":

@@ -3,14 +3,24 @@ import type { FastifyInstance } from "fastify";
 import { AgentService } from "../../src/agent/agent-service.js";
 import { buildApp } from "../../src/app.js";
 import type { LlmProvider } from "../../src/providers/types.js";
+import { ToolExecutor } from "../../src/tools/executor.js";
 import { ToolRegistry } from "../../src/tools/registry.js";
+
+function createAgentService(provider: LlmProvider, registry: ToolRegistry): AgentService {
+  return new AgentService({
+    provider,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({ registry, timeoutMs: 100 }),
+    defaultMaxIterations: 4
+  });
+}
 
 function createTestAgentService(): AgentService {
   const registry = new ToolRegistry();
   const provider: LlmProvider = {
     complete: async () => ({ content: "测试回答" })
   };
-  return new AgentService({ provider, toolRegistry: registry, defaultMaxIterations: 4 });
+  return createAgentService(provider, registry);
 }
 
 async function waitForRun(app: FastifyInstance, runId: string) {
@@ -180,7 +190,7 @@ describe("agent routes", () => {
       }
     };
     const app = await buildApp({
-      agentService: new AgentService({ provider, toolRegistry: registry, defaultMaxIterations: 4 })
+      agentService: createAgentService(provider, registry)
     });
     const createResponse = await app.inject({
       method: "POST",
@@ -217,7 +227,7 @@ describe("agent routes", () => {
       }
     };
     const app = await buildApp({
-      agentService: new AgentService({ provider, toolRegistry: registry, defaultMaxIterations: 4 })
+      agentService: createAgentService(provider, registry)
     });
 
     const firstResponse = await app.inject({

@@ -1,5 +1,7 @@
 import { Bot, CircleAlert, Loader2, UserRound, Wrench } from "lucide-react";
 import { useEffect, useRef } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { AgentState, AgentStep, AgentStreamEvent } from "../api/agent-client";
 
 export type ChatMessageStatus = "running" | "completed" | "failed";
@@ -47,9 +49,9 @@ function getToolEventText(event: AgentStreamEvent): string {
     case "tool_start":
       return `调用 ${event.toolName}`;
     case "tool_result":
-      return `${event.toolName} 返回结果`;
+      return event.durationMs !== undefined ? `${event.toolName} 返回结果（${event.durationMs}ms）` : `${event.toolName} 返回结果`;
     case "tool_error":
-      return `${event.toolName} 执行失败`;
+      return event.durationMs !== undefined ? `${event.toolName} 执行失败（${event.durationMs}ms）` : `${event.toolName} 执行失败`;
     default:
       return "";
   }
@@ -63,7 +65,10 @@ function getToolEventPayload(event: AgentStreamEvent): unknown {
     case "tool_result":
       return event.result;
     case "tool_error":
-      return event.error;
+      return {
+        ...event.error,
+        recoverable: event.error.recoverable ?? false
+      };
     default:
       return null;
   }
@@ -91,6 +96,24 @@ function AssistantStatus({ message, isActive }: { message: ChatMessage; isActive
   }
 
   return null;
+}
+
+function MessageContent({ message, showCursor }: { message: ChatMessage; showCursor: boolean }) {
+  if (message.role === "assistant") {
+    return (
+      <div className="markdown-body">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+        {showCursor ? <span className="typing-cursor" aria-hidden="true" /> : null}
+      </div>
+    );
+  }
+
+  return (
+    <p className="chat-text">
+      {message.content}
+      {showCursor ? <span className="typing-cursor" aria-hidden="true" /> : null}
+    </p>
+  );
 }
 
 export function AgentConversation({ messages, isActive, error }: AgentConversationProps) {
@@ -149,10 +172,7 @@ export function AgentConversation({ messages, isActive, error }: AgentConversati
                     {message.error ? <div className="error-box inline-error">{message.error}</div> : null}
 
                     {message.content ? (
-                      <p className="chat-text">
-                        {message.content}
-                        {showCursor ? <span className="typing-cursor" aria-hidden="true" /> : null}
-                      </p>
+                      <MessageContent message={message} showCursor={showCursor} />
                     ) : message.role === "assistant" && message.status === "running" ? (
                       <p className="chat-text muted-live">
                         正在思考

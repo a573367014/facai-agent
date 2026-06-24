@@ -1,7 +1,7 @@
 import { Parser } from "expr-eval";
 import { z } from "zod";
-import type { RegisteredTool } from "../agent/types.js";
 import { AppError } from "../errors/app-error.js";
+import type { RegisteredTool } from "./types.js";
 
 const calculatorArgsSchema = z.object({
   expression: z.string().min(1)

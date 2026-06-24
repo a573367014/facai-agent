@@ -6,6 +6,7 @@ import { AgentService } from "../../src/agent/agent-service.js";
 import { SqliteAgentRunStore } from "../../src/agent/sqlite-run-store.js";
 import { buildApp } from "../../src/app.js";
 import type { LlmProvider } from "../../src/providers/types.js";
+import { ToolExecutor } from "../../src/tools/executor.js";
 import { ToolRegistry } from "../../src/tools/registry.js";
 
 let tempDirs: string[] = [];
@@ -28,7 +29,12 @@ function createTestAgentService(): AgentService {
   const provider: LlmProvider = {
     complete: async () => ({ content: "测试回答" })
   };
-  return new AgentService({ provider, toolRegistry: registry, defaultMaxIterations: 4 });
+  return new AgentService({
+    provider,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({ registry, timeoutMs: 100 }),
+    defaultMaxIterations: 4
+  });
 }
 
 describe("SqliteAgentRunStore", () => {

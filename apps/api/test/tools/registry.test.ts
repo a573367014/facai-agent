@@ -1,12 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { z } from "zod";
-import { AppError } from "../../src/errors/app-error.js";
+import { createDefaultToolRegistry } from "../../src/tools/index.js";
 import { ToolRegistry } from "../../src/tools/registry.js";
 
 describe("ToolRegistry", () => {
-  it("注册并执行工具", async () => {
+  it("注册工具并暴露模型可用定义", () => {
     const registry = new ToolRegistry();
-    registry.register({
+    const tool = {
       name: "echo",
       description: "Echo input",
       parameters: {
@@ -15,38 +14,33 @@ describe("ToolRegistry", () => {
         required: ["text"]
       },
       execute: async (args) => ({ text: String(args.text) })
-    });
+    };
 
-    await expect(registry.execute("echo", { text: "hi" })).resolves.toEqual({ text: "hi" });
-    expect(registry.getDefinitions()).toHaveLength(1);
+    registry.register(tool);
+
+    expect(registry.getTool("echo")).toBe(tool);
+    expect(registry.getDefinitions()).toEqual([
+      {
+        name: "echo",
+        description: "Echo input",
+        parameters: {
+          type: "object",
+          properties: { text: { type: "string" } },
+          required: ["text"]
+        }
+      }
+    ]);
   });
 
-  it("未知工具返回 TOOL_NOT_FOUND", async () => {
-    const registry = new ToolRegistry();
-
-    await expect(registry.execute("missing", {})).rejects.toMatchObject<AppError>({
-      code: "TOOL_NOT_FOUND",
-      message: "未找到工具：missing"
-    });
-  });
-
-  it("统一校验工具参数", async () => {
-    const registry = new ToolRegistry();
-    registry.register({
-      name: "echo",
-      description: "Echo input",
-      parameters: {
-        type: "object",
-        properties: { text: { type: "string" } },
-        required: ["text"]
-      },
-      argumentSchema: z.object({ text: z.string().min(1) }),
-      execute: async (args) => ({ text: args.text })
+  it("配置 Tavily Key 后注册 web_search 工具", () => {
+    const withoutSearch = createDefaultToolRegistry();
+    const withSearch = createDefaultToolRegistry({
+      tavilyApiKey: "tvly-test",
+      searchMaxResults: 5
     });
 
-    await expect(registry.execute("echo", {})).rejects.toMatchObject<AppError>({
-      code: "TOOL_ARGUMENT_INVALID",
-      message: "工具 echo 的参数不合法"
-    });
+    expect(withoutSearch.getTool("web_search")).toBeUndefined();
+    expect(withSearch.getTool("web_search")).toBeDefined();
+    expect(withSearch.getDefinitions().map((tool) => tool.name)).toContain("web_search");
   });
 });

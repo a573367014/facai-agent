@@ -51,9 +51,16 @@ export type AgentStreamEvent =
   | { type: "answer_chunk"; iteration: number; text: string }
   | { type: "llm_response"; iteration: number; content?: string; toolCalls?: ToolCallPayload[] }
   | { type: "tool_call_ready"; iteration: number; toolCallId: string; toolName: string; arguments: Record<string, unknown> }
-  | { type: "tool_start"; iteration: number; toolName: string; arguments: Record<string, unknown> }
-  | { type: "tool_result"; iteration: number; toolName: string; result: unknown }
-  | { type: "tool_error"; iteration: number; toolName: string; error: { code: string; message: string } }
+  | { type: "tool_start"; iteration: number; toolCallId?: string; toolName: string; arguments: Record<string, unknown> }
+  | { type: "tool_result"; iteration: number; toolCallId?: string; toolName: string; result: unknown; durationMs?: number }
+  | {
+      type: "tool_error";
+      iteration: number;
+      toolCallId?: string;
+      toolName: string;
+      durationMs?: number;
+      error: { code: string; message: string; recoverable?: boolean };
+    }
   | { type: "final_answer"; answer: string; steps: AgentStep[] }
   | { type: "error"; code: string; message: string };
 

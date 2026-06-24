@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { RegisteredTool } from "../agent/types.js";
+import type { RegisteredTool } from "./types.js";
 
 const currentTimeArgsSchema = z.object({
   timezone: z.string().optional().default("UTC")
@@ -17,6 +17,7 @@ export const currentTimeTool: RegisteredTool = {
       }
     }
   },
+  argumentSchema: currentTimeArgsSchema,
   async execute(args) {
     const { timezone } = currentTimeArgsSchema.parse(args);
     const now = new Date();
