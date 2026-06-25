@@ -3,9 +3,6 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { AgentRunCoordinator } from "../agent/run-coordinator.js";
 import type { StoredAgentEvent } from "../agent/run-store.js";
-import type { AgentService } from "../agent/agent-service.js";
-import type { AgentStreamEvent } from "../agent/types.js";
-import type { AppErrorCode } from "../errors/app-error.js";
 import { AppError } from "../errors/app-error.js";
 
 const runRequestSchema = z.object({
@@ -88,26 +85,6 @@ function parseEventsQuery(query: unknown) {
   return parsed.data;
 }
 
-function toErrorEvent(error: unknown): AgentStreamEvent {
-  if (error instanceof AppError) {
-    return {
-      type: "error",
-      code: error.code,
-      message: error.message
-    };
-  }
-
-  return {
-    type: "error",
-    code: "PROVIDER_ERROR" satisfies AppErrorCode,
-    message: error instanceof Error ? error.message : "发生未知错误"
-  };
-}
-
-function formatSseEvent(event: AgentStreamEvent): string {
-  return `data: ${JSON.stringify(event)}\n\n`;
-}
-
 function formatStoredSseEvent(event: StoredAgentEvent): string {
   // SSE 协议里的 id 是断线续传游标。这里用 seq，而不是事件唯一 id，
   // 因为客户端的 after 参数表达的是“从第几个事件之后继续”。
@@ -115,7 +92,7 @@ function formatStoredSseEvent(event: StoredAgentEvent): string {
 }
 
 function isTerminalStoredEvent(event: StoredAgentEvent): boolean {
-  return event.event.type === "final_answer" || event.event.type === "error";
+  return event.event.type === "final_answer" || event.event.type === "error" || event.event.type === "cancelled";
 }
 
 function buildSseHeaders(headers: Record<string, number | string | string[] | undefined>): OutgoingHttpHeaders {
@@ -134,37 +111,14 @@ function buildSseHeaders(headers: Record<string, number | string | string[] | un
   return sseHeaders;
 }
 
-export async function registerAgentRoutes(
-  app: FastifyInstance,
-  agentService: AgentService,
-  runCoordinator: AgentRunCoordinator
-): Promise<void> {
-  app.post("/agents/run", async (request) => {
-    return agentService.run(parseRunRequest(request.body));
-  });
-
-  app.post("/agents/stream", async (request, reply) => {
-    const input = parseRunRequest(request.body);
-
-    reply.raw.writeHead(200, buildSseHeaders(reply.getHeaders()));
-
-    try {
-      await agentService.run({
-        ...input,
-        onEvent: (event) => {
-          reply.raw.write(formatSseEvent(event));
-        }
-      });
-    } catch (error) {
-      reply.raw.write(formatSseEvent(toErrorEvent(error)));
-    } finally {
-      reply.raw.end();
-    }
-  });
-
+export async function registerAgentRoutes(app: FastifyInstance, runCoordinator: AgentRunCoordinator): Promise<void> {
   app.post("/agents/sessions", async (request, reply) => {
     const { title } = parseSessionRequest(request.body);
     reply.status(201).send({ session: runCoordinator.createSession(title) });
+  });
+
+  app.get("/agents/sessions", async () => {
+    return runCoordinator.listSessions();
   });
 
   app.get("/agents/sessions/:sessionId", async (request) => {
@@ -186,6 +140,11 @@ export async function registerAgentRoutes(
   app.get("/agents/runs/:runId", async (request) => {
     const { runId } = parseRunParams(request.params);
     return runCoordinator.getRun(runId);
+  });
+
+  app.post("/agents/runs/:runId/cancel", async (request) => {
+    const { runId } = parseRunParams(request.params);
+    return runCoordinator.cancelRun(runId);
   });
 
   app.get("/agents/runs/:runId/events", async (request, reply) => {

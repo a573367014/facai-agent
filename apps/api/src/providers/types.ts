@@ -3,6 +3,7 @@ import type { AgentMessage, ToolCall, ToolDefinition } from "../agent/types.js";
 export interface LlmProviderRequest {
   messages: AgentMessage[];
   tools: ToolDefinition[];
+  signal?: AbortSignal;
 }
 
 export interface LlmProviderResponse {

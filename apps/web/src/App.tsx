@@ -1,23 +1,26 @@
-import { useEffect, useState } from "react";
+import { Box, Chip, Paper, Typography } from "@mui/material";
+import { useEffect, useRef, useState } from "react";
 import {
+  cancelAgentRun,
   getAgentRun,
   getAgentSession,
+  listAgentSessions,
   startAgentRun,
   streamAgentRunEvents,
-  type AgentRunDetailResponse,
   type AgentRunRecord,
+  type AgentSessionRecord,
   type AgentStreamEvent,
   type StoredAgentEvent
 } from "./api/agent-client";
 import { AgentConversation, type ChatMessage } from "./components/AgentConversation";
 import { AgentTimeline } from "./components/AgentTimeline";
 import { AgentRunForm } from "./components/AgentRunForm";
+import { SessionSidebar, type SessionHistoryItem } from "./components/SessionSidebar";
 import "./styles.css";
 
-const defaultInput = "计算 12 * 9，然后告诉我现在几点";
+const legacySessionIdKey = "agent.sessionId";
 const activeRunIdKey = "agent.activeRunId";
 const activeEventSeqKey = "agent.activeEventSeq";
-const sessionIdKey = "agent.sessionId";
 const sessionIdQueryKey = "sessionId";
 
 function isAbortError(error: unknown) {
@@ -27,6 +30,10 @@ function isAbortError(error: unknown) {
 function toAssistantStatus(run: AgentRunRecord): ChatMessage["status"] {
   if (run.status === "failed") {
     return "failed";
+  }
+
+  if (run.status === "cancelled") {
+    return "cancelled";
   }
 
   if (run.status === "completed") {
@@ -94,8 +101,14 @@ function replaceRunMessages(currentMessages: ChatMessage[], runMessages: ChatMes
   return [...currentMessages.filter((message) => message.runId !== runId), ...runMessages];
 }
 
-function wait(milliseconds: number) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+function compactTitle(value: string) {
+  const normalized = value.replace(/\s+/g, " ").trim();
+
+  if (normalized.length <= 24) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, 24)}...`;
 }
 
 function readSessionIdFromUrl(): string | undefined {
@@ -125,29 +138,30 @@ function clearSessionIdFromUrl(sessionId?: string) {
   window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
 }
 
-async function waitForRunResult(runId: string): Promise<AgentRunDetailResponse> {
-  for (let attempt = 0; attempt < 80; attempt += 1) {
-    const snapshot = await getAgentRun(runId);
-
-    if (snapshot.run.status !== "running") {
-      return snapshot;
-    }
-
-    await wait(250);
-  }
-
-  throw new Error("运行超时，请稍后查看会话结果");
+function buildHistoryItems(sessions: AgentSessionRecord[]): SessionHistoryItem[] {
+  return sessions.map((session) => ({
+    id: session.id,
+    title: compactTitle(session.title ?? "未命名会话")
+  }));
 }
 
 export default function App() {
-  const [input, setInput] = useState(defaultInput);
+  const [input, setInput] = useState("");
   const [maxIterations, setMaxIterations] = useState(4);
-  const [isRunning, setIsRunning] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [events, setEvents] = useState<AgentStreamEvent[]>([]);
   const [health, setHealth] = useState("检查中");
+  const [activeSessionId, setActiveSessionId] = useState<string | undefined>(() => readSessionIdFromUrl());
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [sessions, setSessions] = useState<AgentSessionRecord[]>([]);
+  const activeStreamControllerRef = useRef<AbortController | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    localStorage.removeItem(legacySessionIdKey);
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -168,27 +182,48 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const sessionId = readSessionIdFromUrl() ?? localStorage.getItem(sessionIdKey) ?? undefined;
+    let cancelled = false;
+
+    listAgentSessions()
+      .then(({ sessions }) => {
+        if (!cancelled) {
+          setSessions(sessions);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSessions([]);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const sessionId = readSessionIdFromUrl();
 
     if (!sessionId) {
       return;
     }
 
-    localStorage.setItem(sessionIdKey, sessionId);
+    setActiveSessionId(sessionId);
     writeSessionIdToUrl(sessionId);
 
     let cancelled = false;
 
     getAgentSession(sessionId)
-      .then(({ runs }) => {
+      .then(({ session, runs }) => {
         if (!cancelled) {
+          upsertSession(session);
           setMessages((currentMessages) => mergeMessages(buildMessagesFromRuns(runs), currentMessages));
         }
       })
       .catch((sessionError) => {
         if (!cancelled) {
-          localStorage.removeItem(sessionIdKey);
           clearSessionIdFromUrl(sessionId);
+          setActiveSessionId(undefined);
           setError(sessionError instanceof Error ? sessionError.message : "会话恢复失败");
         }
       });
@@ -211,6 +246,8 @@ export default function App() {
 
     async function recoverActiveRun() {
       setIsStreaming(true);
+      setActiveRunId(runId);
+      activeStreamControllerRef.current = controller;
       setError(null);
       setEvents([]);
 
@@ -257,6 +294,9 @@ export default function App() {
       } finally {
         if (!cancelled) {
           setIsStreaming(false);
+          if (activeStreamControllerRef.current === controller) {
+            activeStreamControllerRef.current = null;
+          }
         }
       }
     }
@@ -272,10 +312,25 @@ export default function App() {
   function clearActiveRun() {
     localStorage.removeItem(activeRunIdKey);
     localStorage.removeItem(activeEventSeqKey);
+    setActiveRunId(null);
+  }
+
+  function upsertSession(session: AgentSessionRecord) {
+    setSessions((currentSessions) => {
+      const withoutSession = currentSessions.filter((candidate) => candidate.id !== session.id);
+      return [session, ...withoutSession].sort((leftSession, rightSession) =>
+        rightSession.updatedAt.localeCompare(leftSession.updatedAt)
+      );
+    });
+  }
+
+  async function refreshSessions() {
+    const response = await listAgentSessions();
+    setSessions(response.sessions);
   }
 
   function rememberSession(sessionId: string) {
-    localStorage.setItem(sessionIdKey, sessionId);
+    setActiveSessionId(sessionId);
     writeSessionIdToUrl(sessionId);
   }
 
@@ -325,6 +380,15 @@ export default function App() {
           };
         }
 
+        if (event.type === "cancelled") {
+          return {
+            ...message,
+            status: "cancelled",
+            events: nextEvents,
+            error: undefined
+          };
+        }
+
         return {
           ...message,
           status: message.status === "completed" ? "completed" : "running",
@@ -341,6 +405,10 @@ export default function App() {
       setError(`${event.code}: ${event.message}`);
       clearActiveRun();
     }
+
+    if (event.type === "cancelled") {
+      clearActiveRun();
+    }
   }
 
   function applyStoredEvent(storedEvent: StoredAgentEvent) {
@@ -349,14 +417,14 @@ export default function App() {
   }
 
   async function startRunWithCurrentSession(submittedInput: string) {
-    const sessionId = readSessionIdFromUrl() ?? localStorage.getItem(sessionIdKey) ?? undefined;
+    const sessionId = activeSessionId ?? readSessionIdFromUrl();
 
     try {
       return await startAgentRun(submittedInput, maxIterations, sessionId);
     } catch (error) {
       if (sessionId) {
-        localStorage.removeItem(sessionIdKey);
         clearSessionIdFromUrl(sessionId);
+        setActiveSessionId(undefined);
         return startAgentRun(submittedInput, maxIterations);
       }
 
@@ -364,111 +432,184 @@ export default function App() {
     }
   }
 
-  async function handleRun() {
-    const submittedInput = input.trim();
-
-    if (!submittedInput) {
+  async function cancelActiveRun({ refreshAfterCancel = true, settleStreaming = true } = {}) {
+    if (!activeRunId) {
       return;
     }
 
-    setIsRunning(true);
-    setError(null);
-    setEvents([]);
+    const runId = activeRunId;
+    const controller = activeStreamControllerRef.current;
+
+    controller?.abort();
 
     try {
-      const { session, run } = await startRunWithCurrentSession(submittedInput);
-      rememberSession(session.id);
+      const { run } = await cancelAgentRun(runId);
       upsertRun(run);
-      setInput("");
-
-      const snapshot = await waitForRunResult(run.id);
-      const runEvents = snapshot.events.map((storedEvent) => storedEvent.event);
-      upsertRun(snapshot.run);
-      setEvents(runEvents);
-      updateAssistantMessage(run.id, (message) => ({
-        ...message,
-        events: runEvents
-      }));
-
-      if (snapshot.run.status === "failed") {
-        setError(snapshot.run.error ? `${snapshot.run.error.code}: ${snapshot.run.error.message}` : "运行失败");
-      }
-    } catch (runError) {
-      const message = runError instanceof Error ? runError.message : "请求失败";
-      setError(message);
+      setError(null);
+    } catch (cancelError) {
+      setError(cancelError instanceof Error ? cancelError.message : "中断失败");
     } finally {
-      setIsRunning(false);
+      clearActiveRun();
+
+      if (activeStreamControllerRef.current === controller) {
+        activeStreamControllerRef.current = null;
+      }
+
+      if (settleStreaming) {
+        setIsStreaming(false);
+      }
+    }
+
+    if (refreshAfterCancel) {
+      await refreshSessions();
     }
   }
 
-  async function handleStreamRun() {
+  async function handleSubmitRun() {
     const submittedInput = input.trim();
 
     if (!submittedInput) {
       return;
+    }
+
+    if (activeRunId) {
+      await cancelActiveRun({ refreshAfterCancel: false, settleStreaming: false });
     }
 
     setIsStreaming(true);
     setError(null);
     setEvents([]);
     clearActiveRun();
+    const controller = new AbortController();
+    let streamControllerAttached = false;
 
     try {
       const { session, run } = await startRunWithCurrentSession(submittedInput);
       rememberSession(session.id);
+      upsertSession(session);
+      setActiveRunId(run.id);
+      activeStreamControllerRef.current = controller;
+      streamControllerAttached = true;
       localStorage.setItem(activeRunIdKey, run.id);
       localStorage.setItem(activeEventSeqKey, "0");
       upsertRun(run);
       setInput("");
-      await streamAgentRunEvents(run.id, 0, applyStoredEvent);
+      await streamAgentRunEvents(run.id, 0, applyStoredEvent, controller.signal);
+      await refreshSessions();
     } catch (streamError) {
-      setError(streamError instanceof Error ? streamError.message : "流式请求失败");
+      if (!isAbortError(streamError)) {
+        setError(streamError instanceof Error ? streamError.message : "流式请求失败");
+      }
     } finally {
-      setIsStreaming(false);
+      if (!streamControllerAttached || activeStreamControllerRef.current === controller) {
+        setIsStreaming(false);
+      }
+
+      if (activeStreamControllerRef.current === controller) {
+        activeStreamControllerRef.current = null;
+      }
     }
   }
 
-  return (
-    <main className="app-shell fullscreen-shell">
-      <header className="topbar">
-        <div>
-          <h1>Agent Demo</h1>
-          <p>Fastify + React 工具调用工作台</p>
-        </div>
-        <span className={health === "正常" ? "status ok" : "status"}>API {health}</span>
-      </header>
+  async function handleCancelRun() {
+    await cancelActiveRun();
+  }
 
-      <div className="workspace">
-        <aside className="control-column">
+  function handleNewSession() {
+    clearActiveRun();
+    clearSessionIdFromUrl();
+    setActiveSessionId(undefined);
+    setInput("");
+    setMessages([]);
+    setEvents([]);
+    setError(null);
+  }
+
+  function handleSuggestionSelect(suggestion: string) {
+    setInput(suggestion);
+    inputRef.current?.focus();
+  }
+
+  async function handleSelectSession(sessionId: string) {
+    if (sessionId === activeSessionId) {
+      return;
+    }
+
+    clearActiveRun();
+    setError(null);
+    setEvents([]);
+
+    try {
+      const { session, runs } = await getAgentSession(sessionId);
+      upsertSession(session);
+      rememberSession(session.id);
+      setMessages(buildMessagesFromRuns(runs));
+    } catch (sessionError) {
+      setError(sessionError instanceof Error ? sessionError.message : "会话恢复失败");
+    }
+  }
+
+  const historyItems = buildHistoryItems(sessions);
+
+  return (
+    <Box component="main" className="app-shell fullscreen-shell">
+      <Box className="workspace">
+        <SessionSidebar
+          activeSessionId={activeSessionId}
+          health={health}
+          historyItems={historyItems}
+          isBusy={isStreaming}
+          onNewSession={handleNewSession}
+          onSelectSession={handleSelectSession}
+        />
+
+        <Box component="section" className="chat-main response-column">
+          <Box component="header" className="chat-main-header">
+            <Box>
+              <Typography component="h1" variant="h6">
+                {activeSessionId ? "当前会话" : "新对话"}
+              </Typography>
+              <Typography component="p">AI 生成可能有误，请核实工具结果</Typography>
+            </Box>
+            {isStreaming ? (
+              <Chip className="run-badge streaming" size="small" label="生成中" color="primary" variant="outlined" />
+            ) : null}
+          </Box>
+
+          <AgentConversation
+            messages={messages}
+            isActive={isStreaming}
+            error={error}
+            onSuggestionSelect={handleSuggestionSelect}
+          />
+
           <AgentRunForm
             input={input}
+            inputRef={inputRef}
             maxIterations={maxIterations}
-            isRunning={isRunning}
             isStreaming={isStreaming}
             onInputChange={setInput}
             onMaxIterationsChange={setMaxIterations}
-            onSubmit={handleRun}
-            onStreamSubmit={handleStreamRun}
+            onSubmit={handleSubmitRun}
+            onCancel={handleCancelRun}
           />
-        </aside>
+        </Box>
 
-        <section className="response-column">
-          <AgentConversation messages={messages} isActive={isRunning || isStreaming} error={error} />
-        </section>
-
-        <aside className="trace-column">
-          <section className="panel trace-panel">
-            <div className="panel-heading compact">
-              <div>
+        <Box component="aside" className="trace-column">
+          <Paper component="section" className="panel trace-panel" elevation={0}>
+            <Box className="panel-heading compact">
+              <Box>
                 <span className="eyebrow">Trace</span>
-                <h2>事件时间线</h2>
-              </div>
-              <span className="count-pill">{events.length}</span>
-            </div>
+                <Typography component="h2" variant="h6">
+                  事件时间线
+                </Typography>
+              </Box>
+              <Chip className="count-pill" size="small" label={events.length} />
+            </Box>
             <AgentTimeline events={events} />
-          </section>
-        </aside>
-      </div>
-    </main>
+          </Paper>
+        </Box>
+      </Box>
+    </Box>
   );
 }

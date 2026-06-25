@@ -5,11 +5,6 @@ export interface AgentStep {
   result: unknown;
 }
 
-export interface AgentRunResponse {
-  answer: string;
-  steps: AgentStep[];
-}
-
 export interface AgentSessionRecord {
   id: string;
   title?: string;
@@ -52,6 +47,7 @@ export type AgentStreamEvent =
   | { type: "llm_response"; iteration: number; content?: string; toolCalls?: ToolCallPayload[] }
   | { type: "tool_call_ready"; iteration: number; toolCallId: string; toolName: string; arguments: Record<string, unknown> }
   | { type: "tool_start"; iteration: number; toolCallId?: string; toolName: string; arguments: Record<string, unknown> }
+  | { type: "tool_progress"; iteration: number; toolCallId?: string; toolName: string; progress: Record<string, unknown> }
   | { type: "tool_result"; iteration: number; toolCallId?: string; toolName: string; result: unknown; durationMs?: number }
   | {
       type: "tool_error";
@@ -61,6 +57,7 @@ export type AgentStreamEvent =
       durationMs?: number;
       error: { code: string; message: string; recoverable?: boolean };
     }
+  | { type: "cancelled"; reason?: string }
   | { type: "final_answer"; answer: string; steps: AgentStep[] }
   | { type: "error"; code: string; message: string };
 
@@ -82,9 +79,17 @@ export interface AgentSessionResponse {
   runs: AgentRunRecord[];
 }
 
+export interface AgentSessionsResponse {
+  sessions: AgentSessionRecord[];
+}
+
 export interface AgentRunDetailResponse {
   run: AgentRunRecord;
   events: StoredAgentEvent[];
+}
+
+export interface CancelAgentRunResponse {
+  run: AgentRunRecord;
 }
 
 export interface ApiErrorResponse {
@@ -95,25 +100,6 @@ export interface ApiErrorResponse {
 }
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:4001";
-
-export async function runAgent(input: string, maxIterations: number): Promise<AgentRunResponse> {
-  const response = await fetch(`${apiBaseUrl}/agents/run`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({ input, maxIterations })
-  });
-
-  const payload = (await response.json()) as AgentRunResponse | ApiErrorResponse;
-
-  if (!response.ok) {
-    const errorPayload = payload as ApiErrorResponse;
-    throw new Error(`${errorPayload.error.code}: ${errorPayload.error.message}`);
-  }
-
-  return payload as AgentRunResponse;
-}
 
 function parseSseBlock<T>(block: string): T | null {
   const dataLine = block
@@ -159,6 +145,18 @@ export async function getAgentSession(sessionId: string): Promise<AgentSessionRe
   return payload as AgentSessionResponse;
 }
 
+export async function listAgentSessions(): Promise<AgentSessionsResponse> {
+  const response = await fetch(`${apiBaseUrl}/agents/sessions`);
+  const payload = (await response.json()) as AgentSessionsResponse | ApiErrorResponse;
+
+  if (!response.ok) {
+    const errorPayload = payload as ApiErrorResponse;
+    throw new Error(`${errorPayload.error.code}: ${errorPayload.error.message}`);
+  }
+
+  return payload as AgentSessionsResponse;
+}
+
 export async function getAgentRun(runId: string): Promise<AgentRunDetailResponse> {
   const response = await fetch(`${apiBaseUrl}/agents/runs/${runId}`);
   const payload = (await response.json()) as AgentRunDetailResponse | ApiErrorResponse;
@@ -169,6 +167,20 @@ export async function getAgentRun(runId: string): Promise<AgentRunDetailResponse
   }
 
   return payload as AgentRunDetailResponse;
+}
+
+export async function cancelAgentRun(runId: string): Promise<CancelAgentRunResponse> {
+  const response = await fetch(`${apiBaseUrl}/agents/runs/${runId}/cancel`, {
+    method: "POST"
+  });
+  const payload = (await response.json()) as CancelAgentRunResponse | ApiErrorResponse;
+
+  if (!response.ok) {
+    const errorPayload = payload as ApiErrorResponse;
+    throw new Error(`${errorPayload.error.code}: ${errorPayload.error.message}`);
+  }
+
+  return payload as CancelAgentRunResponse;
 }
 
 export async function streamAgentRunEvents(
@@ -214,57 +226,6 @@ export async function streamAgentRunEvents(
   buffer += decoder.decode();
   if (buffer.trim()) {
     const event = parseSseBlock<StoredAgentEvent>(buffer);
-    if (event) {
-      onEvent(event);
-    }
-  }
-}
-
-export async function streamAgent(
-  input: string,
-  maxIterations: number,
-  onEvent: (event: AgentStreamEvent) => void,
-  signal?: AbortSignal
-): Promise<void> {
-  const response = await fetch(`${apiBaseUrl}/agents/stream`, {
-    method: "POST",
-    signal,
-    headers: {
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({ input, maxIterations })
-  });
-
-  if (!response.ok || !response.body) {
-    throw new Error("流式请求失败");
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-
-    if (done) {
-      break;
-    }
-
-    buffer += decoder.decode(value, { stream: true });
-    const blocks = buffer.split("\n\n");
-    buffer = blocks.pop() ?? "";
-
-    for (const block of blocks) {
-      const event = parseSseBlock<AgentStreamEvent>(block);
-      if (event) {
-        onEvent(event);
-      }
-    }
-  }
-
-  buffer += decoder.decode();
-  if (buffer.trim()) {
-    const event = parseSseBlock<AgentStreamEvent>(buffer);
     if (event) {
       onEvent(event);
     }

@@ -107,6 +107,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
         "content-type": "application/json",
         authorization: `Bearer ${this.options.apiKey}`
       },
+      signal: request.signal,
       body: this.buildRequestBody(request)
     });
 
@@ -165,6 +166,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
         "content-type": "application/json",
         authorization: `Bearer ${this.options.apiKey}`
       },
+      signal: request.signal,
       body: this.buildRequestBody(request, true)
     });
 

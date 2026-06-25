@@ -1,5 +1,6 @@
 import { AppError } from "../errors/app-error.js";
 import type { AgentService } from "./agent-service.js";
+import { AgentContextBuilder } from "./context-builder.js";
 import type { AgentErrorDetail, AgentMessage, AgentRunInput } from "./types.js";
 import type { AgentRunEventListener, AgentRunStore } from "./run-store.js";
 
@@ -14,14 +15,27 @@ function toErrorDetail(error: unknown): AgentErrorDetail {
   };
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
 export class AgentRunCoordinator {
+  private readonly runningRuns = new Map<string, AbortController>();
+
   constructor(
     private readonly agentService: AgentService,
-    private readonly store: AgentRunStore
+    private readonly store: AgentRunStore,
+    private readonly contextBuilder = new AgentContextBuilder()
   ) {}
 
   createSession(title?: string) {
     return this.store.createSession(title);
+  }
+
+  listSessions() {
+    return {
+      sessions: this.store.listSessions()
+    };
   }
 
   getSession(sessionId: string) {
@@ -45,10 +59,36 @@ export class AgentRunCoordinator {
       input: input.input,
       maxIterations: input.maxIterations
     });
+    const controller = new AbortController();
 
-    void this.executeRun(run.id, { ...input, history });
+    this.runningRuns.set(run.id, controller);
+    void this.executeRun(run.id, { ...input, history, signal: controller.signal });
 
     return { session, run };
+  }
+
+  cancelRun(runId: string) {
+    const run = this.ensureRun(runId);
+
+    if (run.status !== "running") {
+      return { run };
+    }
+
+    this.runningRuns.get(runId)?.abort();
+    this.store.appendEvent(runId, {
+      type: "agent_state",
+      iteration: 0,
+      state: "done",
+      label: "已中断"
+    });
+    this.store.appendEvent(runId, {
+      type: "cancelled",
+      reason: "用户中断"
+    });
+    const cancelledRun = this.store.cancelRun(runId) ?? run;
+    this.runningRuns.delete(runId);
+
+    return { run: cancelledRun };
   }
 
   getRun(runId: string) {
@@ -80,13 +120,22 @@ export class AgentRunCoordinator {
         input: input.input,
         history: input.history,
         maxIterations: input.maxIterations,
+        signal: input.signal,
         onEvent: (event) => {
           this.store.appendEvent(runId, event);
         }
       });
 
+      if (this.store.getRun(runId)?.status !== "running") {
+        return;
+      }
+
       this.store.completeRun(runId, result);
     } catch (error) {
+      if (isAbortError(error) || this.store.getRun(runId)?.status === "cancelled") {
+        return;
+      }
+
       const detail = toErrorDetail(error);
       this.store.appendEvent(runId, {
         type: "error",
@@ -94,6 +143,8 @@ export class AgentRunCoordinator {
         message: detail.message
       });
       this.store.failRun(runId, detail);
+    } finally {
+      this.runningRuns.delete(runId);
     }
   }
 
@@ -108,13 +159,8 @@ export class AgentRunCoordinator {
   }
 
   private buildConversationHistory(sessionId: string): AgentMessage[] {
-    return this.store
-      .getRunsBySession(sessionId)
-      .filter((run) => run.status === "completed" && run.answer)
-      .sort((leftRun, rightRun) => leftRun.createdAt.localeCompare(rightRun.createdAt))
-      .flatMap((run): AgentMessage[] => [
-        { role: "user", content: run.input },
-        { role: "assistant", content: run.answer }
-      ]);
+    // Coordinator 只关心“什么时候要历史”，不关心“历史怎么裁剪”。
+    // 裁剪策略集中在 ContextBuilder，后续加摘要、token 预算或资源引用时不会继续撑大这里。
+    return this.contextBuilder.buildConversationHistory(this.store.getRunsBySession(sessionId));
   }
 }

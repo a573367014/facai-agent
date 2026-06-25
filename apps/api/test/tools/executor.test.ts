@@ -36,6 +36,63 @@ describe("ToolExecutor", () => {
     expect(result.durationMs).toEqual(expect.any(Number));
   });
 
+  it("工具显式返回 llmContent 时拆分系统数据和 LLM 文本", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "search",
+      description: "Search",
+      parameters: { type: "object", properties: {} },
+      execute: async () => ({
+        data: {
+          raw: "完整搜索结果",
+          results: [{ title: "A", url: "https://example.com" }]
+        },
+        llmContent: "给 LLM 的短搜索摘要"
+      })
+    });
+    const executor = new ToolExecutor({ registry, timeoutMs: 100 });
+
+    const result = await executor.execute({
+      toolName: "search",
+      arguments: {}
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        raw: "完整搜索结果",
+        results: [{ title: "A", url: "https://example.com" }]
+      },
+      llmContent: "给 LLM 的短搜索摘要"
+    });
+  });
+
+  it("普通工具返回带 data 字段的业务对象时不会被误拆", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "legacy",
+      description: "Legacy",
+      parameters: { type: "object", properties: {} },
+      execute: async () => ({
+        data: "这是业务字段，不是 ToolOutput"
+      })
+    });
+    const executor = new ToolExecutor({ registry, timeoutMs: 100 });
+
+    const result = await executor.execute({
+      toolName: "legacy",
+      arguments: {}
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        data: "这是业务字段，不是 ToolOutput"
+      }
+    });
+    expect(result).not.toHaveProperty("llmContent");
+  });
+
   it("未知工具返回 TOOL_NOT_FOUND", async () => {
     const executor = new ToolExecutor({ registry: new ToolRegistry(), timeoutMs: 100 });
 
@@ -181,5 +238,34 @@ describe("ToolExecutor", () => {
       }
     });
     expect(aborted).toBe(true);
+  });
+
+  it("工具配置了独立超时时间时优先使用工具超时", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "slow_image_tool",
+      description: "Slow image tool",
+      parameters: { type: "object", properties: {} },
+      timeoutMs: 5,
+      execute: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return { ok: true };
+      }
+    });
+    const executor = new ToolExecutor({ registry, timeoutMs: 1000 });
+
+    const result = await executor.execute({
+      toolName: "slow_image_tool",
+      arguments: {}
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        code: "TOOL_TIMEOUT",
+        message: "工具 slow_image_tool 执行超时",
+        recoverable: true
+      }
+    });
   });
 });

@@ -65,6 +65,60 @@ describe("AgentService", () => {
     });
   });
 
+  it("工具提供 llmContent 时优先把精简文本回灌给 provider", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "search",
+      description: "search",
+      parameters: { type: "object", properties: {} },
+      execute: async () => ({
+        data: {
+          provider: "test",
+          results: [{ title: "完整结果", url: "https://example.com", snippet: "很长的原始内容" }]
+        },
+        llmContent: "搜索摘要：完整结果 https://example.com"
+      })
+    });
+    const observedToolContents: string[] = [];
+    const provider: LlmProvider = {
+      complete: async ({ messages }) => {
+        const toolMessages = messages.filter((message) => message.role === "tool");
+
+        if (toolMessages.length > 0) {
+          observedToolContents.push(...toolMessages.map((message) => message.content));
+          return { content: "已根据搜索摘要回答。" };
+        }
+
+        return {
+          toolCalls: [
+            {
+              id: "call_1",
+              name: "search",
+              arguments: {}
+            }
+          ]
+        };
+      }
+    };
+    const service = createAgentService(provider, registry);
+
+    await expect(service.run({ input: "搜索资料" })).resolves.toEqual({
+      answer: "已根据搜索摘要回答。",
+      steps: [
+        {
+          type: "tool_call",
+          toolName: "search",
+          arguments: {},
+          result: {
+            provider: "test",
+            results: [{ title: "完整结果", url: "https://example.com", snippet: "很长的原始内容" }]
+          }
+        }
+      ]
+    });
+    expect(observedToolContents).toEqual(["搜索摘要：完整结果 https://example.com"]);
+  });
+
   it("只把权限策略允许的工具暴露给 provider", async () => {
     const registry = new ToolRegistry();
     registry.register({
@@ -287,6 +341,67 @@ describe("AgentService", () => {
       type: "final_answer",
       answer: "结果是 108。"
     });
+  });
+
+  it("工具可以在最终 tool_result 前发出 tool_progress 事件", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "progress_tool",
+      description: "progress tool",
+      parameters: { type: "object", properties: {} },
+      execute: async (_args, context) => {
+        await (context as { emitProgress?: (progress: Record<string, unknown>) => Promise<void> }).emitProgress?.({
+          kind: "unit_done",
+          index: 0,
+          value: "第一段完成"
+        });
+
+        return { ok: true };
+      }
+    });
+
+    const provider: LlmProvider = {
+      complete: async ({ messages }) => {
+        if (messages.some((message) => message.role === "tool")) {
+          return { content: "工具完成。" };
+        }
+
+        return {
+          toolCalls: [
+            {
+              id: "call_progress",
+              name: "progress_tool",
+              arguments: {}
+            }
+          ]
+        };
+      }
+    };
+    const events: AgentStreamEvent[] = [];
+    const service = createAgentService(provider, registry);
+
+    await service.run({
+      input: "执行进度工具",
+      onEvent: (event) => {
+        events.push(event);
+      }
+    });
+
+    expect(events.map((event) => event.type)).toContain("tool_progress");
+    expect(events).toContainEqual({
+      type: "tool_progress",
+      iteration: 0,
+      toolCallId: "call_progress",
+      toolName: "progress_tool",
+      progress: {
+        kind: "unit_done",
+        index: 0,
+        value: "第一段完成"
+      }
+    });
+    expect(events.findIndex((event) => event.type === "tool_progress")).toBeLessThan(
+      events.findIndex((event) => event.type === "tool_result")
+    );
   });
 
   it("provider 支持流式时发出 answer_delta 事件", async () => {

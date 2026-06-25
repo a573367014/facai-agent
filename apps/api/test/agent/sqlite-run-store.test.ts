@@ -81,6 +81,24 @@ describe("SqliteAgentRunStore", () => {
     secondStore.close();
   });
 
+  it("能按更新时间倒序列出持久化会话", async () => {
+    const databasePath = createTempDatabasePath();
+    const firstStore = await SqliteAgentRunStore.create({ databasePath });
+    const firstSession = firstStore.createSession("旧会话");
+    const secondSession = firstStore.createSession("新会话");
+    firstStore.createRun({
+      sessionId: firstSession.id,
+      input: "更新旧会话",
+      maxIterations: 4
+    });
+    firstStore.close();
+
+    const secondStore = await SqliteAgentRunStore.create({ databasePath });
+
+    expect(secondStore.listSessions().map((session) => session.id)).toEqual([firstSession.id, secondSession.id]);
+    secondStore.close();
+  });
+
   it("应用配置为 sqlite 时会把会话写入 SQLite 文件", async () => {
     const databasePath = createTempDatabasePath();
     const previousStore = process.env.AGENT_STORE;

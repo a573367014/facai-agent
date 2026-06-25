@@ -25,6 +25,7 @@ export interface AgentRunInput {
   input: string;
   history?: AgentMessage[];
   maxIterations?: number;
+  signal?: AbortSignal;
   onEvent?: (event: AgentStreamEvent) => void | Promise<void>;
 }
 
@@ -53,7 +54,9 @@ export type AgentStreamEvent =
   | { type: "llm_response"; iteration: number; content?: string; toolCalls?: ToolCall[] }
   | { type: "tool_call_ready"; iteration: number; toolCallId: string; toolName: string; arguments: JsonObject }
   | { type: "tool_start"; iteration: number; toolCallId?: string; toolName: string; arguments: JsonObject }
+  | { type: "tool_progress"; iteration: number; toolCallId?: string; toolName: string; progress: JsonObject }
   | { type: "tool_result"; iteration: number; toolCallId?: string; toolName: string; result: unknown; durationMs?: number }
   | { type: "tool_error"; iteration: number; toolCallId?: string; toolName: string; durationMs?: number; error: AgentErrorDetail }
+  | { type: "cancelled"; reason?: string }
   | { type: "final_answer"; answer: string; steps: AgentStep[] }
   | { type: "error"; code: string; message: string };

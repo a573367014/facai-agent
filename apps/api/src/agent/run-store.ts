@@ -52,6 +52,7 @@ export interface CreateAgentRunInput {
 
 export interface AgentRunStore {
   createSession(title?: string): AgentSessionRecord;
+  listSessions(): AgentSessionRecord[];
   getSession(sessionId: string): AgentSessionRecord | undefined;
   createRun(input: CreateAgentRunInput): AgentRunRecord;
   getRun(runId: string): AgentRunRecord | undefined;
@@ -61,6 +62,7 @@ export interface AgentRunStore {
   getEvents(runId: string, after?: number): StoredAgentEvent[];
   completeRun(runId: string, result: AgentRunResult): AgentRunRecord | undefined;
   failRun(runId: string, error: { code: string; message: string }): AgentRunRecord | undefined;
+  cancelRun(runId: string): AgentRunRecord | undefined;
   subscribe(runId: string, listener: AgentRunEventListener): () => void;
 }
 
@@ -92,6 +94,12 @@ export class InMemoryAgentRunStore implements AgentRunStore {
 
     this.sessions.set(session.id, session);
     return session;
+  }
+
+  listSessions(): AgentSessionRecord[] {
+    return [...this.sessions.values()].sort((leftSession, rightSession) =>
+      rightSession.updatedAt.localeCompare(leftSession.updatedAt)
+    );
   }
 
   getSession(sessionId: string): AgentSessionRecord | undefined {
@@ -217,6 +225,22 @@ export class InMemoryAgentRunStore implements AgentRunStore {
     const timestamp = now();
     run.status = "failed";
     run.error = error;
+    run.updatedAt = timestamp;
+    run.completedAt = timestamp;
+    this.touchSession(run.sessionId, timestamp);
+    return run;
+  }
+
+  cancelRun(runId: string): AgentRunRecord | undefined {
+    const run = this.runs.get(runId);
+
+    if (!run) {
+      return undefined;
+    }
+
+    this.flushPendingAnswerChunk(runId);
+    const timestamp = now();
+    run.status = "cancelled";
     run.updatedAt = timestamp;
     run.completedAt = timestamp;
     this.touchSession(run.sessionId, timestamp);

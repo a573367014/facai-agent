@@ -2,7 +2,7 @@ import { ZodError } from "zod";
 import { AppError } from "../errors/app-error.js";
 import { ToolAccessPolicy } from "./access-policy.js";
 import type { ToolRegistry } from "./registry.js";
-import type { JsonObject, ToolExecutionInput, ToolExecutionResult } from "./types.js";
+import type { JsonObject, ToolExecutionInput, ToolExecutionResult, ToolOutput } from "./types.js";
 
 export interface ToolExecutorOptions {
   registry: ToolRegistry;
@@ -14,6 +14,11 @@ type TimedExecutionResult =
   | { type: "success"; data: unknown }
   | { type: "failure"; error: unknown }
   | { type: "timeout" };
+
+interface NormalizedToolOutput {
+  data: unknown;
+  llmContent?: string;
+}
 
 // ToolExecutor 是工具运行时边界：AgentService 不直接执行工具，
 // 而是把工具名、参数和上下文交给这里统一治理。
@@ -77,24 +82,26 @@ export class ToolExecutor {
           runId: input.runId,
           sessionId: input.sessionId,
           toolCallId: input.toolCallId,
-          signal: controller.signal
+          signal: controller.signal,
+          emitProgress: input.emitProgress
         })
       )
       .then<TimedExecutionResult>((data) => ({ type: "success", data }))
       .catch<TimedExecutionResult>((error) => ({ type: "failure", error }));
 
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const timeoutMs = tool.timeoutMs ?? this.options.timeoutMs;
     // 超时不是强杀 JavaScript 任务，而是先触发 AbortSignal，再让 race 返回 timeout。
     // 工具如果支持 context.signal，就能主动停止网络请求、文件读取等耗时操作。
     const timeout = new Promise<TimedExecutionResult>((resolve) => {
       timeoutId = setTimeout(() => {
         controller.abort();
         resolve({ type: "timeout" });
-      }, this.options.timeoutMs);
+      }, timeoutMs);
     });
 
     // 谁先结束就采用谁的结果：工具成功/失败，或者超时。
-    const result = await Promise.race([execution, timeout]);
+    const timedResult = await Promise.race([execution, timeout]);
 
     // 不论 race 谁赢，都要清理定时器和父 signal 监听，避免长时间运行后堆积监听器。
     if (timeoutId) {
@@ -102,25 +109,58 @@ export class ToolExecutor {
     }
     input.signal?.removeEventListener("abort", cancelFromParent);
 
-    if (result.type === "success") {
-      return {
+    if (timedResult.type === "success") {
+      const normalizedOutput = this.normalizeToolOutput(timedResult.data);
+      const result: Extract<ToolExecutionResult, { ok: true }> = {
         ok: true,
-        data: result.data,
+        data: normalizedOutput.data,
         durationMs: this.durationSince(startedAt)
       };
+
+      // llmContent 是一个显式能力，不是每个工具都有。
+      // 没有精简文本时不返回 undefined 字段，可以让调用方通过字段存在与否判断工具是否做了 LLM 视图优化。
+      if (normalizedOutput.llmContent) {
+        result.llmContent = normalizedOutput.llmContent;
+      }
+
+      return result;
     }
 
-    if (result.type === "timeout") {
+    if (timedResult.type === "timeout") {
       // 超时标记为 recoverable，是因为 Agent 后续可以选择换工具、缩小请求范围或提示用户重试。
       return this.toFailure(startedAt, "TOOL_TIMEOUT", `工具 ${input.toolName} 执行超时`, true);
     }
 
-    if (result.error instanceof AppError) {
+    if (timedResult.error instanceof AppError) {
       // 工具内部主动抛出的 AppError 保留原始 code/message，避免丢掉业务语义。
-      return this.toFailure(startedAt, result.error.code, result.error.message, false);
+      return this.toFailure(startedAt, timedResult.error.code, timedResult.error.message, false);
     }
 
-    return this.toFailure(startedAt, "TOOL_EXECUTION_ERROR", this.toMessage(result.error), false);
+    return this.toFailure(startedAt, "TOOL_EXECUTION_ERROR", this.toMessage(timedResult.error), false);
+  }
+
+  private normalizeToolOutput(output: unknown): NormalizedToolOutput {
+    // 为了兼容旧工具，默认把工具返回值整体视为 data。
+    // 只有当工具显式返回 { data, llmContent } 时，才拆出给 LLM 的精简内容。
+    // 这样即使某个业务工具天然返回 { data: ... }，也不会被误当成 ToolOutput。
+    if (!this.isToolOutput(output)) {
+      return { data: output };
+    }
+
+    return {
+      data: output.data,
+      llmContent: output.llmContent?.trim() || undefined
+    };
+  }
+
+  private isToolOutput(output: unknown): output is ToolOutput {
+    return (
+      typeof output === "object" &&
+      output !== null &&
+      Object.prototype.hasOwnProperty.call(output, "data") &&
+      Object.prototype.hasOwnProperty.call(output, "llmContent") &&
+      (typeof (output as ToolOutput).llmContent === "string" || (output as ToolOutput).llmContent === undefined)
+    );
   }
 
   private toFailure(

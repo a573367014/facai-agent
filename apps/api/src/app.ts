@@ -1,6 +1,7 @@
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import { AgentService } from "./agent/agent-service.js";
+import { AgentContextBuilder } from "./agent/context-builder.js";
 import { AgentRunCoordinator } from "./agent/run-coordinator.js";
 import { InMemoryAgentRunStore } from "./agent/run-store.js";
 import { SqliteAgentRunStore } from "./agent/sqlite-run-store.js";
@@ -50,7 +51,19 @@ export async function buildApp(options: BuildAppOptions = {}) {
   // 2. ToolExecutor 执行时按 toolName 找到真实工具。
   const toolRegistry = createDefaultToolRegistry({
     tavilyApiKey: env.TAVILY_API_KEY,
-    searchMaxResults: env.SEARCH_MAX_RESULTS
+    searchMaxResults: env.SEARCH_MAX_RESULTS,
+    jimengImage: {
+      accessKeyId: env.VOLCENGINE_ACCESS_KEY_ID,
+      secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY,
+      endpoint: env.VOLCENGINE_IMAGE_ENDPOINT,
+      region: env.VOLCENGINE_IMAGE_REGION,
+      service: env.VOLCENGINE_IMAGE_SERVICE,
+      reqKey: env.VOLCENGINE_IMAGE_REQ_KEY,
+      pollIntervalMs: env.VOLCENGINE_IMAGE_POLL_INTERVAL_MS,
+      maxPollAttempts: env.VOLCENGINE_IMAGE_MAX_POLL_ATTEMPTS,
+      timeoutMs: env.VOLCENGINE_IMAGE_TOOL_TIMEOUT_MS,
+      batchConcurrency: env.VOLCENGINE_IMAGE_BATCH_CONCURRENCY
+    }
   });
   // 当前先用 allow-list 做最小权限控制。未配置时 demo 仍开放所有默认工具；
   // 配了 AGENT_ALLOWED_TOOLS 后，LLM 只能看到这些工具，执行层也只允许这些工具。
@@ -87,11 +100,18 @@ export async function buildApp(options: BuildAppOptions = {}) {
       });
     }
 
-    runCoordinator = new AgentRunCoordinator(agentService, runStore);
+    runCoordinator = new AgentRunCoordinator(
+      agentService,
+      runStore,
+      new AgentContextBuilder({
+        maxHistoryRuns: env.AGENT_CONTEXT_MAX_COMPLETED_RUNS,
+        maxHistoryCharacters: env.AGENT_CONTEXT_MAX_HISTORY_CHARS
+      })
+    );
   }
 
   await registerHealthRoutes(app);
-  await registerAgentRoutes(app, agentService, runCoordinator);
+  await registerAgentRoutes(app, runCoordinator);
 
   return app;
 }

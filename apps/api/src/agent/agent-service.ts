@@ -37,15 +37,16 @@ export class AgentService {
     };
 
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+      assertNotAborted(input.signal);
       await emit({ type: "iteration_start", iteration });
       await emit({ type: "agent_state", iteration, state: "thinking", label: "模型思考中" });
       await emit({ type: "llm_start", iteration });
       const response =
         input.onEvent && this.options.provider.completeStream
-          ? await this.options.provider.completeStream({ messages, tools }, async (delta) => {
+          ? await this.options.provider.completeStream({ messages, tools, signal: input.signal }, async (delta) => {
               await emit({ type: "answer_delta", iteration, delta });
             })
-          : await this.options.provider.complete({ messages, tools });
+          : await this.options.provider.complete({ messages, tools, signal: input.signal });
       await emit({
         type: "llm_response",
         iteration,
@@ -94,7 +95,19 @@ export class AgentService {
         const execution = await this.options.toolExecutor.execute({
           toolCallId: toolCall.id,
           toolName: toolCall.name,
-          arguments: toolCall.arguments
+          arguments: toolCall.arguments,
+          signal: input.signal,
+          // emitProgress 是工具内部发中间态的出口。
+          // AgentService 在这里补上 iteration/toolCallId/toolName，让前端和持久化层不用理解工具私有上下文。
+          emitProgress: async (progress) => {
+            await emit({
+              type: "tool_progress",
+              iteration,
+              toolCallId: toolCall.id,
+              toolName: toolCall.name,
+              progress
+            });
+          }
         });
 
         if (!execution.ok) {
@@ -122,7 +135,7 @@ export class AgentService {
             role: "tool",
             toolCallId: toolCall.id,
             name: toolCall.name,
-            content: JSON.stringify({
+            content: execution.llmContent ?? JSON.stringify({
               ok: false,
               error: execution.error
             })
@@ -151,7 +164,9 @@ export class AgentService {
           role: "tool",
           toolCallId: toolCall.id,
           name: toolCall.name,
-          content: JSON.stringify(execution.data)
+          // role=tool 的 content 必须是字符串。简单工具可以继续用 JSON fallback；
+          // 像 web_search 这种大结果工具，则优先用工具自己提供的 llmContent 控制 token 和可读性。
+          content: execution.llmContent ?? JSON.stringify(execution.data)
         });
       }
 
@@ -166,5 +181,11 @@ export class AgentService {
     }
 
     throw new AppError("AGENT_MAX_ITERATIONS", "Agent 达到最大迭代次数，仍未得到最终答案", 422);
+  }
+}
+
+function assertNotAborted(signal?: AbortSignal) {
+  if (signal?.aborted) {
+    throw new DOMException("Aborted", "AbortError");
   }
 }

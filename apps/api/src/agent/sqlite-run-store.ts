@@ -127,6 +127,14 @@ export class SqliteAgentRunStore implements AgentRunStore {
     return row ? this.toSessionRecord(row) : undefined;
   }
 
+  listSessions(): AgentSessionRecord[] {
+    return this.queryMany(
+      `SELECT id, title, created_at, updated_at
+       FROM agent_sessions
+       ORDER BY updated_at DESC`
+    ).map((row) => this.toSessionRecord(row));
+  }
+
   createRun(input: CreateAgentRunInput): AgentRunRecord {
     const timestamp = now();
     const run: AgentRunRecord = {
@@ -265,6 +273,29 @@ export class SqliteAgentRunStore implements AgentRunStore {
            completed_at = ?
        WHERE id = ?`,
       ["failed", JSON.stringify(error), timestamp, timestamp, runId]
+    );
+    this.touchSession(existingRun.sessionId, timestamp);
+    this.persist();
+    return this.getRun(runId);
+  }
+
+  cancelRun(runId: string): AgentRunRecord | undefined {
+    const existingRun = this.getRun(runId);
+
+    if (!existingRun) {
+      return undefined;
+    }
+
+    this.flushPendingAnswerChunk(runId);
+    const timestamp = now();
+    this.database.run(
+      `UPDATE agent_runs
+       SET status = ?,
+           error_json = NULL,
+           updated_at = ?,
+           completed_at = ?
+       WHERE id = ?`,
+      ["cancelled", timestamp, timestamp, runId]
     );
     this.touchSession(existingRun.sessionId, timestamp);
     this.persist();

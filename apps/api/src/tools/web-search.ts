@@ -22,11 +22,30 @@ const tavilyResponseSchema = z.object({
   response_time: z.number().optional()
 });
 
+interface WebSearchResultItem {
+  title: string;
+  url: string;
+  snippet: string;
+  score?: number;
+}
+
+interface WebSearchResult {
+  provider: "tavily";
+  query: string;
+  answer?: string;
+  results: WebSearchResultItem[];
+  resultCount: number;
+  responseTimeSeconds?: number;
+}
+
 export interface TavilySearchToolOptions {
   apiKey: string;
   maxResults: number;
   fetchImpl?: typeof fetch;
 }
+
+const MAX_LLM_RESULTS = 5;
+const MAX_LLM_SNIPPET_CHARS = 500;
 
 function toPositiveMaxResults(value: number) {
   return Math.min(10, Math.max(1, Math.trunc(value)));
@@ -36,6 +55,41 @@ function toSnippet(result: z.infer<typeof tavilyResultSchema>) {
   // Tavily 的 content 通常是适合 LLM 阅读的摘要；raw_content 可能很长。
   // 第一版只把短摘要喂回模型，避免一次搜索把上下文撑爆。
   return (result.content ?? result.raw_content ?? "").trim();
+}
+
+function truncateForLlm(text: string, maxChars: number) {
+  const normalizedText = text.replace(/\s+/g, " ").trim();
+
+  if (normalizedText.length <= maxChars) {
+    return normalizedText;
+  }
+
+  return `${normalizedText.slice(0, maxChars).trimEnd()}...`;
+}
+
+function renderSearchResultForLlm(result: WebSearchResult) {
+  const lines = [`搜索 query：${result.query}`];
+
+  if (result.answer) {
+    lines.push("", `Tavily 摘要：${result.answer}`);
+  }
+
+  if (result.results.length === 0) {
+    lines.push("", "搜索结果：未找到可用来源。");
+    return lines.join("\n");
+  }
+
+  lines.push("", "搜索结果：");
+
+  for (const [index, item] of result.results.slice(0, MAX_LLM_RESULTS).entries()) {
+    lines.push(
+      `${index + 1}. ${item.title}`,
+      `   URL: ${item.url}`,
+      `   摘要: ${truncateForLlm(item.snippet, MAX_LLM_SNIPPET_CHARS)}`
+    );
+  }
+
+  return lines.join("\n");
 }
 
 export function createTavilySearchTool(options: TavilySearchToolOptions): RegisteredTool {
@@ -103,13 +157,18 @@ export function createTavilySearchTool(options: TavilySearchToolOptions): Regist
         }))
         .filter((result) => result.url.length > 0);
 
-      return {
+      const searchResult: WebSearchResult = {
         provider: "tavily",
         query: payload.query ?? parsedArgs.query,
         answer: payload.answer ?? undefined,
         results,
         resultCount: results.length,
         responseTimeSeconds: payload.response_time
+      };
+
+      return {
+        data: searchResult,
+        llmContent: renderSearchResultForLlm(searchResult)
       };
     }
   };

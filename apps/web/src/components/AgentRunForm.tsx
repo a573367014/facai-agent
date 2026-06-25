@@ -1,85 +1,100 @@
-import { Loader2, Play, Radio } from "lucide-react";
-import type { FormEvent } from "react";
+import { Box, IconButton, Paper, Stack, TextField, Tooltip } from "@mui/material";
+import { Send, Square } from "lucide-react";
+import type { FormEvent, KeyboardEvent, Ref } from "react";
 
 interface AgentRunFormProps {
   input: string;
   maxIterations: number;
-  isRunning: boolean;
   isStreaming: boolean;
   onInputChange: (value: string) => void;
   onMaxIterationsChange: (value: number) => void;
   onSubmit: () => void;
-  onStreamSubmit: () => void;
+  onCancel: () => void;
+  inputRef?: Ref<HTMLTextAreaElement>;
 }
-
-const examples = [
-  "计算 12 * 9，然后告诉我现在几点",
-  "现在上海时间是多少？",
-  "帮我计算 (32 + 18) * 4"
-];
 
 export function AgentRunForm(props: AgentRunFormProps) {
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+
+    if (!props.input.trim()) {
+      return;
+    }
+
     props.onSubmit();
   }
 
+  function handleInputKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    const nativeEvent = event.nativeEvent as globalThis.KeyboardEvent;
+
+    if (event.key !== "Enter" || event.shiftKey || nativeEvent.isComposing) {
+      return;
+    }
+
+    event.preventDefault();
+
+    if (!props.input.trim()) {
+      return;
+    }
+
+    props.onSubmit();
+  }
+
+  const submitButtonLabel = props.isStreaming ? "停止" : "发送";
+
   return (
-    <form className="panel run-form" onSubmit={handleSubmit}>
-      <div className="panel-heading compact">
-        <div>
-          <span className="eyebrow">Task</span>
-          <h2>运行 Agent</h2>
-        </div>
-      </div>
+    <Paper component="form" className="chat-composer" elevation={0} onSubmit={handleSubmit}>
+      <TextField
+        className="field"
+        id="agent-input"
+        placeholder="发消息..."
+        value={props.input}
+        inputRef={props.inputRef}
+        onChange={(event) => props.onInputChange(event.target.value)}
+        onKeyDown={handleInputKeyDown}
+        multiline
+        minRows={2}
+        maxRows={6}
+        fullWidth
+        slotProps={{
+          htmlInput: {
+            "aria-label": "发消息"
+          }
+        }}
+      />
 
-      <div className="field">
-        <label htmlFor="agent-input">任务</label>
-        <textarea
-          id="agent-input"
-          value={props.input}
-          onChange={(event) => props.onInputChange(event.target.value)}
-          rows={8}
-        />
-      </div>
-
-      <div className="form-row">
-        <label htmlFor="max-iterations">最大迭代</label>
-        <input
+      <Stack className="composer-toolbar" direction="row" spacing={1}>
+        <TextField
+          className="iteration-field"
+          label="迭代"
           id="max-iterations"
           type="number"
-          min={1}
-          max={8}
           value={props.maxIterations}
           onChange={(event) => props.onMaxIterationsChange(Number(event.target.value))}
+          slotProps={{
+            htmlInput: {
+              min: 1,
+              max: 8
+            }
+          }}
         />
-      </div>
 
-      <div className="button-row">
-        <button className="primary-button" type="submit" disabled={props.isRunning || props.isStreaming || !props.input.trim()}>
-          {props.isRunning ? <Loader2 size={16} className="spin" /> : <Play size={16} />}
-          运行
-        </button>
-
-        <button
-          className="secondary-button"
-          type="button"
-          disabled={props.isRunning || props.isStreaming || !props.input.trim()}
-          onClick={props.onStreamSubmit}
-        >
-          {props.isStreaming ? <Loader2 size={16} className="spin" /> : <Radio size={16} />}
-          流式运行
-        </button>
-      </div>
-
-      <div className="examples">
-        <div className="examples-title">示例</div>
-        {examples.map((example) => (
-          <button type="button" key={example} onClick={() => props.onInputChange(example)}>
-            {example}
-          </button>
-        ))}
-      </div>
-    </form>
+        <Box className="composer-spacer" />
+        <Tooltip title={submitButtonLabel}>
+          <span>
+            <IconButton
+              className={`primary-button composer-submit-button ${props.isStreaming ? "stop" : "send"}`}
+              type={props.isStreaming ? "button" : "submit"}
+              size="small"
+              aria-label={submitButtonLabel}
+              disabled={!props.isStreaming && !props.input.trim()}
+              onClick={props.isStreaming ? props.onCancel : undefined}
+            >
+              {props.isStreaming ? <Square size={18} /> : <Send size={18} />}
+            </IconButton>
+          </span>
+        </Tooltip>
+      </Stack>
+    </Paper>
   );
 }

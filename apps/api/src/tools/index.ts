@@ -1,11 +1,13 @@
 import { calculatorTool } from "./calculator.js";
 import { currentTimeTool } from "./current-time.js";
+import { createJimengImageTool, type JimengImageToolOptions } from "./jimeng-image.js";
 import { ToolRegistry } from "./registry.js";
 import { createTavilySearchTool } from "./web-search.js";
 
 export interface DefaultToolRegistryOptions {
   tavilyApiKey?: string;
   searchMaxResults?: number;
+  jimengImage?: JimengImageToolOptions;
 }
 
 export function createDefaultToolRegistry(options: DefaultToolRegistryOptions = {}): ToolRegistry {
@@ -22,6 +24,10 @@ export function createDefaultToolRegistry(options: DefaultToolRegistryOptions = 
         maxResults: options.searchMaxResults ?? 5
       })
     );
+  }
+
+  if (options.jimengImage?.accessKeyId?.trim() && options.jimengImage.secretAccessKey?.trim()) {
+    registry.register(createJimengImageTool(options.jimengImage));
   }
 
   return registry;

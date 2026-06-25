@@ -1,3 +1,5 @@
+import { Accordion, AccordionDetails, AccordionSummary, Box, Chip, Typography } from "@mui/material";
+import { ChevronDown } from "lucide-react";
 import type { AgentStreamEvent } from "../api/agent-client";
 
 interface AgentTimelineProps {
@@ -24,12 +26,16 @@ function getEventTitle(event: AgentStreamEvent): string {
       return `准备工具：${event.toolName}`;
     case "tool_start":
       return `调用工具：${event.toolName}`;
+    case "tool_progress":
+      return `工具进度：${event.toolName}`;
     case "tool_result":
       return `工具结果：${event.toolName}`;
     case "tool_error":
       return `工具错误：${event.toolName}`;
     case "final_answer":
       return "最终答案";
+    case "cancelled":
+      return "运行已中断";
     case "error":
       return `错误：${event.code}`;
   }
@@ -46,6 +52,8 @@ function getEventSummary(event: AgentStreamEvent): string {
     case "tool_call_ready":
     case "tool_start":
       return JSON.stringify(event.arguments);
+    case "tool_progress":
+      return JSON.stringify(event.progress);
     case "tool_result":
       return [event.durationMs !== undefined ? `耗时 ${event.durationMs}ms` : null, JSON.stringify(event.result)].filter(Boolean).join(" · ");
     case "tool_error":
@@ -58,6 +66,8 @@ function getEventSummary(event: AgentStreamEvent): string {
         .join(" · ");
     case "final_answer":
       return event.answer;
+    case "cancelled":
+      return event.reason ?? "";
     case "error":
       return event.message;
     default:
@@ -77,22 +87,26 @@ export function AgentTimeline({ events }: AgentTimelineProps) {
   return (
     <ol className="timeline">
       {events.map((event, index) => (
-        <li className={`timeline-item event-${event.type}`} key={`${event.type}-${index}`}>
-          <div className="timeline-marker" aria-hidden="true" />
-          <div className="timeline-body">
-            <div className="timeline-topline">
-              <div>
-                <div className="timeline-title">{getEventTitle(event)}</div>
+        <Box component="li" className={`timeline-item event-${event.type}`} key={`${event.type}-${index}`}>
+          <Box className="timeline-marker" aria-hidden="true" />
+          <Box className="timeline-body">
+            <Box className="timeline-topline">
+              <Box>
+                <Typography className="timeline-title" component="div">
+                  {getEventTitle(event)}
+                </Typography>
                 {getEventSummary(event) ? <p>{getEventSummary(event)}</p> : null}
-              </div>
-              {getEventIteration(event) !== null ? <span className="iteration-pill">#{getEventIteration(event)! + 1}</span> : null}
-            </div>
-            <details>
-              <summary>原始事件</summary>
-              <pre>{JSON.stringify(event, null, 2)}</pre>
-            </details>
-          </div>
-        </li>
+              </Box>
+              {getEventIteration(event) !== null ? <Chip className="iteration-pill" size="small" label={`#${getEventIteration(event)! + 1}`} /> : null}
+            </Box>
+            <Accordion className="timeline-raw-event">
+              <AccordionSummary expandIcon={<ChevronDown size={15} />}>原始事件</AccordionSummary>
+              <AccordionDetails>
+                <pre>{JSON.stringify(event, null, 2)}</pre>
+              </AccordionDetails>
+            </Accordion>
+          </Box>
+        </Box>
       ))}
     </ol>
   );

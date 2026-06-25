@@ -61,63 +61,21 @@ describe("agent routes", () => {
     expect(response.headers["access-control-allow-origin"]).toBe("http://127.0.0.1:4000");
   });
 
-  it("POST /agents/run 返回 agent 结果", async () => {
+  it("不再暴露旧的同步运行和直连流式接口", async () => {
     const app = await buildApp({ agentService: createTestAgentService() });
-    const response = await app.inject({
+    const runResponse = await app.inject({
       method: "POST",
       url: "/agents/run",
       payload: { input: "你好" }
     });
-
-    expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({ answer: "测试回答", steps: [] });
-  });
-
-  it("POST /agents/run 校验空 input", async () => {
-    const app = await buildApp({ agentService: createTestAgentService() });
-    const response = await app.inject({
-      method: "POST",
-      url: "/agents/run",
-      payload: { input: "" }
-    });
-
-    expect(response.statusCode).toBe(400);
-    expect(response.json()).toMatchObject({
-      error: {
-        code: "VALIDATION_ERROR",
-        message: "input 必须是非空字符串，maxIterations 必须是 1 到 8 之间的整数"
-      }
-    });
-  });
-
-  it("POST /agents/stream 以 SSE 返回 trace 事件", async () => {
-    const app = await buildApp({ agentService: createTestAgentService() });
-    const response = await app.inject({
+    const streamResponse = await app.inject({
       method: "POST",
       url: "/agents/stream",
       payload: { input: "你好" }
     });
 
-    expect(response.statusCode).toBe(200);
-    expect(response.headers["content-type"]).toContain("text/event-stream");
-    expect(response.body).toContain("data:");
-    expect(response.body).toContain("\"type\":\"final_answer\"");
-    expect(response.body).toContain("\"answer\":\"测试回答\"");
-  });
-
-  it("POST /agents/stream 带上浏览器需要的 CORS 响应头", async () => {
-    const app = await buildApp({ agentService: createTestAgentService() });
-    const response = await app.inject({
-      method: "POST",
-      url: "/agents/stream",
-      headers: {
-        origin: "http://127.0.0.1:4000"
-      },
-      payload: { input: "你好" }
-    });
-
-    expect(response.statusCode).toBe(200);
-    expect(response.headers["access-control-allow-origin"]).toBe("http://127.0.0.1:4000");
+    expect(runResponse.statusCode).toBe(404);
+    expect(streamResponse.statusCode).toBe(404);
   });
 
   it("POST /agents/runs 创建 session 和后台 run", async () => {
@@ -146,6 +104,41 @@ describe("agent routes", () => {
       status: "completed",
       answer: "测试回答"
     });
+  });
+
+  it("GET /agents/sessions 按更新时间倒序返回会话列表", async () => {
+    const app = await buildApp({ agentService: createTestAgentService() });
+    const firstResponse = await app.inject({
+      method: "POST",
+      url: "/agents/sessions",
+      payload: { title: "第一段会话" }
+    });
+    const secondResponse = await app.inject({
+      method: "POST",
+      url: "/agents/sessions",
+      payload: { title: "第二段会话" }
+    });
+    const firstSession = firstResponse.json() as { session: { id: string } };
+    const secondSession = secondResponse.json() as { session: { id: string } };
+
+    await app.inject({
+      method: "POST",
+      url: `/agents/sessions/${firstSession.session.id}/runs`,
+      payload: { input: "让第一段会话更新" }
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/agents/sessions"
+    });
+    const payload = response.json() as { sessions: Array<{ id: string; title?: string }> };
+
+    expect(response.statusCode).toBe(200);
+    expect(payload.sessions.map((session) => session.id)).toEqual([firstSession.session.id, secondSession.session.id]);
+    expect(payload.sessions).toEqual([
+      expect.objectContaining({ id: firstSession.session.id, title: "第一段会话" }),
+      expect.objectContaining({ id: secondSession.session.id, title: "第二段会话" })
+    ]);
   });
 
   it("GET /agents/runs/:runId/events 回放 run 的历史事件", async () => {
@@ -215,6 +208,62 @@ describe("agent routes", () => {
     expect(answerChunkEvents.length).toBeGreaterThan(0);
     expect(answerChunkEvents.length).toBeLessThan(deltaParts.length);
     expect(answerChunkEvents.map((event) => event.event.text).join("")).toBe(deltaParts.join(""));
+  });
+
+  it("POST /agents/runs/:runId/cancel 会中断运行中的 run", async () => {
+    const registry = new ToolRegistry();
+    const provider: LlmProvider = {
+      complete: async () => {
+        throw new Error("streaming path should be used");
+      },
+      completeStream: async (request) => {
+        const signal = (request as { signal?: AbortSignal }).signal;
+
+        await new Promise((_resolve, reject) => {
+          signal?.addEventListener("abort", () => {
+            reject(new DOMException("Aborted", "AbortError"));
+          });
+        });
+
+        return { content: "不应该返回" };
+      }
+    };
+    const app = await buildApp({
+      agentService: createAgentService(provider, registry)
+    });
+    const createResponse = await app.inject({
+      method: "POST",
+      url: "/agents/runs",
+      payload: { input: "生成一段长回答" }
+    });
+    const { run } = createResponse.json() as { run: { id: string } };
+
+    const cancelResponse = await app.inject({
+      method: "POST",
+      url: `/agents/runs/${run.id}/cancel`
+    });
+    const snapshotResponse = await app.inject({
+      method: "GET",
+      url: `/agents/runs/${run.id}`
+    });
+    const snapshot = snapshotResponse.json() as {
+      run: { status: string };
+      events: Array<{ event: { type: string; label?: string; code?: string } }>;
+    };
+
+    expect(cancelResponse.statusCode).toBe(200);
+    expect(snapshot.run.status).toBe("cancelled");
+    expect(snapshot.events.map((event) => event.event.type)).toContain("cancelled");
+    expect(snapshot.events).toContainEqual(
+      expect.objectContaining({
+        event: {
+          type: "agent_state",
+          iteration: 0,
+          state: "done",
+          label: "已中断"
+        }
+      })
+    );
   });
 
   it("同一 session 的后续 run 会带上历史问答", async () => {

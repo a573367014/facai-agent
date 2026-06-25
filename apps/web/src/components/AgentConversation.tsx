@@ -1,10 +1,19 @@
-import { Bot, CircleAlert, Loader2, UserRound, Wrench } from "lucide-react";
+import { Alert, Box, Chip, CircularProgress, Paper, Typography } from "@mui/material";
+import { Bot, CircleAlert, CircleStop, UserRound } from "lucide-react";
 import { useEffect, useRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { AgentState, AgentStep, AgentStreamEvent } from "../api/agent-client";
+import { buildToolTraces, type ToolTrace } from "../utils/tool-traces";
+import {
+  asImageResult,
+  ImageLoadingPreview,
+  ImagePreview,
+  type ToolImageActionPayload
+} from "./ToolResultPreview";
+import { ToolTraceList } from "./ToolTraceList";
 
-export type ChatMessageStatus = "running" | "completed" | "failed";
+export type ChatMessageStatus = "running" | "completed" | "failed" | "cancelled";
 
 export interface ChatMessage {
   id: string;
@@ -21,6 +30,8 @@ interface AgentConversationProps {
   messages: ChatMessage[];
   isActive: boolean;
   error?: string | null;
+  onImageAction?: (payload: ToolImageActionPayload) => void;
+  onSuggestionSelect?: (suggestion: string) => void;
 }
 
 const stateText: Record<AgentState, string> = {
@@ -32,46 +43,16 @@ const stateText: Record<AgentState, string> = {
   failed: "失败"
 };
 
+const emptySuggestions = [
+  "现在上海时间是多少？",
+  "数据库设计中需要注意哪些问题？",
+  "帮我生成一张温馨田园小猪图片",
+  "JavaScript 的哪些新特性可以提升前端开发效率？",
+  "解释一下这个 Agent 项目的工具调用流程"
+];
+
 function getLatestState(events: AgentStreamEvent[] = []) {
   return [...events].reverse().find((event) => event.type === "agent_state");
-}
-
-function getToolEvents(events: AgentStreamEvent[] = []) {
-  return events.filter(
-    (event) => event.type === "tool_call_ready" || event.type === "tool_start" || event.type === "tool_result" || event.type === "tool_error"
-  );
-}
-
-function getToolEventText(event: AgentStreamEvent): string {
-  switch (event.type) {
-    case "tool_call_ready":
-      return `准备 ${event.toolName}`;
-    case "tool_start":
-      return `调用 ${event.toolName}`;
-    case "tool_result":
-      return event.durationMs !== undefined ? `${event.toolName} 返回结果（${event.durationMs}ms）` : `${event.toolName} 返回结果`;
-    case "tool_error":
-      return event.durationMs !== undefined ? `${event.toolName} 执行失败（${event.durationMs}ms）` : `${event.toolName} 执行失败`;
-    default:
-      return "";
-  }
-}
-
-function getToolEventPayload(event: AgentStreamEvent): unknown {
-  switch (event.type) {
-    case "tool_call_ready":
-    case "tool_start":
-      return event.arguments;
-    case "tool_result":
-      return event.result;
-    case "tool_error":
-      return {
-        ...event.error,
-        recoverable: event.error.recoverable ?? false
-      };
-    default:
-      return null;
-  }
 }
 
 function AssistantStatus({ message, isActive }: { message: ChatMessage; isActive: boolean }) {
@@ -79,30 +60,66 @@ function AssistantStatus({ message, isActive }: { message: ChatMessage; isActive
 
   if (message.status === "failed") {
     return (
-      <span className="chat-status failed">
-        <CircleAlert size={14} />
-        失败
-      </span>
+      <Chip className="chat-status failed" size="small" icon={<CircleAlert size={14} />} label="失败" color="error" />
+    );
+  }
+
+  if (message.status === "cancelled") {
+    return (
+      <Chip className="chat-status cancelled" size="small" icon={<CircleStop size={14} />} label="已中断" variant="outlined" />
     );
   }
 
   if (message.status === "running" || (isActive && !message.content)) {
     return (
-      <span className="chat-status running">
-        <Loader2 size={14} className="spin" />
-        {latestState ? stateText[latestState.state] : "运行中"}
-      </span>
+      <Chip
+        className="chat-status running"
+        size="small"
+        icon={<CircularProgress color="inherit" size={14} />}
+        label={latestState ? stateText[latestState.state] : "运行中"}
+        color="primary"
+        variant="outlined"
+      />
     );
   }
 
   return null;
 }
 
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function getImageResourceUrls(message: ChatMessage) {
+  if (message.role !== "assistant") {
+    return [];
+  }
+
+  return getImageTraces(message.events, message.steps).flatMap((trace) => asImageResult(trace.result)?.imageUrls ?? []);
+}
+
+function stripImageResourceReferences(content: string, imageUrls: string[]) {
+  if (imageUrls.length === 0) {
+    return content;
+  }
+
+  const imageUrlPatterns = imageUrls.map((url) => new RegExp(escapeRegExp(url)));
+
+  return content
+    .split("\n")
+    .filter((line) => !imageUrlPatterns.some((pattern) => pattern.test(line)))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function MessageContent({ message, showCursor }: { message: ChatMessage; showCursor: boolean }) {
   if (message.role === "assistant") {
+    const content = stripImageResourceReferences(message.content, getImageResourceUrls(message));
+
     return (
       <div className="markdown-body">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
         {showCursor ? <span className="typing-cursor" aria-hidden="true" /> : null}
       </div>
     );
@@ -116,8 +133,86 @@ function MessageContent({ message, showCursor }: { message: ChatMessage; showCur
   );
 }
 
-export function AgentConversation({ messages, isActive, error }: AgentConversationProps) {
+function MessageImageAssets({
+  events = [],
+  steps = [],
+  onImageAction
+}: {
+  events?: AgentStreamEvent[];
+  steps?: AgentStep[];
+  onImageAction?: (payload: ToolImageActionPayload) => void;
+}) {
+  const imageTraces = getImageTraces(events, steps);
+
+  if (imageTraces.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="message-image-assets">
+      {imageTraces.map((trace) => {
+        const imageResult = asImageResult(trace.result);
+
+        if (imageResult) {
+          return <ImagePreview key={trace.id} trace={trace} result={imageResult} onImageAction={onImageAction} />;
+        }
+
+        if (trace.status === "pending" || trace.status === "running") {
+          return <ImageLoadingPreview key={trace.id} trace={trace} />;
+        }
+
+        return null;
+      })}
+    </div>
+  );
+}
+
+function buildImageTracesFromSteps(steps: AgentStep[] = []): ToolTrace[] {
+  return steps.flatMap((step, index) => {
+    if (step.toolName !== "generate_image") {
+      return [];
+    }
+
+    return [
+      {
+        id: `step:${index}:${step.toolName}`,
+        iteration: index,
+        toolName: step.toolName,
+        status: "success",
+        arguments: step.arguments,
+        result: step.result
+      } satisfies ToolTrace
+    ];
+  });
+}
+
+function getImageTraces(events: AgentStreamEvent[] = [], steps: AgentStep[] = []) {
+  const eventImageTraces = buildToolTraces(events).filter((trace) => trace.toolName === "generate_image" && !trace.error);
+
+  if (eventImageTraces.length > 0) {
+    return eventImageTraces;
+  }
+
+  return buildImageTracesFromSteps(steps);
+}
+
+function hasActiveImageTrace(events: AgentStreamEvent[] = []) {
+  return buildToolTraces(events).some(
+    (trace) => trace.toolName === "generate_image" && !trace.error && (trace.status === "pending" || trace.status === "running")
+  );
+}
+
+function getAssistantLiveText(message: ChatMessage) {
+  if (hasActiveImageTrace(message.events)) {
+    return "我正在为你生成图片";
+  }
+
+  return "正在思考";
+}
+
+export function AgentConversation({ messages, isActive, error, onImageAction, onSuggestionSelect }: AgentConversationProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const isEmpty = messages.length === 0;
 
   useEffect(() => {
     if (!scrollRef.current) {
@@ -136,32 +231,38 @@ export function AgentConversation({ messages, isActive, error }: AgentConversati
   }, [messages]);
 
   return (
-    <section className="panel chat-panel">
-      <div className="panel-heading compact chat-heading">
-        <div>
-          <span className="eyebrow">Session</span>
-          <h2>对话</h2>
-        </div>
-        {isActive ? <span className="run-badge streaming">生成中</span> : null}
-      </div>
-
-      <div className="chat-scroll" ref={scrollRef}>
-        {error ? <div className="error-box chat-global-error">{error}</div> : null}
+    <Paper component="section" className="panel chat-panel" elevation={0}>
+      <div className={isEmpty ? "chat-scroll chat-scroll-empty" : "chat-scroll"} ref={scrollRef}>
+        {error ? (
+          <Alert className="error-box chat-global-error" severity="error">
+            {error}
+          </Alert>
+        ) : null}
         {messages.length === 0 ? (
-          <div className="empty-state chat-empty">
-            <strong>还没有消息</strong>
-            <p>发起任务后，会在这里形成用户和助手的连续对话。</p>
-          </div>
+          <Box className="empty-state chat-empty">
+            <Typography component="h2">有什么我能帮你的吗？</Typography>
+            <p>输入一个任务，Agent 会按需调用工具并把过程展示在右侧。</p>
+            <Box className="empty-suggestions">
+              {emptySuggestions.map((suggestion) => (
+                <Chip
+                  className="empty-suggestion-chip"
+                  key={suggestion}
+                  label={suggestion}
+                  clickable={Boolean(onSuggestionSelect)}
+                  onClick={onSuggestionSelect ? () => onSuggestionSelect(suggestion) : undefined}
+                />
+              ))}
+            </Box>
+          </Box>
         ) : (
           messages.map((message) => {
-            const toolEvents = message.role === "assistant" ? getToolEvents(message.events) : [];
             const showCursor = message.role === "assistant" && message.status === "running";
 
             return (
-              <article className={`chat-row ${message.role}`} key={message.id}>
-                <div className="chat-avatar" aria-hidden="true">
+              <Box component="article" className={`chat-row ${message.role}`} key={message.id}>
+                <Box className="chat-avatar" aria-hidden="true">
                   {message.role === "user" ? <UserRound size={18} /> : <Bot size={18} />}
-                </div>
+                </Box>
                 <div className={`chat-content ${message.role}`}>
                   <div className={`chat-bubble ${message.role}`}>
                     <div className="chat-meta">
@@ -169,43 +270,33 @@ export function AgentConversation({ messages, isActive, error }: AgentConversati
                       {message.role === "assistant" ? <AssistantStatus message={message} isActive={isActive} /> : null}
                     </div>
 
-                    {message.error ? <div className="error-box inline-error">{message.error}</div> : null}
+                    {message.error ? (
+                      <Alert className="error-box inline-error" severity="error">
+                        {message.error}
+                      </Alert>
+                    ) : null}
 
                     {message.content ? (
                       <MessageContent message={message} showCursor={showCursor} />
                     ) : message.role === "assistant" && message.status === "running" ? (
                       <p className="chat-text muted-live">
-                        正在思考
+                        {getAssistantLiveText(message)}
                         <span className="typing-cursor" aria-hidden="true" />
                       </p>
                     ) : null}
 
-                    {toolEvents.length > 0 ? (
-                      <details className="tool-events">
-                        <summary className="tool-events-title">
-                          <span className="tool-events-label">
-                            <Wrench size={14} />
-                            工具过程
-                          </span>
-                          <span className="tool-events-count">{toolEvents.length}</span>
-                        </summary>
-                        <div className="tool-events-body">
-                          {toolEvents.map((event, index) => (
-                            <details className="tool-event" key={`${event.type}-${index}`}>
-                              <summary>{getToolEventText(event)}</summary>
-                              <pre>{JSON.stringify(getToolEventPayload(event), null, 2)}</pre>
-                            </details>
-                          ))}
-                        </div>
-                      </details>
+                    {message.role === "assistant" ? (
+                      <MessageImageAssets events={message.events} steps={message.steps} onImageAction={onImageAction} />
                     ) : null}
+
+                    {message.role === "assistant" ? <ToolTraceList events={message.events} onImageAction={onImageAction} /> : null}
                   </div>
                 </div>
-              </article>
+              </Box>
             );
           })
         )}
       </div>
-    </section>
+    </Paper>
   );
 }

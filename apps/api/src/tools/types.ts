@@ -1,6 +1,7 @@
 import type { ZodTypeAny } from "zod";
 
 export type JsonObject = Record<string, unknown>;
+export type ToolProgressPayload = JsonObject;
 
 // 给 LLM 看的工具定义。这里的 parameters 保持 JSON Schema 形态，
 // 因为 OpenAI-compatible tools payload 需要直接消费这个结构。
@@ -17,6 +18,9 @@ export interface ToolExecutionContext {
   sessionId?: string;
   toolCallId?: string;
   signal?: AbortSignal;
+  // 长耗时工具可以用它发“中间态”，例如批量生图里某一张已经完成。
+  // 它只负责把结构化进度交给 AgentService；最终结果仍然必须通过 execute 的 return 返回。
+  emitProgress?: (progress: ToolProgressPayload) => void | Promise<void>;
 }
 
 // 后端真正注册和执行的工具。它比 ToolDefinition 多了两件事：
@@ -24,7 +28,17 @@ export interface ToolExecutionContext {
 // 这样 LLM 看到的是 JSON Schema，后端校验用的是 zod，两边职责不会混在一起。
 export interface RegisteredTool extends ToolDefinition {
   argumentSchema?: ZodTypeAny;
-  execute: (args: JsonObject, context: ToolExecutionContext) => Promise<unknown> | unknown;
+  timeoutMs?: number;
+  execute: (args: JsonObject, context: ToolExecutionContext) => Promise<unknown | ToolOutput> | unknown | ToolOutput;
+}
+
+// 工具可以直接返回普通业务数据，也可以返回 ToolOutput。
+// data 是完整结构化结果，给前端、日志、回放使用；llmContent 是压缩后的文本，专门给 LLM 继续推理使用。
+// 注意：只有显式提供 llmContent 才算 ToolOutput。这样普通业务对象 { data: ... } 不会被误拆。
+// 不强制每个工具都写 llmContent，是为了让 calculator/current_time 这类简单工具继续保持轻量。
+export interface ToolOutput {
+  data: unknown;
+  llmContent: string;
 }
 
 // AgentService 调用 ToolExecutor 时传入的执行请求。
@@ -41,7 +55,7 @@ export type ToolExecutionResult =
       ok: true;
       data: unknown;
       durationMs: number;
-      displayText?: string;
+      llmContent?: string;
     }
   | {
       ok: false;
@@ -53,4 +67,5 @@ export type ToolExecutionResult =
         recoverable: boolean;
       };
       durationMs: number;
+      llmContent?: string;
     };
