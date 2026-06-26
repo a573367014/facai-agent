@@ -25,14 +25,14 @@ describe("message parts", () => {
     expect(legacyContentToParts("")).toEqual([]);
   });
 
-  it("keeps a legacy text mirror for sqlite compatibility", () => {
+  it("keeps only text in the legacy sqlite mirror", () => {
     expect(partsToLegacyContent([{ type: "text", value: "你好" }])).toBe("你好");
     expect(
       partsToLegacyContent([
         { type: "text", value: "图在这里" },
         { type: "media", mime: "image/png", url: "https://example.com/pig.png", name: "小猪" }
       ])
-    ).toBe("图在这里\n小猪：https://example.com/pig.png");
+    ).toBe("图在这里");
   });
 
   it("projects select values to labels for LLM context", () => {

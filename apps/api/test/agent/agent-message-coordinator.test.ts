@@ -154,4 +154,109 @@ describe("AgentMessageCoordinator", () => {
       store.close();
     }
   });
+
+  it("流式回答会更新 assistant message 的 text part 并发出 part delta 事件", async () => {
+    const registry = new ToolRegistry();
+    const provider: LlmProvider = {
+      complete: async () => {
+        throw new Error("streaming path should be used");
+      },
+      completeStream: async (_request, onDelta) => {
+        await onDelta("你好");
+        await onDelta("世界");
+        return { content: "你好世界" };
+      }
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+
+    try {
+      const started = coordinator.startMessage({ input: "问候一下" });
+
+      await waitForMessage(coordinator, started.assistantMessage.id);
+      const { message, events } = coordinator.getMessage(started.assistantMessage.id);
+
+      expect(message.parts).toEqual([{ type: "text", value: "你好世界" }]);
+      expect(
+        events
+          .map((event) => event.event)
+          .filter((event) => event.type === "message.part.delta")
+      ).toEqual([
+        { type: "message.part.delta", messageId: started.assistantMessage.id, partIndex: 0, delta: "你好" },
+        { type: "message.part.delta", messageId: started.assistantMessage.id, partIndex: 0, delta: "世界" }
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("图片工具结果会写入 assistant message 的 media parts", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "generate_image",
+      description: "生成图片",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string" }
+        },
+        required: ["prompt"]
+      },
+      argumentSchema: z.object({
+        prompt: z.string()
+      }),
+      execute: ({ prompt }) => ({
+        provider: "test_image",
+        prompt,
+        imageUrls: ["https://example.com/pig.png"]
+      })
+    });
+    let callCount = 0;
+    const provider: LlmProvider = {
+      complete: async () => {
+        callCount += 1;
+
+        if (callCount === 1) {
+          return {
+            toolCalls: [
+              {
+                id: "call_image",
+                name: "generate_image",
+                arguments: { prompt: "小猪" }
+              }
+            ]
+          };
+        }
+
+        return { content: "图片已生成。" };
+      }
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+
+    try {
+      const started = coordinator.startMessage({ input: "生成一张小猪图片" });
+
+      await waitForMessage(coordinator, started.assistantMessage.id);
+      const { message, events } = coordinator.getMessage(started.assistantMessage.id);
+
+      expect(message.parts).toEqual([
+        { type: "text", value: "图片已生成。" },
+        expect.objectContaining({
+          type: "media",
+          mime: "image/png",
+          url: "https://example.com/pig.png",
+          extra: expect.objectContaining({
+            lifecycle: { state: "succeeded" },
+            tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 0 },
+            generation: { prompt: "小猪", provider: "test_image" }
+          })
+        })
+      ]);
+      expect(events.map((event) => event.event.type)).toContain("message.part.created");
+      expect(events.map((event) => event.event.type)).toContain("message.part.updated");
+    } finally {
+      store.close();
+    }
+  });
 });

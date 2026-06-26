@@ -1,4 +1,5 @@
 import type { JsonObject, ToolDefinition } from "../tools/types.js";
+import type { MessagePart } from "./message-parts.js";
 
 export type { JsonObject, RegisteredTool, ToolDefinition } from "../tools/types.js";
 
@@ -23,6 +24,7 @@ export interface AgentStep {
 
 export interface AgentExecutionInput {
   input: string;
+  parts?: MessagePart[];
   history?: AgentMessage[];
   maxIterations?: number;
   messageId?: string;
@@ -51,6 +53,9 @@ export type AgentStreamEvent =
   | { type: "iteration_end"; iteration: number; outcome: "tool_calls" | "final_answer" }
   | { type: "agent_state"; iteration: number; state: AgentState; label: string }
   | { type: "llm_start"; iteration: number }
+  | { type: "message.part.created"; messageId: string; partIndex: number; part: MessagePart }
+  | { type: "message.part.delta"; messageId: string; partIndex: number; delta: string }
+  | { type: "message.part.updated"; messageId: string; partIndex: number; part: MessagePart }
   | { type: "answer_delta"; iteration: number; delta: string }
   | { type: "answer_chunk"; iteration: number; text: string }
   | { type: "llm_response"; iteration: number; content?: string; toolCalls?: ToolCall[] }

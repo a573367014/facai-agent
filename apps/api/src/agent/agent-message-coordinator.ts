@@ -1,6 +1,14 @@
 import { AppError } from "../errors/app-error.js";
 import type { AgentService } from "./agent-service.js";
 import { AgentContextBuilder } from "./context-builder.js";
+import {
+  appendTextDelta,
+  createTextPart,
+  partsToLegacyContent,
+  upsertGeneratedImageParts,
+  type GeneratedImagePartInput,
+  type MessagePart
+} from "./message-parts.js";
 import type { AgentErrorDetail, AgentMessage, AgentExecutionInput, AgentStreamEvent, JsonObject } from "./types.js";
 import type { AgentAssetRecord, AgentEventListener, AgentMessageRecord, AgentStore } from "./agent-store.js";
 
@@ -58,19 +66,21 @@ export class AgentMessageCoordinator {
   }
 
   startMessage(input: AgentExecutionInput & { sessionId?: string }) {
-    const session = input.sessionId ? this.getSession(input.sessionId).session : this.store.createSession(input.input.slice(0, 32));
+    const userParts = input.parts?.length ? input.parts : [createTextPart(input.input)];
+    const userText = partsToLegacyContent(userParts);
+    const session = input.sessionId ? this.getSession(input.sessionId).session : this.store.createSession(userText.slice(0, 32));
     const history = this.buildConversationHistory(session.id);
     const userMessage = this.store.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
-      content: input.input
+      parts: userParts
     });
     const assistantMessage = this.store.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "running",
-      content: "",
+      parts: [createTextPart("")],
       maxIterations: input.maxIterations
     });
     const controller = new AbortController();
@@ -109,12 +119,12 @@ export class AgentMessageCoordinator {
       type: "cancelled",
       reason: "用户中断"
     });
-    const cancelledMessage =
-      this.store.updateMessage(messageId, {
-        status: "cancelled",
-        content: "",
-        completedAt: now()
-      }) ?? message;
+      const cancelledMessage =
+        this.store.updateMessage(messageId, {
+          status: "cancelled",
+          parts: message.parts,
+          completedAt: now()
+        }) ?? message;
     this.runningMessages.delete(messageId);
 
     return { message: this.attachAssetsToMessage(cancelledMessage) };
@@ -149,7 +159,7 @@ export class AgentMessageCoordinator {
         sessionId: input.sessionId,
         signal: input.signal,
         onEvent: (event) => {
-          this.store.appendEvent(messageId, event);
+          this.handleExecutionEvent(messageId, event);
         }
       });
 
@@ -159,7 +169,7 @@ export class AgentMessageCoordinator {
 
       const completedMessage = this.store.updateMessage(messageId, {
         status: "completed",
-        content: result.answer,
+        parts: this.withAssistantText(messageId, result.answer),
         steps: result.steps,
         completedAt: now()
       });
@@ -183,7 +193,7 @@ export class AgentMessageCoordinator {
       });
       this.store.updateMessage(messageId, {
         status: "failed",
-        content: "本轮运行失败。",
+        parts: this.withAssistantText(messageId, "本轮运行失败。"),
         error: detail,
         completedAt: now()
       });
@@ -200,6 +210,117 @@ export class AgentMessageCoordinator {
     }
 
     return message;
+  }
+
+  private handleExecutionEvent(messageId: string, event: AgentStreamEvent) {
+    if (event.type === "answer_delta") {
+      this.appendAssistantTextDelta(messageId, event.delta);
+      this.store.appendEvent(messageId, event);
+      return;
+    }
+
+    if (event.type === "tool_start" && event.toolName === "generate_image" && event.toolCallId) {
+      this.upsertImagePart(messageId, {
+        state: "pending",
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        outputIndex: 0,
+        mime: "image/png",
+        generation: { prompt: toOptionalString(event.arguments.prompt) }
+      });
+    }
+
+    if (event.type === "tool_result" && event.toolName === "generate_image" && event.toolCallId) {
+      this.upsertImageResultParts(messageId, event);
+    }
+
+    if (event.type === "tool_error" && event.toolName === "generate_image" && event.toolCallId) {
+      this.upsertImagePart(messageId, {
+        state: "failed",
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        outputIndex: 0,
+        mime: "image/png",
+        error: {
+          code: event.error.code,
+          message: event.error.message
+        }
+      });
+    }
+
+    this.store.appendEvent(messageId, event);
+  }
+
+  private appendAssistantTextDelta(messageId: string, delta: string) {
+    const message = this.store.getMessage(messageId);
+
+    if (!message) {
+      return;
+    }
+
+    const { parts, partIndex } = ensureTextPart(message.parts);
+    const nextParts = appendTextDelta(parts, partIndex, delta);
+    this.store.updateMessageParts(messageId, nextParts);
+    this.store.appendEvent(messageId, {
+      type: "message.part.delta",
+      messageId,
+      partIndex,
+      delta
+    });
+  }
+
+  private withAssistantText(messageId: string, value: string): MessagePart[] {
+    const message = this.store.getMessage(messageId);
+    const { parts, partIndex } = ensureTextPart(message?.parts ?? []);
+
+    return parts.map((part, index) => (index === partIndex && part.type === "text" ? { ...part, value } : part));
+  }
+
+  private upsertImageResultParts(
+    messageId: string,
+    event: Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: "generate_image"; toolCallId: string }
+  ) {
+    for (const asset of extractImageAssets(event.result, 0)) {
+      this.upsertImagePart(messageId, {
+        state: "succeeded",
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        outputIndex: asset.index ?? 0,
+        mime: asset.mimeType ?? "image/png",
+        url: asset.url,
+        width: asset.width,
+        height: asset.height,
+        generation: {
+          prompt: asset.prompt,
+          provider: toOptionalString(asset.metadata?.provider)
+        }
+      });
+    }
+  }
+
+  private upsertImagePart(messageId: string, input: GeneratedImagePartInput) {
+    const message = this.store.getMessage(messageId);
+
+    if (!message) {
+      return;
+    }
+
+    const existingIndex = findToolPartIndex(message.parts, input.toolCallId, input.outputIndex);
+    const nextParts = upsertGeneratedImageParts(message.parts, input);
+    const partIndex = findToolPartIndex(nextParts, input.toolCallId, input.outputIndex);
+    const updatedMessage = this.store.updateMessageParts(messageId, nextParts);
+    const part = updatedMessage?.parts[partIndex] ?? nextParts[partIndex];
+
+    if (!part || partIndex < 0) {
+      return;
+    }
+
+    this.store.appendEvent(messageId, {
+      type: existingIndex === -1 ? "message.part.created" : "message.part.updated",
+      messageId,
+      partIndex,
+      part
+    });
   }
 
   private buildConversationHistory(sessionId: string): AgentMessage[] {
@@ -279,6 +400,25 @@ function toOptionalString(value: unknown): string | undefined {
 
 function compactJsonObject(value: Record<string, unknown>): JsonObject {
   return Object.fromEntries(Object.entries(value).filter(([, entryValue]) => entryValue !== undefined)) as JsonObject;
+}
+
+function ensureTextPart(parts: MessagePart[]): { parts: MessagePart[]; partIndex: number } {
+  const partIndex = parts.findIndex((part) => part.type === "text");
+
+  if (partIndex !== -1) {
+    return { parts, partIndex };
+  }
+
+  return { parts: [createTextPart(""), ...parts], partIndex: 0 };
+}
+
+function findToolPartIndex(parts: MessagePart[], toolCallId: string, outputIndex?: number) {
+  return parts.findIndex(
+    (part) =>
+      part.type === "media" &&
+      part.extra?.tool?.toolCallId === toolCallId &&
+      part.extra.tool.outputIndex === outputIndex
+  );
 }
 
 function isGeneratedImageToolResult(
