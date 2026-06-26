@@ -178,7 +178,7 @@ describe("App", () => {
 
     render(<App />);
 
-    expect(screen.getByLabelText("发消息")).toHaveValue("");
+    expect(screen.getByLabelText("发消息")).toHaveTextContent("");
     expect(screen.getByPlaceholderText("发消息...")).toBeInTheDocument();
   });
 
@@ -378,7 +378,7 @@ describe("App", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "现在上海时间是多少？" }));
 
-    expect(screen.getByLabelText("发消息")).toHaveValue("现在上海时间是多少？");
+    expect(screen.getByLabelText("发消息")).toHaveTextContent("现在上海时间是多少？");
     expect(screen.getByLabelText("发消息")).toHaveFocus();
   });
 
@@ -653,9 +653,9 @@ describe("App", () => {
       if (url.endsWith("/agents/messages") && init?.method === "POST") {
         messageCreateCount += 1;
         const messageId = `msg_${messageCreateCount}`;
-        const body = JSON.parse(String(init.body)) as { input: string };
+        const body = JSON.parse(String(init.body)) as { parts: Array<{ type: "text"; value: string }> };
 
-        return jsonResponse(createStartMessageResponse({ input: body.input, assistantMessageId: messageId }));
+        return jsonResponse(createStartMessageResponse({ input: body.parts[0]?.value ?? "", assistantMessageId: messageId }));
       }
 
       if (url.endsWith("/agents/messages/msg_1/events?after=0")) {
@@ -707,9 +707,9 @@ describe("App", () => {
     const messageBodies = vi
       .mocked(globalThis.fetch)
       .mock.calls.filter(([url, init]) => String(url).endsWith("/agents/messages") && init?.method === "POST")
-      .map(([, init]) => JSON.parse(String(init?.body)) as { input: string });
+      .map(([, init]) => JSON.parse(String(init?.body)) as { parts: Array<{ type: "text"; value: string }> });
 
-    expect(messageBodies.map((body) => body.input)).toEqual(["第一轮", "第二轮"]);
+    expect(messageBodies.map((body) => body.parts[0]?.value)).toEqual(["第一轮", "第二轮"]);
   });
 
   it("创建流式 message 失败后会恢复发送按钮", async () => {

@@ -5,10 +5,10 @@ import { AgentComposer } from "./AgentComposer";
 
 function renderForm(overrides: Partial<Parameters<typeof AgentComposer>[0]> = {}) {
   const props = {
-    input: "你好",
+    parts: [{ type: "text", value: "你好" }] as Parameters<typeof AgentComposer>[0]["parts"],
     maxIterations: 4,
     isStreaming: false,
-    onInputChange: vi.fn(),
+    onPartsChange: vi.fn(),
     onMaxIterationsChange: vi.fn(),
     onSubmit: vi.fn(),
     onCancel: vi.fn(),
@@ -31,7 +31,7 @@ describe("AgentComposer", () => {
     await userEvent.keyboard("{Enter}");
 
     expect(props.onSubmit).toHaveBeenCalledTimes(1);
-    expect(props.onInputChange).not.toHaveBeenCalledWith(expect.stringContaining("\n"));
+    expect(props.onPartsChange).not.toHaveBeenCalledWith([{ type: "text", value: "你好\n" }]);
   });
 
   it("输入框中按 Shift+Enter 换行，不提交", async () => {
@@ -44,7 +44,7 @@ describe("AgentComposer", () => {
   });
 
   it("生成中按 Enter 会提交新输入，不直接停止", async () => {
-    const props = renderForm({ isStreaming: true, input: "新的问题" });
+    const props = renderForm({ isStreaming: true, parts: [{ type: "text", value: "新的问题" }] });
 
     screen.getByLabelText("发消息").focus();
     await userEvent.keyboard("{Enter}");

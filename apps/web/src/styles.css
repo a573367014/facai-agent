@@ -514,6 +514,43 @@ button:not(:disabled):hover {
   font-size: 15px;
 }
 
+.part-composer {
+  min-height: 52px;
+}
+
+.part-composer-editor {
+  position: relative;
+  min-height: 52px;
+  max-height: 168px;
+  overflow-y: auto;
+  padding: 7px 4px 2px;
+  border: 0;
+  outline: 0;
+  color: var(--eye-text);
+  font-size: 15px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.part-composer-editor:focus {
+  outline: 0;
+  box-shadow: none;
+}
+
+.part-composer-editor p {
+  margin: 0;
+}
+
+.part-composer-editor.is-empty::before {
+  position: absolute;
+  top: 7px;
+  left: 4px;
+  color: var(--eye-muted);
+  content: attr(placeholder);
+  pointer-events: none;
+}
+
 .composer-toolbar {
   align-items: center;
   gap: 10px;

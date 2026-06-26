@@ -17,6 +17,7 @@ import { AgentConversation, type ChatMessage } from "./components/AgentConversat
 import { AgentTimeline } from "./components/AgentTimeline";
 import { AgentComposer } from "./components/AgentComposer";
 import { SessionSidebar, type SessionHistoryItem } from "./components/SessionSidebar";
+import { stripRuntimeFields, type RuntimePart } from "./prosemirror/part-serialization";
 import "./styles.css";
 
 const activeMessageIdKey = "agent.activeMessageId";
@@ -163,7 +164,8 @@ function buildHistoryItems(sessions: AgentSessionRecord[]): SessionHistoryItem[]
 }
 
 export default function App() {
-  const [input, setInput] = useState("");
+  const [composerParts, setComposerParts] = useState<RuntimePart[]>([{ type: "text", value: "" }]);
+  const [composerFocusToken, setComposerFocusToken] = useState(0);
   const [maxIterations, setMaxIterations] = useState(4);
   const [isStreaming, setIsStreaming] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -174,7 +176,6 @@ export default function App() {
   const [activeMessageId, setActiveMessageId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<AgentSessionRecord[]>([]);
   const activeStreamControllerRef = useRef<AbortController | null>(null);
-  const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -445,16 +446,16 @@ export default function App() {
     applyAgentEvent(storedEvent.event, storedEvent.messageId);
   }
 
-  async function startMessageWithCurrentSession(submittedInput: string) {
+  async function startMessageWithCurrentSession(submittedParts: MessagePart[]) {
     const sessionId = activeSessionId ?? readSessionIdFromUrl();
 
     try {
-      return await startAgentMessage(submittedInput, maxIterations, sessionId);
+      return await startAgentMessage(submittedParts, maxIterations, sessionId);
     } catch (error) {
       if (sessionId) {
         clearSessionIdFromUrl(sessionId);
         setActiveSessionId(undefined);
-        return startAgentMessage(submittedInput, maxIterations);
+        return startAgentMessage(submittedParts, maxIterations);
       }
 
       throw error;
@@ -495,9 +496,11 @@ export default function App() {
   }
 
   async function handleSubmitMessage() {
-    const submittedInput = input.trim();
+    const submittedParts = stripRuntimeFields(composerParts).filter(
+      (part) => part.type === "media" || (part.type === "text" && part.value.trim())
+    );
 
-    if (!submittedInput) {
+    if (submittedParts.length === 0) {
       return;
     }
 
@@ -513,7 +516,7 @@ export default function App() {
     let streamControllerAttached = false;
 
     try {
-      const { session, userMessage, assistantMessage } = await startMessageWithCurrentSession(submittedInput);
+      const { session, userMessage, assistantMessage } = await startMessageWithCurrentSession(submittedParts);
       rememberSession(session.id);
       upsertSession(session);
       setActiveMessageId(assistantMessage.id);
@@ -522,7 +525,7 @@ export default function App() {
       localStorage.setItem(activeMessageIdKey, assistantMessage.id);
       localStorage.setItem(activeEventSeqKey, "0");
       setMessages((currentMessages) => appendStartedMessages(currentMessages, userMessage, assistantMessage));
-      setInput("");
+      setComposerParts([{ type: "text", value: "" }]);
       await streamAgentMessageEvents(assistantMessage.id, 0, applyStoredEvent, controller.signal);
       await refreshSessions();
     } catch (streamError) {
@@ -548,15 +551,15 @@ export default function App() {
     clearActiveMessage();
     clearSessionIdFromUrl();
     setActiveSessionId(undefined);
-    setInput("");
+    setComposerParts([{ type: "text", value: "" }]);
     setMessages([]);
     setEvents([]);
     setError(null);
   }
 
   function handleSuggestionSelect(suggestion: string) {
-    setInput(suggestion);
-    inputRef.current?.focus();
+    setComposerParts([{ type: "text", value: suggestion }]);
+    setComposerFocusToken((currentToken) => currentToken + 1);
   }
 
   async function handleSelectSession(sessionId: string) {
@@ -613,11 +616,11 @@ export default function App() {
           />
 
           <AgentComposer
-            input={input}
-            inputRef={inputRef}
+            parts={composerParts}
             maxIterations={maxIterations}
             isStreaming={isStreaming}
-            onInputChange={setInput}
+            focusToken={composerFocusToken}
+            onPartsChange={setComposerParts}
             onMaxIterationsChange={setMaxIterations}
             onSubmit={handleSubmitMessage}
             onCancel={handleCancelMessage}
