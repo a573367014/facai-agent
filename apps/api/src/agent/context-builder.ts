@@ -1,4 +1,5 @@
 import type { AgentMessageRecord } from "./agent-store.js";
+import { partsToLlmText } from "./message-parts.js";
 import type { AgentMessage } from "./types.js";
 
 const DEFAULT_MAX_CONTEXT_MESSAGES = 12;
@@ -61,16 +62,19 @@ function countMessageCharacters(message: AgentMessageRecord): number {
 }
 
 function toContextMessage(message: AgentMessageRecord): AgentMessage | undefined {
-  if (message.role === "user" && message.content) {
-    return { role: "user", content: message.content };
+  const projectedContent = partsToLlmText(message.parts);
+  const fallbackContent = projectedContent || message.content;
+
+  if (message.role === "user" && fallbackContent) {
+    return { role: "user", content: fallbackContent };
   }
 
   if (message.role !== "assistant") {
     return undefined;
   }
 
-  if (message.status === "completed" && message.content) {
-    return { role: "assistant", content: message.content };
+  if (message.status === "completed" && fallbackContent) {
+    return { role: "assistant", content: fallbackContent };
   }
 
   if (message.status === "failed") {

@@ -1,14 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { AgentContextBuilder } from "../../src/agent/context-builder.js";
 import type { AgentMessageRecord } from "../../src/agent/agent-store.js";
+import { legacyContentToParts } from "../../src/agent/message-parts.js";
 
 function createMessage(overrides: Partial<AgentMessageRecord>): AgentMessageRecord {
+  const content = overrides.content ?? "默认消息";
+
   return {
     id: "msg_test",
     sessionId: "session_test",
     role: "user",
     status: "completed",
-    content: "默认消息",
+    content,
+    parts: legacyContentToParts(content),
     createdAt: "2026-06-25T00:00:00.000Z",
     updatedAt: "2026-06-25T00:00:00.000Z",
     ...overrides
@@ -116,6 +120,31 @@ describe("AgentContextBuilder", () => {
     ]);
 
     expect(history).toEqual([]);
+  });
+
+  it("从 message parts 投影结构化输入，而不是直接读取 legacy content", () => {
+    const builder = new AgentContextBuilder();
+    const history = builder.buildConversationHistory([
+      createMessage({
+        content: "",
+        parts: [
+          { type: "text", value: "帮我生成图片" },
+          {
+            type: "text",
+            value: "warm_pastoral",
+            extra: {
+              placeholder: {
+                type: "select",
+                label: "风格",
+                options: [{ label: "温馨田园风", value: "warm_pastoral" }]
+              }
+            }
+          }
+        ]
+      })
+    ]);
+
+    expect(history).toEqual([{ role: "user", content: "帮我生成图片\n风格：温馨田园风" }]);
   });
 
   it("达到字符预算后丢弃更早历史，但至少保留最近一条上下文", () => {
