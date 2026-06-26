@@ -365,7 +365,9 @@ export class SqliteAgentStore implements AgentStore {
       return this.appendAnswerDelta(messageId, event);
     }
 
-    this.flushPendingAnswerChunk(messageId);
+    if (event.type !== "message.part.delta") {
+      this.flushPendingAnswerChunk(messageId);
+    }
     return this.appendStoredEvent(messageId, event);
   }
 

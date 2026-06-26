@@ -134,6 +134,54 @@ describe("agent routes", () => {
     });
   });
 
+  it("POST /agents/messages 支持直接提交 message parts", async () => {
+    const app = await buildTestApp({ agentService: createTestAgentService() });
+    const response = await app.inject({
+      method: "POST",
+      url: "/agents/messages",
+      payload: {
+        parts: [
+          { type: "text", value: "帮我生成图片" },
+          {
+            type: "text",
+            value: "warm_pastoral",
+            extra: {
+              placeholder: {
+                type: "select",
+                label: "风格",
+                options: [{ label: "温馨田园风", value: "warm_pastoral" }]
+              }
+            }
+          }
+        ]
+      }
+    });
+
+    expect(response.statusCode).toBe(202);
+    const payload = response.json() as {
+      userMessage: {
+        parts: unknown[];
+        content: string;
+      };
+    };
+
+    expect(payload.userMessage.parts).toEqual([
+      { type: "text", value: "帮我生成图片" },
+      {
+        type: "text",
+        value: "warm_pastoral",
+        extra: {
+          placeholder: {
+            type: "select",
+            label: "风格",
+            options: [{ label: "温馨田园风", value: "warm_pastoral" }]
+          }
+        }
+      }
+    ]);
+    expect(payload.userMessage.content).toBe("帮我生成图片\n风格：温馨田园风");
+  });
+
   it("GET /agents/sessions 按更新时间倒序返回会话列表", async () => {
     const app = await buildTestApp({ agentService: createTestAgentService() });
     const firstResponse = await app.inject({

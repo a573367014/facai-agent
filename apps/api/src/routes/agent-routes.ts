@@ -3,10 +3,37 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { AgentMessageCoordinator } from "../agent/agent-message-coordinator.js";
 import type { StoredAgentEvent } from "../agent/agent-store.js";
+import {
+  legacyContentToParts,
+  partsToLlmText,
+  stripRuntimePartFields,
+  type MessagePart
+} from "../agent/message-parts.js";
 import { AppError } from "../errors/app-error.js";
 
+const partExtraSchema = z.record(z.unknown());
+const textPartSchema = z
+  .object({
+    type: z.literal("text"),
+    value: z.string(),
+    extra: partExtraSchema.optional()
+  })
+  .passthrough();
+const mediaPartSchema = z
+  .object({
+    type: z.literal("media"),
+    mime: z.string().min(1),
+    url: z.string(),
+    name: z.string().optional(),
+    width: z.number().optional(),
+    height: z.number().optional(),
+    extra: partExtraSchema.optional()
+  })
+  .passthrough();
+const messagePartSchema = z.discriminatedUnion("type", [textPartSchema, mediaPartSchema]);
 const messageRequestSchema = z.object({
-  input: z.string().trim().min(1),
+  input: z.string().trim().min(1).optional(),
+  parts: z.array(messagePartSchema).min(1).optional(),
   maxIterations: z.number().int().min(1).max(8).optional()
 });
 const messageStartRequestSchema = messageRequestSchema.extend({
@@ -28,21 +55,43 @@ const eventsQuerySchema = z.object({
 function parseMessageRequest(body: unknown) {
   const parsed = messageRequestSchema.safeParse(body);
 
-  if (!parsed.success) {
-    throw new AppError("VALIDATION_ERROR", "input 必须是非空字符串，maxIterations 必须是 1 到 8 之间的整数", 400);
+  if (!parsed.success || (!parsed.data.input && !parsed.data.parts?.length)) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "input 必须是非空字符串，或 parts 必须是非空消息片段数组，maxIterations 必须是 1 到 8 之间的整数",
+      400
+    );
   }
 
-  return parsed.data;
+  return normalizeMessageRequest(parsed.data);
 }
 
 function parseMessageStartRequest(body: unknown) {
   const parsed = messageStartRequestSchema.safeParse(body);
 
-  if (!parsed.success) {
-    throw new AppError("VALIDATION_ERROR", "input 必须是非空字符串，maxIterations 必须是 1 到 8 之间的整数", 400);
+  if (!parsed.success || (!parsed.data.input && !parsed.data.parts?.length)) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "input 必须是非空字符串，或 parts 必须是非空消息片段数组，maxIterations 必须是 1 到 8 之间的整数",
+      400
+    );
   }
 
-  return parsed.data;
+  return normalizeMessageRequest(parsed.data);
+}
+
+function normalizeMessageRequest(input: z.infer<typeof messageStartRequestSchema>) {
+  const parts = input.parts?.length
+    ? stripRuntimePartFields(input.parts as Array<MessagePart & Record<string, unknown>>)
+    : legacyContentToParts(input.input ?? "");
+  const projectedInput = partsToLlmText(parts) || input.input?.trim() || "";
+
+  return {
+    input: projectedInput,
+    parts,
+    maxIterations: input.maxIterations,
+    sessionId: "sessionId" in input ? input.sessionId : undefined
+  };
 }
 
 function parseSessionRequest(body: unknown) {
