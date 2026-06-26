@@ -73,7 +73,7 @@ export function createTextPart(value: string): TextPart {
 export function stripRuntimePartFields(parts: Array<MessagePart & Record<string, unknown>>): MessagePart[] {
   return parts.map((part) => {
     const cleanEntries = Object.entries(part).filter(([key]) => !key.startsWith("$"));
-    return Object.fromEntries(cleanEntries) as MessagePart;
+    return Object.fromEntries(cleanEntries) as unknown as MessagePart;
   });
 }
 

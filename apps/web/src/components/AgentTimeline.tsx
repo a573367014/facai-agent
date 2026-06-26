@@ -16,6 +16,12 @@ function getEventTitle(event: AgentStreamEvent): string {
       return event.label;
     case "llm_start":
       return "请求模型";
+    case "message.part.created":
+      return "消息片段已创建";
+    case "message.part.delta":
+      return "消息片段增量";
+    case "message.part.updated":
+      return "消息片段已更新";
     case "answer_delta":
       return "答案片段";
     case "answer_chunk":
@@ -47,6 +53,11 @@ function getEventSummary(event: AgentStreamEvent): string {
       return event.delta;
     case "answer_chunk":
       return event.text;
+    case "message.part.created":
+    case "message.part.updated":
+      return `${event.part.type} #${event.partIndex + 1}`;
+    case "message.part.delta":
+      return event.delta;
     case "llm_response":
       return event.toolCalls?.length ? `返回 ${event.toolCalls.length} 个工具调用` : "返回自然语言内容";
     case "tool_call_ready":

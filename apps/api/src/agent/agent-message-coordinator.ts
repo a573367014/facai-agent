@@ -14,6 +14,17 @@ import type { AgentAssetRecord, AgentEventListener, AgentMessageRecord, AgentSto
 
 type MessageWithAssets = AgentMessageRecord & { assets: AgentAssetRecord[] };
 
+interface ExtractedImageAsset {
+  type: "image";
+  url: string;
+  mimeType?: string;
+  width?: number;
+  height?: number;
+  prompt?: string;
+  index: number;
+  metadata: JsonObject;
+}
+
 function toErrorDetail(error: unknown): AgentErrorDetail {
   if (error instanceof AppError) {
     return { code: error.code, message: error.message };
@@ -223,7 +234,7 @@ export class AgentMessageCoordinator {
       });
     }
 
-    if (event.type === "tool_result" && event.toolName === "generate_image" && event.toolCallId) {
+    if (isGenerateImageToolResultWithId(event)) {
       this.upsertImageResultParts(messageId, event);
     }
 
@@ -376,6 +387,12 @@ function compactJsonObject(value: Record<string, unknown>): JsonObject {
   return Object.fromEntries(Object.entries(value).filter(([, entryValue]) => entryValue !== undefined)) as JsonObject;
 }
 
+function isGenerateImageToolResultWithId(
+  event: AgentStreamEvent
+): event is Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: "generate_image"; toolCallId: string } {
+  return event.type === "tool_result" && event.toolName === "generate_image" && typeof event.toolCallId === "string";
+}
+
 function ensureTextPart(parts: MessagePart[]): { parts: MessagePart[]; partIndex: number } {
   const partIndex = parts.findIndex((part) => part.type === "text");
 
@@ -395,7 +412,7 @@ function findToolPartIndex(parts: MessagePart[], toolCallId: string, outputIndex
   );
 }
 
-function extractImageAssets(result: unknown, startIndex: number) {
+function extractImageAssets(result: unknown, startIndex: number): ExtractedImageAsset[] {
   if (!isRecord(result)) {
     return [];
   }
