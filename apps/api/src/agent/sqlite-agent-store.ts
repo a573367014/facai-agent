@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import initSqlJs from "sql.js";
 import type { AgentExecutionResult, AgentStreamEvent } from "./types.js";
+import { legacyContentToParts, partsToLegacyContent, type MessagePart } from "./message-parts.js";
 import type {
   AgentAssetRecord,
   AgentAssetType,
@@ -139,12 +140,15 @@ export class SqliteAgentStore implements AgentStore {
 
   createMessage(input: CreateAgentMessageInput): AgentMessageRecord {
     const timestamp = now();
+    const parts = input.parts ?? legacyContentToParts(input.content ?? "");
+    const content = partsToLegacyContent(parts);
     const message: AgentMessageRecord = {
       id: createId("msg"),
       sessionId: input.sessionId,
       role: input.role,
       status: input.status,
-      content: input.content ?? "",
+      parts,
+      content,
       maxIterations: input.maxIterations,
       error: input.error,
       createdAt: timestamp,
@@ -158,6 +162,7 @@ export class SqliteAgentStore implements AgentStore {
          role,
          status,
          content,
+         parts_json,
          max_iterations,
          steps_json,
          error_json,
@@ -165,13 +170,14 @@ export class SqliteAgentStore implements AgentStore {
          updated_at,
          completed_at
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         message.id,
         message.sessionId,
         message.role,
         message.status,
         message.content,
+        JSON.stringify(message.parts),
         message.maxIterations ?? null,
         null,
         message.error ? JSON.stringify(message.error) : null,
@@ -194,7 +200,8 @@ export class SqliteAgentStore implements AgentStore {
 
     const timestamp = now();
     const status = input.status ?? existingMessage.status;
-    const content = input.content ?? existingMessage.content;
+    const parts = input.parts ?? (input.content === undefined ? existingMessage.parts : legacyContentToParts(input.content));
+    const content = partsToLegacyContent(parts);
     const steps = input.steps ?? existingMessage.steps;
     const error = input.error;
     const completedAt = input.completedAt ?? existingMessage.completedAt;
@@ -203,6 +210,7 @@ export class SqliteAgentStore implements AgentStore {
       `UPDATE agent_messages
        SET status = ?,
            content = ?,
+           parts_json = ?,
            steps_json = ?,
            error_json = ?,
            updated_at = ?,
@@ -211,6 +219,7 @@ export class SqliteAgentStore implements AgentStore {
       [
         status,
         content,
+        JSON.stringify(parts),
         steps ? JSON.stringify(steps) : null,
         error ? JSON.stringify(error) : null,
         timestamp,
@@ -223,6 +232,10 @@ export class SqliteAgentStore implements AgentStore {
     return this.getMessage(messageId);
   }
 
+  updateMessageParts(messageId: string, parts: MessagePart[]): AgentMessageRecord | undefined {
+    return this.updateMessage(messageId, { parts });
+  }
+
   getMessage(messageId: string): AgentMessageRecord | undefined {
     const row = this.queryOne(
       `SELECT
@@ -231,6 +244,7 @@ export class SqliteAgentStore implements AgentStore {
          role,
          status,
          content,
+         parts_json,
          max_iterations,
          steps_json,
          error_json,
@@ -253,6 +267,7 @@ export class SqliteAgentStore implements AgentStore {
          role,
          status,
          content,
+         parts_json,
          max_iterations,
          steps_json,
          error_json,
@@ -401,6 +416,7 @@ export class SqliteAgentStore implements AgentStore {
         role TEXT NOT NULL,
         status TEXT NOT NULL,
         content TEXT NOT NULL DEFAULT '',
+        parts_json TEXT NOT NULL DEFAULT '[]',
         max_iterations INTEGER,
         steps_json TEXT,
         error_json TEXT,
@@ -447,6 +463,16 @@ export class SqliteAgentStore implements AgentStore {
       CREATE INDEX IF NOT EXISTS idx_agent_events_message_id_seq
         ON agent_events (message_id, seq);
     `);
+    this.ensureMessagePartsColumn();
+  }
+
+  private ensureMessagePartsColumn() {
+    const columns = this.database.exec(`PRAGMA table_info(agent_messages)`)[0]?.values ?? [];
+    const hasPartsJson = columns.some((row) => row[1] === "parts_json");
+
+    if (!hasPartsJson) {
+      this.database.run(`ALTER TABLE agent_messages ADD COLUMN parts_json TEXT NOT NULL DEFAULT '[]'`);
+    }
   }
 
   private appendAnswerDelta(
@@ -569,12 +595,17 @@ export class SqliteAgentStore implements AgentStore {
   }
 
   private toMessageRecord(row: SqlRow): AgentMessageRecord {
+    const content = requiredString(row.content, "content");
+    const storedParts = parseJson<MessagePart[]>(row.parts_json);
+    const parts = storedParts && storedParts.length > 0 ? storedParts : legacyContentToParts(content);
+
     return {
       id: requiredString(row.id, "id"),
       sessionId: requiredString(row.session_id, "session_id"),
       role: requiredString(row.role, "role") as AgentMessageRole,
       status: requiredString(row.status, "status") as AgentMessageStatus,
-      content: requiredString(row.content, "content"),
+      parts,
+      content,
       maxIterations: optionalNumber(row.max_iterations),
       steps: parseJson<AgentExecutionResult["steps"]>(row.steps_json),
       error: parseJson<AgentMessageRecord["error"]>(row.error_json),

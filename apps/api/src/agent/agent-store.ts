@@ -1,4 +1,5 @@
 import type { AgentExecutionResult, AgentStreamEvent, JsonObject } from "./types.js";
+import type { MessagePart } from "./message-parts.js";
 
 export type AgentMessageRole = "user" | "assistant";
 export type AgentMessageStatus = "running" | "completed" | "failed" | "cancelled";
@@ -16,6 +17,8 @@ export interface AgentMessageRecord {
   sessionId: string;
   role: AgentMessageRole;
   status: AgentMessageStatus;
+  parts: MessagePart[];
+  // content 只作为旧调用点和旧 SQLite 字段的兼容镜像；新业务逻辑应优先读取 parts。
   content: string;
   maxIterations?: number;
   steps?: AgentExecutionResult["steps"];
@@ -60,6 +63,7 @@ export interface CreateAgentMessageInput {
   role: AgentMessageRole;
   status: AgentMessageStatus;
   content?: string;
+  parts?: MessagePart[];
   maxIterations?: number;
   error?: {
     code: string;
@@ -70,6 +74,7 @@ export interface CreateAgentMessageInput {
 export interface UpdateAgentMessageInput {
   status?: AgentMessageStatus;
   content?: string;
+  parts?: MessagePart[];
   steps?: AgentExecutionResult["steps"];
   error?: {
     code: string;
@@ -98,6 +103,7 @@ export interface AgentStore {
   getSession(sessionId: string): AgentSessionRecord | undefined;
   createMessage(input: CreateAgentMessageInput): AgentMessageRecord;
   updateMessage(messageId: string, input: UpdateAgentMessageInput): AgentMessageRecord | undefined;
+  updateMessageParts(messageId: string, parts: MessagePart[]): AgentMessageRecord | undefined;
   getMessage(messageId: string): AgentMessageRecord | undefined;
   getMessagesBySession(sessionId: string): AgentMessageRecord[];
   createAsset(input: CreateAgentAssetInput): AgentAssetRecord;

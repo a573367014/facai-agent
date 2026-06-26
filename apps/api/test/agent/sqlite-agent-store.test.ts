@@ -8,6 +8,7 @@ import { buildApp } from "../../src/app.js";
 import type { LlmProvider } from "../../src/providers/types.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
 import { ToolRegistry } from "../../src/tools/registry.js";
+import type { MessagePart } from "../../src/agent/message-parts.js";
 
 let tempDirs: string[] = [];
 
@@ -38,6 +39,43 @@ function createTestAgentService(): AgentService {
 }
 
 describe("SqliteAgentStore", () => {
+  it("重新创建 store 后仍能读回 message parts", async () => {
+    const databasePath = createTempDatabasePath();
+    const firstStore = await SqliteAgentStore.create({ databasePath });
+    const session = firstStore.createSession("parts 会话");
+    const parts: MessagePart[] = [{ type: "text", value: "你好" }];
+    const message = firstStore.createMessage({
+      sessionId: session.id,
+      role: "user",
+      status: "completed",
+      parts
+    });
+    firstStore.close();
+
+    const secondStore = await SqliteAgentStore.create({ databasePath });
+
+    expect(secondStore.getMessage(message.id)?.parts).toEqual(parts);
+    secondStore.close();
+  });
+
+  it("能单独更新 message parts 且不改变状态", async () => {
+    const databasePath = createTempDatabasePath();
+    const store = await SqliteAgentStore.create({ databasePath });
+    const session = store.createSession("parts 更新");
+    const message = store.createMessage({
+      sessionId: session.id,
+      role: "assistant",
+      status: "running",
+      parts: [{ type: "text", value: "" }]
+    });
+
+    const updated = store.updateMessageParts(message.id, [{ type: "text", value: "流式文本" }]);
+
+    expect(updated?.status).toBe("running");
+    expect(updated?.parts).toEqual([{ type: "text", value: "流式文本" }]);
+    store.close();
+  });
+
   it("重新创建 store 后仍能读回 session、messages、assets 和 events", async () => {
     const databasePath = createTempDatabasePath();
     const firstStore = await SqliteAgentStore.create({ databasePath, answerChunkCharLimit: 4 });
