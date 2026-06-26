@@ -766,6 +766,38 @@ describe("App", () => {
     expect(screen.getByText("请求模型")).toBeInTheDocument();
   });
 
+  it("流式运行时用 message part delta 实时展示答案", async () => {
+    mockAppFetch((url, init) => {
+      if (url.endsWith("/agents/messages") && init?.method === "POST") {
+        const response = createStartMessageResponse({ input: "用户问题", assistantMessageId: "msg_1" });
+
+        return jsonResponse({
+          ...response,
+          assistantMessage: {
+            ...response.assistantMessage,
+            parts: [{ type: "text", value: "" }]
+          }
+        });
+      }
+
+      if (url.endsWith("/agents/messages/msg_1/events?after=0")) {
+        return createStoredSseResponse("msg_1", [
+          { type: "message.part.delta", messageId: "msg_1", partIndex: 0, delta: "新协议答案" },
+          { type: "final_answer", answer: "新协议答案", steps: [] }
+        ]);
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await userEvent.type(screen.getByLabelText("发消息"), "用户问题");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(screen.getAllByText("新协议答案").length).toBeGreaterThan(0));
+  });
+
   it("刷新后根据本地 activeMessageId 恢复事件流", async () => {
     localStorage.setItem("agent.activeMessageId", "msg_1");
     mockAppFetch((url) => {

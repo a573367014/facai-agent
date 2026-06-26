@@ -39,6 +39,37 @@ describe("AgentConversation", () => {
     expect(container.querySelector("pre code")).toHaveTextContent("const value = 1;");
   });
 
+  it("renders assistant text and media from message parts", () => {
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_1:assistant",
+        role: "assistant",
+        content: "",
+        parts: [
+          { type: "text", value: "**图片已生成。**" },
+          {
+            type: "media",
+            mime: "image/png",
+            url: "https://example.com/part-image.png",
+            width: 1024,
+            height: 768,
+            extra: {
+              lifecycle: { state: "succeeded" },
+              tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 0 },
+              generation: { prompt: "田园小猪", provider: "test" }
+            }
+          }
+        ],
+        status: "completed"
+      }
+    ];
+
+    render(<AgentConversation messages={messages} isActive={false} />);
+
+    expect(screen.getByText("图片已生成。").tagName.toLowerCase()).toBe("strong");
+    expect(screen.getByRole("img", { name: "田园小猪" })).toHaveAttribute("src", "https://example.com/part-image.png");
+  });
+
   it("在回答主体展示图片预览，工具过程只保留技术轨迹", async () => {
     const messages: ChatMessage[] = [
       {

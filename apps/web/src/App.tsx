@@ -8,6 +8,7 @@ import {
   startAgentMessage,
   streamAgentMessageEvents,
   type AgentMessageRecord,
+  type MessagePart,
   type AgentSessionRecord,
   type AgentStreamEvent,
   type StoredAgentEvent
@@ -37,12 +38,21 @@ function createMessageFromRecord(message: AgentMessageRecord): ChatMessage {
     id: message.id,
     role: message.role,
     content: message.content,
+    parts: normalizeRecordParts(message),
     status: toChatMessageStatus(message.status),
     steps: message.steps ?? [],
     assets: message.assets ?? [],
     events: [],
     error
   };
+}
+
+function normalizeRecordParts(message: AgentMessageRecord): MessagePart[] {
+  if (message.parts?.length) {
+    return message.parts;
+  }
+
+  return message.content ? [{ type: "text", value: message.content }] : [];
 }
 
 function buildMessagesFromRecords(messages: AgentMessageRecord[]): ChatMessage[] {
@@ -59,6 +69,42 @@ function replaceMessage(currentMessages: ChatMessage[], nextMessage: ChatMessage
   }
 
   return currentMessages.map((message) => (message.id === nextMessage.id ? nextMessage : message));
+}
+
+function setTextPartValue(parts: MessagePart[] = [], value: string): MessagePart[] {
+  const textPartIndex = parts.findIndex((part) => part.type === "text");
+
+  if (textPartIndex === -1) {
+    return value ? [{ type: "text", value }, ...parts] : parts;
+  }
+
+  return parts.map((part, index) => (index === textPartIndex && part.type === "text" ? { ...part, value } : part));
+}
+
+function applyPartEventToMessage(message: ChatMessage, event: AgentStreamEvent): ChatMessage {
+  if (event.type === "message.part.created") {
+    const parts = [...(message.parts ?? [])];
+    parts.splice(event.partIndex, 0, event.part);
+    return { ...message, parts };
+  }
+
+  if (event.type === "message.part.delta") {
+    return {
+      ...message,
+      parts: (message.parts ?? []).map((part, index) =>
+        index === event.partIndex && part.type === "text" ? { ...part, value: part.value + event.delta } : part
+      )
+    };
+  }
+
+  if (event.type === "message.part.updated") {
+    return {
+      ...message,
+      parts: (message.parts ?? []).map((part, index) => (index === event.partIndex ? event.part : part))
+    };
+  }
+
+  return message;
 }
 
 function appendStartedMessages(
@@ -322,6 +368,17 @@ export default function App() {
       updateAssistantMessage(messageId, (message) => {
         const nextEvents = [...(message.events ?? []), event];
 
+        if (
+          event.type === "message.part.created" ||
+          event.type === "message.part.delta" ||
+          event.type === "message.part.updated"
+        ) {
+          return {
+            ...applyPartEventToMessage(message, event),
+            events: nextEvents
+          };
+        }
+
         if (event.type === "answer_delta" || event.type === "answer_chunk") {
           return {
             ...message,
@@ -335,6 +392,7 @@ export default function App() {
           return {
             ...message,
             content: event.answer,
+            parts: setTextPartValue(message.parts, event.answer),
             status: "completed",
             steps: event.steps,
             events: nextEvents,

@@ -28,12 +28,59 @@ export interface AgentAssetRecord {
   createdAt: string;
 }
 
+export interface PartExtra {
+  placeholder?: {
+    type: "text" | "input" | "select" | "image" | "skill";
+    label: string;
+    defaultValue?: string;
+    options?: Array<{ label: string; value: string; icon?: string }>;
+    [key: string]: unknown;
+  };
+  lifecycle?: {
+    state: "pending" | "succeeded" | "failed";
+    error?: {
+      code: string;
+      message: string;
+    };
+  };
+  tool?: {
+    name: string;
+    toolCallId: string;
+    outputIndex?: number;
+  };
+  generation?: {
+    prompt?: string;
+    provider?: string;
+    model?: string;
+  };
+  [key: string]: unknown;
+}
+
+export interface TextPart {
+  type: "text";
+  value: string;
+  extra?: PartExtra;
+}
+
+export interface MediaPart {
+  type: "media";
+  mime: string;
+  url: string;
+  name?: string;
+  width?: number;
+  height?: number;
+  extra?: PartExtra;
+}
+
+export type MessagePart = TextPart | MediaPart;
+
 export interface AgentMessageRecord {
   id: string;
   sessionId: string;
   role: "user" | "assistant";
   status: "running" | "completed" | "failed" | "cancelled";
   content: string;
+  parts?: MessagePart[];
   maxIterations?: number;
   steps?: AgentStep[];
   error?: {
@@ -59,6 +106,9 @@ export type AgentStreamEvent =
   | { type: "iteration_end"; iteration: number; outcome: "tool_calls" | "final_answer" }
   | { type: "agent_state"; iteration: number; state: AgentState; label: string }
   | { type: "llm_start"; iteration: number }
+  | { type: "message.part.created"; messageId: string; partIndex: number; part: MessagePart }
+  | { type: "message.part.delta"; messageId: string; partIndex: number; delta: string }
+  | { type: "message.part.updated"; messageId: string; partIndex: number; part: MessagePart }
   | { type: "answer_delta"; iteration: number; delta: string }
   | { type: "answer_chunk"; iteration: number; text: string }
   | { type: "llm_response"; iteration: number; content?: string; toolCalls?: ToolCallPayload[] }
@@ -133,16 +183,17 @@ function parseSseBlock<T>(block: string): T | null {
 }
 
 export async function startAgentMessage(
-  input: string,
+  input: string | MessagePart[],
   maxIterations: number,
   sessionId?: string
 ): Promise<StartAgentMessageResponse> {
+  const requestPayload = Array.isArray(input) ? { parts: input, maxIterations, sessionId } : { input, maxIterations, sessionId };
   const response = await fetch(`${apiBaseUrl}/agents/messages`, {
     method: "POST",
     headers: {
       "content-type": "application/json"
     },
-    body: JSON.stringify({ input, maxIterations, sessionId })
+    body: JSON.stringify(requestPayload)
   });
 
   const payload = (await response.json()) as StartAgentMessageResponse | ApiErrorResponse;

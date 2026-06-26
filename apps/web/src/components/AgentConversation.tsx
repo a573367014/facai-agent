@@ -3,7 +3,7 @@ import { Bot, CircleAlert, CircleStop, UserRound } from "lucide-react";
 import { useEffect, useRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { AgentAssetRecord, AgentState, AgentStep, AgentStreamEvent } from "../api/agent-client";
+import type { AgentAssetRecord, AgentState, AgentStep, AgentStreamEvent, MessagePart } from "../api/agent-client";
 import { buildToolTraces, type ToolTrace } from "../utils/tool-traces";
 import {
   asImageResult,
@@ -12,6 +12,7 @@ import {
   type ToolImageActionPayload
 } from "./ToolResultPreview";
 import { ToolTraceList } from "./ToolTraceList";
+import { MessagePartRenderer } from "./MessagePartRenderer";
 
 export type ChatMessageStatus = "running" | "completed" | "failed" | "cancelled";
 
@@ -19,6 +20,7 @@ export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
+  parts?: MessagePart[];
   status?: ChatMessageStatus;
   steps?: AgentStep[];
   events?: AgentStreamEvent[];
@@ -96,6 +98,7 @@ function getImageResourceUrls(message: ChatMessage) {
   }
 
   return [
+    ...(message.parts ?? []).flatMap((part) => (part.type === "media" && part.url ? [part.url] : [])),
     ...(message.assets ?? []).map((asset) => asset.url),
     ...getImageTraces(message.events, message.steps).flatMap((trace) => asImageResult(trace.result)?.imageUrls ?? [])
   ];
@@ -251,6 +254,10 @@ function hasActiveImageTrace(events: AgentStreamEvent[] = []) {
   );
 }
 
+function hasMediaParts(message: ChatMessage) {
+  return Boolean(message.parts?.some((part) => part.type === "media"));
+}
+
 function getAssistantLiveText(message: ChatMessage) {
   if (hasActiveImageTrace(message.events)) {
     return "我正在为你生成图片";
@@ -325,7 +332,14 @@ export function AgentConversation({ messages, isActive, error, onImageAction, on
                       </Alert>
                     ) : null}
 
-                    {message.content ? (
+                    {message.parts?.length ? (
+                      <MessagePartRenderer
+                        role={message.role}
+                        parts={message.parts}
+                        showCursor={showCursor}
+                        onImageAction={onImageAction}
+                      />
+                    ) : message.content ? (
                       <MessageContent message={message} showCursor={showCursor} />
                     ) : message.role === "assistant" && message.status === "running" ? (
                       <p className="chat-text muted-live">
@@ -334,7 +348,7 @@ export function AgentConversation({ messages, isActive, error, onImageAction, on
                       </p>
                     ) : null}
 
-                    {message.role === "assistant" ? (
+                    {message.role === "assistant" && !hasMediaParts(message) ? (
                       <MessageImageAssets
                         assets={message.assets}
                         events={message.events}
