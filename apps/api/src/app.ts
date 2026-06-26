@@ -1,10 +1,9 @@
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import { AgentService } from "./agent/agent-service.js";
+import { AgentMessageCoordinator } from "./agent/agent-message-coordinator.js";
 import { AgentContextBuilder } from "./agent/context-builder.js";
-import { AgentRunCoordinator } from "./agent/run-coordinator.js";
-import { InMemoryAgentRunStore } from "./agent/run-store.js";
-import { SqliteAgentRunStore } from "./agent/sqlite-run-store.js";
+import { SqliteAgentStore } from "./agent/sqlite-agent-store.js";
 import { loadEnv } from "./config/env.js";
 import { AppError } from "./errors/app-error.js";
 import { OpenAiCompatibleProvider } from "./providers/openai-compatible-provider.js";
@@ -16,7 +15,8 @@ import { createDefaultToolRegistry } from "./tools/index.js";
 
 export interface BuildAppOptions {
   agentService?: AgentService;
-  runCoordinator?: AgentRunCoordinator;
+  coordinator?: AgentMessageCoordinator;
+  databasePath?: string;
 }
 
 export async function buildApp(options: BuildAppOptions = {}) {
@@ -86,32 +86,27 @@ export async function buildApp(options: BuildAppOptions = {}) {
       }),
       defaultMaxIterations: env.AGENT_MAX_ITERATIONS
     });
-  let runCoordinator = options.runCoordinator;
+  let coordinator = options.coordinator;
 
-  if (!runCoordinator) {
-    const runStore =
-      env.AGENT_STORE === "sqlite"
-        ? await SqliteAgentRunStore.create({ databasePath: env.AGENT_SQLITE_PATH })
-        : new InMemoryAgentRunStore();
+  if (!coordinator) {
+    const agentStore = await SqliteAgentStore.create({ databasePath: options.databasePath ?? env.AGENT_SQLITE_PATH });
 
-    if (runStore instanceof SqliteAgentRunStore) {
-      app.addHook("onClose", async () => {
-        runStore.close();
-      });
-    }
+    app.addHook("onClose", async () => {
+      agentStore.close();
+    });
 
-    runCoordinator = new AgentRunCoordinator(
+    coordinator = new AgentMessageCoordinator(
       agentService,
-      runStore,
+      agentStore,
       new AgentContextBuilder({
-        maxHistoryRuns: env.AGENT_CONTEXT_MAX_COMPLETED_RUNS,
+        maxHistoryMessages: env.AGENT_CONTEXT_MAX_MESSAGES,
         maxHistoryCharacters: env.AGENT_CONTEXT_MAX_HISTORY_CHARS
       })
     );
   }
 
   await registerHealthRoutes(app);
-  await registerAgentRoutes(app, runCoordinator);
+  await registerAgentRoutes(app, coordinator);
 
   return app;
 }

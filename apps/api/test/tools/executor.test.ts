@@ -18,7 +18,7 @@ describe("ToolExecutor", () => {
       argumentSchema: z.object({ text: z.string().min(1) }),
       execute: async (args, context) => ({
         text: args.text,
-        runId: context.runId
+        messageId: context.messageId
       })
     });
     const executor = new ToolExecutor({ registry, timeoutMs: 100 });
@@ -26,12 +26,12 @@ describe("ToolExecutor", () => {
     const result = await executor.execute({
       toolName: "echo",
       arguments: { text: "hi" },
-      runId: "run_1"
+      messageId: "msg_1"
     });
 
     expect(result).toMatchObject({
       ok: true,
-      data: { text: "hi", runId: "run_1" }
+      data: { text: "hi", messageId: "msg_1" }
     });
     expect(result.durationMs).toEqual(expect.any(Number));
   });
@@ -70,8 +70,8 @@ describe("ToolExecutor", () => {
   it("普通工具返回带 data 字段的业务对象时不会被误拆", async () => {
     const registry = new ToolRegistry();
     registry.register({
-      name: "legacy",
-      description: "Legacy",
+      name: "plain_data",
+      description: "Plain data",
       parameters: { type: "object", properties: {} },
       execute: async () => ({
         data: "这是业务字段，不是 ToolOutput"
@@ -80,7 +80,7 @@ describe("ToolExecutor", () => {
     const executor = new ToolExecutor({ registry, timeoutMs: 100 });
 
     const result = await executor.execute({
-      toolName: "legacy",
+      toolName: "plain_data",
       arguments: {}
     });
 

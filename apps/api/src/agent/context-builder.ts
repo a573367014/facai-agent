@@ -1,92 +1,91 @@
-import type { AgentRunRecord } from "./run-store.js";
+import type { AgentMessageRecord } from "./agent-store.js";
 import type { AgentMessage } from "./types.js";
 
-const DEFAULT_MAX_CONTEXT_RUNS = 6;
+const DEFAULT_MAX_CONTEXT_MESSAGES = 12;
 const DEFAULT_MAX_HISTORY_CHARACTERS = 12_000;
 const MAX_FAILURE_REASON_LENGTH = 120;
 
 export interface AgentContextBuilderOptions {
-  maxHistoryRuns?: number;
-  maxCompletedRuns?: number;
+  maxHistoryMessages?: number;
   maxHistoryCharacters?: number;
 }
 
 export class AgentContextBuilder {
-  private readonly maxHistoryRuns: number;
+  private readonly maxHistoryMessages: number;
   private readonly maxHistoryCharacters: number;
 
   constructor(options: AgentContextBuilderOptions = {}) {
-    this.maxHistoryRuns = options.maxHistoryRuns ?? options.maxCompletedRuns ?? DEFAULT_MAX_CONTEXT_RUNS;
+    this.maxHistoryMessages = options.maxHistoryMessages ?? DEFAULT_MAX_CONTEXT_MESSAGES;
     this.maxHistoryCharacters = options.maxHistoryCharacters ?? DEFAULT_MAX_HISTORY_CHARACTERS;
   }
 
-  buildConversationHistory(runs: AgentRunRecord[]): AgentMessage[] {
-    if (this.maxHistoryRuns === 0) {
+  buildConversationHistory(messages: AgentMessageRecord[]): AgentMessage[] {
+    if (this.maxHistoryMessages === 0) {
       return [];
     }
 
-    const contextRuns = runs
-      .filter((run) => toRunMessages(run).length > 0)
-      .sort((leftRun, rightRun) => leftRun.createdAt.localeCompare(rightRun.createdAt))
-      .slice(-this.maxHistoryRuns);
+    const contextMessages = messages
+      .filter((message) => toContextMessage(message) !== undefined)
+      .sort((leftMessage, rightMessage) => leftMessage.createdAt.localeCompare(rightMessage.createdAt))
+      .slice(-this.maxHistoryMessages);
+    const selectedMessages = this.selectMessagesWithinBudget(contextMessages);
 
-    const selectedRuns = this.selectRunsWithinBudget(contextRuns);
-
-    return selectedRuns.flatMap(toRunMessages);
+    return selectedMessages.flatMap((message) => {
+      const contextMessage = toContextMessage(message);
+      return contextMessage ? [contextMessage] : [];
+    });
   }
 
-  private selectRunsWithinBudget(runs: AgentRunRecord[]): AgentRunRecord[] {
-    const selectedRuns: AgentRunRecord[] = [];
+  private selectMessagesWithinBudget(messages: AgentMessageRecord[]): AgentMessageRecord[] {
+    const selectedMessages: AgentMessageRecord[] = [];
     let usedCharacters = 0;
 
-    for (const run of [...runs].reverse()) {
-      const runCharacters = countRunCharacters(run);
+    for (const message of [...messages].reverse()) {
+      const messageCharacters = countMessageCharacters(message);
 
-      // 最近一轮即使超过预算也保留。否则一次很长的上一轮对话会导致“完全没有上下文”，
-      // 体验上比软性超预算更糟。后续接 tokenizer 后，可以把这里升级成截断或摘要。
-      if (selectedRuns.length > 0 && usedCharacters + runCharacters > this.maxHistoryCharacters) {
+      if (selectedMessages.length > 0 && usedCharacters + messageCharacters > this.maxHistoryCharacters) {
         continue;
       }
 
-      selectedRuns.push(run);
-      usedCharacters += runCharacters;
+      selectedMessages.push(message);
+      usedCharacters += messageCharacters;
     }
 
-    return selectedRuns.reverse();
+    return selectedMessages.reverse();
   }
 }
 
-function countRunCharacters(run: AgentRunRecord): number {
-  return toRunMessages(run).reduce((total, message) => total + (message.content?.length ?? 0), 0);
+function countMessageCharacters(message: AgentMessageRecord): number {
+  const contextMessage = toContextMessage(message);
+  return contextMessage?.content?.length ?? 0;
 }
 
-function toRunMessages(run: AgentRunRecord): AgentMessage[] {
-  if (run.status === "completed" && run.answer) {
-    return [
-      { role: "user", content: run.input },
-      { role: "assistant", content: run.answer }
-    ];
+function toContextMessage(message: AgentMessageRecord): AgentMessage | undefined {
+  if (message.role === "user" && message.content) {
+    return { role: "user", content: message.content };
   }
 
-  if (run.status === "failed") {
-    return [
-      { role: "user", content: run.input },
-      { role: "assistant", content: buildFailureSummary(run) }
-    ];
+  if (message.role !== "assistant") {
+    return undefined;
   }
 
-  if (run.status === "cancelled") {
-    return [
-      { role: "user", content: run.input },
-      { role: "assistant", content: "上一轮回答被用户中断。" }
-    ];
+  if (message.status === "completed" && message.content) {
+    return { role: "assistant", content: message.content };
   }
 
-  return [];
+  if (message.status === "failed") {
+    return { role: "assistant", content: buildFailureSummary(message) };
+  }
+
+  if (message.status === "cancelled") {
+    return { role: "assistant", content: "上一轮回答被用户中断。" };
+  }
+
+  return undefined;
 }
 
-function buildFailureSummary(run: AgentRunRecord): string {
-  const reason = sanitizeFailureReason(run.error?.message);
+function buildFailureSummary(message: AgentMessageRecord): string {
+  const reason = sanitizeFailureReason(message.error?.message);
 
   if (!reason) {
     return "上一轮没有完成。";

@@ -12,18 +12,35 @@ export interface AgentSessionRecord {
   updatedAt: string;
 }
 
-export interface AgentRunRecord {
+export interface AgentAssetRecord {
   id: string;
   sessionId: string;
-  input: string;
-  maxIterations?: number;
+  messageId?: string;
+  toolCallId?: string;
+  type: "image";
+  url: string;
+  mimeType?: string;
+  width?: number;
+  height?: number;
+  prompt?: string;
+  index?: number;
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface AgentMessageRecord {
+  id: string;
+  sessionId: string;
+  role: "user" | "assistant";
   status: "running" | "completed" | "failed" | "cancelled";
-  answer?: string;
+  content: string;
+  maxIterations?: number;
   steps?: AgentStep[];
   error?: {
     code: string;
     message: string;
   };
+  assets: AgentAssetRecord[];
   createdAt: string;
   updatedAt: string;
   completedAt?: string;
@@ -64,32 +81,33 @@ export type AgentStreamEvent =
 export interface StoredAgentEvent {
   id: string;
   seq: number;
-  runId: string;
+  messageId: string;
   event: AgentStreamEvent;
   createdAt: string;
 }
 
-export interface StartAgentRunResponse {
+export interface StartAgentMessageResponse {
   session: AgentSessionRecord;
-  run: AgentRunRecord;
+  userMessage: AgentMessageRecord;
+  assistantMessage: AgentMessageRecord;
 }
 
 export interface AgentSessionResponse {
   session: AgentSessionRecord;
-  runs: AgentRunRecord[];
+  messages: AgentMessageRecord[];
 }
 
 export interface AgentSessionsResponse {
   sessions: AgentSessionRecord[];
 }
 
-export interface AgentRunDetailResponse {
-  run: AgentRunRecord;
+export interface AgentMessageDetailResponse {
+  message: AgentMessageRecord;
   events: StoredAgentEvent[];
 }
 
-export interface CancelAgentRunResponse {
-  run: AgentRunRecord;
+export interface CancelAgentMessageResponse {
+  message: AgentMessageRecord;
 }
 
 export interface ApiErrorResponse {
@@ -114,8 +132,12 @@ function parseSseBlock<T>(block: string): T | null {
   return JSON.parse(dataLine.slice("data:".length).trim()) as T;
 }
 
-export async function startAgentRun(input: string, maxIterations: number, sessionId?: string): Promise<StartAgentRunResponse> {
-  const response = await fetch(`${apiBaseUrl}/agents/runs`, {
+export async function startAgentMessage(
+  input: string,
+  maxIterations: number,
+  sessionId?: string
+): Promise<StartAgentMessageResponse> {
+  const response = await fetch(`${apiBaseUrl}/agents/messages`, {
     method: "POST",
     headers: {
       "content-type": "application/json"
@@ -123,14 +145,14 @@ export async function startAgentRun(input: string, maxIterations: number, sessio
     body: JSON.stringify({ input, maxIterations, sessionId })
   });
 
-  const payload = (await response.json()) as StartAgentRunResponse | ApiErrorResponse;
+  const payload = (await response.json()) as StartAgentMessageResponse | ApiErrorResponse;
 
   if (!response.ok) {
     const errorPayload = payload as ApiErrorResponse;
     throw new Error(`${errorPayload.error.code}: ${errorPayload.error.message}`);
   }
 
-  return payload as StartAgentRunResponse;
+  return payload as StartAgentMessageResponse;
 }
 
 export async function getAgentSession(sessionId: string): Promise<AgentSessionResponse> {
@@ -157,39 +179,39 @@ export async function listAgentSessions(): Promise<AgentSessionsResponse> {
   return payload as AgentSessionsResponse;
 }
 
-export async function getAgentRun(runId: string): Promise<AgentRunDetailResponse> {
-  const response = await fetch(`${apiBaseUrl}/agents/runs/${runId}`);
-  const payload = (await response.json()) as AgentRunDetailResponse | ApiErrorResponse;
+export async function getAgentMessage(messageId: string): Promise<AgentMessageDetailResponse> {
+  const response = await fetch(`${apiBaseUrl}/agents/messages/${messageId}`);
+  const payload = (await response.json()) as AgentMessageDetailResponse | ApiErrorResponse;
 
   if (!response.ok) {
     const errorPayload = payload as ApiErrorResponse;
     throw new Error(`${errorPayload.error.code}: ${errorPayload.error.message}`);
   }
 
-  return payload as AgentRunDetailResponse;
+  return payload as AgentMessageDetailResponse;
 }
 
-export async function cancelAgentRun(runId: string): Promise<CancelAgentRunResponse> {
-  const response = await fetch(`${apiBaseUrl}/agents/runs/${runId}/cancel`, {
+export async function cancelAgentMessage(messageId: string): Promise<CancelAgentMessageResponse> {
+  const response = await fetch(`${apiBaseUrl}/agents/messages/${messageId}/cancel`, {
     method: "POST"
   });
-  const payload = (await response.json()) as CancelAgentRunResponse | ApiErrorResponse;
+  const payload = (await response.json()) as CancelAgentMessageResponse | ApiErrorResponse;
 
   if (!response.ok) {
     const errorPayload = payload as ApiErrorResponse;
     throw new Error(`${errorPayload.error.code}: ${errorPayload.error.message}`);
   }
 
-  return payload as CancelAgentRunResponse;
+  return payload as CancelAgentMessageResponse;
 }
 
-export async function streamAgentRunEvents(
-  runId: string,
+export async function streamAgentMessageEvents(
+  messageId: string,
   after: number,
   onEvent: (event: StoredAgentEvent) => void,
   signal?: AbortSignal
 ): Promise<void> {
-  const response = await fetch(`${apiBaseUrl}/agents/runs/${runId}/events?after=${after}`, {
+  const response = await fetch(`${apiBaseUrl}/agents/messages/${messageId}/events?after=${after}`, {
     signal,
     headers: {
       accept: "text/event-stream"

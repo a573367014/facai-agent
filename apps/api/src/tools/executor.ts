@@ -66,7 +66,7 @@ export class ToolExecutor {
     const controller = new AbortController();
     const cancelFromParent = () => controller.abort();
 
-    // 外层 signal 预留给后续 run cancel。外层取消时，这里同步取消当前工具；
+    // 外层 signal 预留给后续消息取消。外层取消时，这里同步取消当前工具；
     // 如果外层已经取消，也立即把内部 controller 标记为 aborted。
     if (input.signal?.aborted) {
       controller.abort();
@@ -79,7 +79,7 @@ export class ToolExecutor {
     const execution = Promise.resolve()
       .then(() =>
         tool.execute(parsedArguments, {
-          runId: input.runId,
+          messageId: input.messageId,
           sessionId: input.sessionId,
           toolCallId: input.toolCallId,
           signal: controller.signal,
@@ -140,7 +140,7 @@ export class ToolExecutor {
   }
 
   private normalizeToolOutput(output: unknown): NormalizedToolOutput {
-    // 为了兼容旧工具，默认把工具返回值整体视为 data。
+    // 普通工具可以直接返回业务对象；只有显式 ToolOutput 才会拆出 llmContent。
     // 只有当工具显式返回 { data, llmContent } 时，才拆出给 LLM 的精简内容。
     // 这样即使某个业务工具天然返回 { data: ... }，也不会被误当成 ToolOutput。
     if (!this.isToolOutput(output)) {

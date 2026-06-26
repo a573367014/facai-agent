@@ -13,7 +13,7 @@
 
 - `OPENAI_API_KEY`
 - `OPENAI_MODEL`
-- `AGENT_CONTEXT_MAX_COMPLETED_RUNS`：新 run 最多携带多少轮历史上下文，默认 `6`
+- `AGENT_CONTEXT_MAX_MESSAGES`：新消息最多携带多少条历史上下文，默认 `12`
 - `AGENT_CONTEXT_MAX_HISTORY_CHARS`：历史上下文的近似字符预算，默认 `12000`
 - `AGENT_TOOL_TIMEOUT_MS`：工具调用超时时间，默认 `10000`
 - `AGENT_ALLOWED_TOOLS`：允许暴露和执行的工具名，逗号分隔；留空表示允许全部已注册工具
@@ -29,7 +29,6 @@
 - `VOLCENGINE_IMAGE_MAX_POLL_ATTEMPTS`：最大轮询次数，默认 `40`
 - `VOLCENGINE_IMAGE_TOOL_TIMEOUT_MS`：生图工具独立超时时间，默认 `90000`
 - `VOLCENGINE_IMAGE_BATCH_CONCURRENCY`：批量生图内部并发数，默认 `2`，范围 `1-5`
-- `AGENT_STORE`：`memory` 或 `sqlite`
 - `AGENT_SQLITE_PATH`：SQLite 文件路径，默认 `./data/agent.sqlite`
 
 ## 安装
@@ -73,7 +72,7 @@ npm run dev:web
 
 ## 演进路线 / TODO
 
-当前项目已经具备 Agent Demo 的基础能力：Fastify API、React 工作台、SSE 流式事件、session/run、SQLite 持久化、事件压缩、断线恢复和上下文续聊。后续建议按下面顺序演进，优先把 Agent Runtime 的核心能力打稳。
+当前项目已经具备 Agent Demo 的基础能力：Fastify API、React 工作台、SSE 流式事件、session/message、SQLite 持久化、事件压缩、断线恢复和上下文续聊。后续建议按下面顺序演进，优先把 Agent Runtime 的核心能力打稳。
 
 ### 1. 工具系统升级
 
@@ -125,15 +124,15 @@ Seedream 通用3.0 生图流程：
   -> AgentService 发出 tool_result，并让 LLM 把图片链接整理成最终中文回复
 ```
 
-### 2. Run 生命周期补完整
+### 2. Message 生命周期补完整
 
-目标：让用户能控制一次运行，而不是只能等待它自然结束。
+目标：让用户能控制一次 assistant message 的生成，而不是只能等待它自然结束。
 
-- [x] 支持取消运行：`POST /agents/runs/:runId/cancel`。
-- [ ] 支持重试运行：`POST /agents/runs/:runId/retry`。
-- [ ] 支持重新生成当前 run 的回答。
+- [x] 支持取消生成：`POST /agents/messages/:messageId/cancel`。
+- [ ] 支持重试生成：`POST /agents/messages/:messageId/retry`。
+- [ ] 支持重新生成当前 assistant message 的回答。
 - [ ] 支持运行中刷新页面后自动恢复订阅。
-- [ ] 支持查看、删除 session 和 run。
+- [ ] 支持查看、删除 session 和 message。
 - [ ] 后端引入 `AbortController`，让 LLM 请求和工具执行都能响应取消。
 
 为什么做它：真实 LLM 请求和工具调用都可能耗时较久，用户需要停止、重试、恢复这些基本控制能力。
@@ -143,23 +142,23 @@ Seedream 通用3.0 生图流程：
 目标：从“把所有历史都喂给模型”升级为可控的上下文构建策略。
 
 - [x] 抽出 `ContextBuilder`，集中负责构造传给 LLM 的 messages。
-- [x] 限制最近历史 run 数量，避免同一 session 越聊越长。
+- [x] 限制最近历史 message 数量，避免同一 session 越聊越长。
 - [x] 增加近似字符预算，先用轻量方式控制上下文膨胀。
-- [x] 失败 run 保留用户输入和简短失败摘要，避免“再试一次”这类补充指令丢失上下文。
-- [x] 中断 run 保留用户输入和“被用户中断”摘要，方便后续继续或改写。
+- [x] 失败 message 保留用户输入和简短失败摘要，避免“再试一次”这类补充指令丢失上下文。
+- [x] 中断 message 保留用户输入和“被用户中断”摘要，方便后续继续或改写。
 - [ ] 最近 N 轮保留原文，更早内容改成摘要。
 - [ ] 增加 token 预算，避免上下文无限增长。
 - [ ] 支持重要事实记忆，保存用户偏好、项目背景等长期信息。
 - [ ] 对工具结果做摘要，避免大结果反复进入上下文。
 
-为什么做它：如果同一个 session 下的历史 run 全部进入新 run 上下文，短期简单有效，长期会带来 token 成本、上下文窗口和旧信息干扰问题。
+为什么做它：如果同一个 session 下的历史 message 全部进入新 message 上下文，短期简单有效，长期会带来 token 成本、上下文窗口和旧信息干扰问题。
 
 当前实现背景：
 
-- `AgentRunCoordinator` 只决定“新 run 需要同 session 历史”，不再直接拼历史消息。
-- `AgentContextBuilder` 负责筛选可进入上下文的 run、按时间排序、按最近轮数和字符预算裁剪。
-- completed run 会进入上下文为 `user input + assistant answer`；failed run 会进入上下文为 `user input + 简短失败摘要`；cancelled run 会进入上下文为 `user input + 被用户中断摘要`。
-- running run 不进入上下文，避免把尚未完成的并发状态喂给新 run。
+- `AgentMessageCoordinator` 只决定“新 message 需要同 session 历史”，不再直接拼历史消息。
+- `AgentContextBuilder` 负责筛选可进入上下文的 message、按时间排序、按最近条数和字符预算裁剪。
+- completed message 会进入上下文为原始消息内容；failed message 会进入上下文为简短失败摘要；cancelled message 会进入上下文为被用户中断摘要。
+- running message 不进入上下文，避免把尚未完成的并发状态喂给新 message。
 - 最近一轮历史即使超过字符预算也会保留，避免用户刚问过的关键上下文突然消失。
 - 目前字符预算是轻量 guardrail，不是严格 tokenizer；后续可以在这个抽象内升级为真实 token 预算或摘要策略。
 
@@ -180,8 +179,8 @@ Seedream 通用3.0 生图流程：
 
 目标：让 Agent 行为可以复盘、比较和持续优化。
 
-- [ ] 保存完整 run 输入、事件、工具调用和最终答案。
-- [ ] 支持按 run 回放事件流。
+- [ ] 保存完整 message 输入、事件、工具调用和最终答案。
+- [ ] 支持按 message 回放事件流。
 - [ ] 增加固定样例集，用来比较不同模型、prompt 和工具策略。
 - [ ] 记录失败原因分类，帮助发现系统性问题。
 

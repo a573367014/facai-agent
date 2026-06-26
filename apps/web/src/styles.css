@@ -113,7 +113,7 @@ button:not(:disabled):hover {
 }
 
 .status,
-.run-badge,
+.generation-badge,
 .count-pill,
 .iteration-pill {
   display: inline-flex;
@@ -131,34 +131,34 @@ button:not(:disabled):hover {
 }
 
 .status.ok,
-.run-badge.done,
-.run-badge.answering {
+.generation-badge.done,
+.generation-badge.answering {
   border-color: #b8d2a6;
   background: var(--eye-primary-soft);
   color: var(--eye-primary-strong);
 }
 
-.run-badge.thinking,
-.run-badge.streaming {
+.generation-badge.thinking,
+.generation-badge.streaming {
   border-color: #9dc9c3;
   background: #e9f4ed;
   color: var(--eye-primary);
 }
 
-.run-badge.calling_tool,
-.run-badge.observing {
+.generation-badge.calling_tool,
+.generation-badge.observing {
   border-color: var(--eye-border-strong);
   background: var(--eye-warning-soft);
   color: var(--eye-warning);
 }
 
-.run-badge.failed {
+.generation-badge.failed {
   border-color: #e7b89e;
   background: var(--eye-danger-soft);
   color: var(--eye-danger);
 }
 
-.run-badge.idle {
+.generation-badge.idle {
   color: var(--eye-muted);
 }
 
@@ -415,7 +415,7 @@ button:not(:disabled):hover {
   font-size: 12px;
 }
 
-.chat-main-header .run-badge {
+.chat-main-header .generation-badge {
   position: absolute;
   right: 18px;
 }
@@ -457,7 +457,6 @@ button:not(:disabled):hover {
   text-transform: uppercase;
 }
 
-.run-form,
 .chat-composer {
   display: flex;
   flex-direction: column;

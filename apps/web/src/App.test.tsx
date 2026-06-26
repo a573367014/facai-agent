@@ -21,7 +21,61 @@ function createSseResponse(events: string[]): Response {
   } as Response;
 }
 
-function createStoredSseResponse(runId: string, events: Array<Record<string, unknown>>): Response {
+const timestamp = "2026-06-22T00:00:00.000Z";
+
+function createUserMessage(sessionId: string, content: string, overrides: Record<string, unknown> = {}) {
+  return {
+    id: `msg_user_${sessionId}`,
+    sessionId,
+    role: "user",
+    status: "completed",
+    content,
+    assets: [],
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    ...overrides
+  };
+}
+
+function createAssistantMessage(
+  sessionId: string,
+  content: string,
+  overrides: Record<string, unknown> = {}
+) {
+  return {
+    id: `msg_assistant_${sessionId}`,
+    sessionId,
+    role: "assistant",
+    status: "completed",
+    content,
+    assets: [],
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    ...overrides
+  };
+}
+
+function createStartMessageResponse({
+  sessionId = "session_1",
+  input,
+  assistantMessageId = "msg_1"
+}: {
+  sessionId?: string;
+  input: string;
+  assistantMessageId?: string;
+}) {
+  return {
+    session: { id: sessionId },
+    userMessage: createUserMessage(sessionId, input, { id: `${assistantMessageId}:user` }),
+    assistantMessage: createAssistantMessage(sessionId, "", {
+      id: assistantMessageId,
+      status: "running",
+      updatedAt: timestamp
+    })
+  };
+}
+
+function createStoredSseResponse(messageId: string, events: Array<Record<string, unknown>>): Response {
   const encoder = new TextEncoder();
   return {
     ok: true,
@@ -33,7 +87,7 @@ function createStoredSseResponse(runId: string, events: Array<Record<string, unk
             const storedEvent = {
               id: `event_${seq}`,
               seq,
-              runId,
+              messageId,
               event,
               createdAt: "2026-06-22T00:00:00.000Z"
             };
@@ -139,18 +193,13 @@ describe("App", () => {
             createdAt: "2026-06-22T00:00:00.000Z",
             updatedAt: "2026-06-22T00:00:00.000Z"
           },
-          runs: [
-            {
-              id: "run_from_url",
-              sessionId: "session_from_url",
-              input: "从 URL 恢复",
-              status: "completed",
-              answer: "URL 会话回答",
+          messages: [
+            createUserMessage("session_from_url", "从 URL 恢复", { id: "msg_user_from_url" }),
+            createAssistantMessage("session_from_url", "URL 会话回答", {
+              id: "msg_assistant_from_url",
               steps: [],
-              createdAt: "2026-06-22T00:00:00.000Z",
-              updatedAt: "2026-06-22T00:00:01.000Z",
               completedAt: "2026-06-22T00:00:01.000Z"
-            }
+            })
           ]
         });
       }
@@ -197,18 +246,13 @@ describe("App", () => {
             createdAt: "2026-06-22T00:00:00.000Z",
             updatedAt: "2026-06-22T00:00:01.000Z"
           },
-          runs: [
-            {
-              id: "run_a",
-              sessionId: "session_a",
-              input: "整理产品方案",
-              status: "completed",
-              answer: "产品方案内容",
+          messages: [
+            createUserMessage("session_a", "整理产品方案", { id: "msg_user_a" }),
+            createAssistantMessage("session_a", "产品方案内容", {
+              id: "msg_assistant_a",
               steps: [],
-              createdAt: "2026-06-22T00:00:00.000Z",
-              updatedAt: "2026-06-22T00:00:01.000Z",
               completedAt: "2026-06-22T00:00:01.000Z"
-            }
+            })
           ]
         });
       }
@@ -249,18 +293,13 @@ describe("App", () => {
             createdAt: "2026-06-22T00:00:00.000Z",
             updatedAt: "2026-06-22T00:00:00.000Z"
           },
-          runs: [
-            {
-              id: "run_from_url",
-              sessionId: "session_from_url",
-              input: "从 URL 恢复",
-              status: "completed",
-              answer: "URL 会话回答",
+          messages: [
+            createUserMessage("session_from_url", "从 URL 恢复", { id: "msg_user_from_url" }),
+            createAssistantMessage("session_from_url", "URL 会话回答", {
+              id: "msg_assistant_from_url",
               steps: [],
-              createdAt: "2026-06-22T00:00:00.000Z",
-              updatedAt: "2026-06-22T00:00:01.000Z",
               completedAt: "2026-06-22T00:00:01.000Z"
-            }
+            })
           ]
         });
       }
@@ -359,14 +398,11 @@ describe("App", () => {
   it("提交任务会用流式事件展示回答和可折叠工具过程", async () => {
     window.history.replaceState(null, "", "/");
     mockAppFetch((url, init) => {
-      if (url.endsWith("/agents/runs") && init?.method === "POST") {
-        return jsonResponse({
-          session: { id: "session_1" },
-          run: { id: "run_1", sessionId: "session_1", status: "running", input: "计算 12 * 9" }
-        });
+      if (url.endsWith("/agents/messages") && init?.method === "POST") {
+        return jsonResponse(createStartMessageResponse({ input: "计算 12 * 9", assistantMessageId: "msg_1" }));
       }
 
-      if (url.endsWith("/agents/runs/run_1/events?after=0")) {
+      if (url.endsWith("/agents/messages/msg_1/events?after=0")) {
         const steps = [
           {
             type: "tool_call",
@@ -376,7 +412,7 @@ describe("App", () => {
           }
         ];
 
-        return createStoredSseResponse("run_1", [
+        return createStoredSseResponse("msg_1", [
           {
             type: "tool_start",
             iteration: 0,
@@ -404,7 +440,6 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getAllByText("结果是 108").length).toBeGreaterThan(0));
     expect(window.location.search).toBe("?sessionId=session_1");
-    expect(localStorage.getItem("agent.sessionId")).toBeNull();
     expect(screen.getByText("工具过程")).toBeInTheDocument();
     expect(screen.queryByText("工具步骤")).not.toBeInTheDocument();
     expect(screen.getAllByText(/"expression": "12 \* 9"/).length).toBeGreaterThan(0);
@@ -412,7 +447,6 @@ describe("App", () => {
 
   it("打开带 sessionId 的地址时优先恢复 URL 里的会话", async () => {
     window.history.replaceState(null, "", "/?sessionId=session_from_url");
-    localStorage.setItem("agent.sessionId", "session_from_storage");
     mockAppFetch((url) => {
       if (url.endsWith("/agents/sessions/session_from_url")) {
         return jsonResponse({
@@ -422,18 +456,13 @@ describe("App", () => {
             createdAt: "2026-06-22T00:00:00.000Z",
             updatedAt: "2026-06-22T00:00:00.000Z"
           },
-          runs: [
-            {
-              id: "run_from_url",
-              sessionId: "session_from_url",
-              input: "从 URL 恢复",
-              status: "completed",
-              answer: "URL 会话回答",
+          messages: [
+            createUserMessage("session_from_url", "从 URL 恢复", { id: "msg_user_from_url" }),
+            createAssistantMessage("session_from_url", "URL 会话回答", {
+              id: "msg_assistant_from_url",
               steps: [],
-              createdAt: "2026-06-22T00:00:00.000Z",
-              updatedAt: "2026-06-22T00:00:01.000Z",
               completedAt: "2026-06-22T00:00:01.000Z"
-            }
+            })
           ]
         });
       }
@@ -444,11 +473,10 @@ describe("App", () => {
     render(<App />);
 
     await waitFor(() => expect(screen.getByText("URL 会话回答")).toBeInTheDocument());
-    expect(localStorage.getItem("agent.sessionId")).toBeNull();
     expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/sessions/session_from_url");
   });
 
-  it("刷新恢复已完成会话时从 run.steps 展示生成图片", async () => {
+  it("刷新恢复已完成会话时从 message.assets 展示生成图片", async () => {
     window.history.replaceState(null, "", "/?sessionId=session_with_image");
     mockAppFetch((url) => {
       if (url.endsWith("/agents/sessions/session_with_image")) {
@@ -459,29 +487,38 @@ describe("App", () => {
             createdAt: "2026-06-22T00:00:00.000Z",
             updatedAt: "2026-06-22T00:00:00.000Z"
           },
-          runs: [
+          messages: [
             {
-              id: "run_with_image",
+              id: "msg_user",
               sessionId: "session_with_image",
-              input: "生成一只小狗",
+              role: "user",
               status: "completed",
-              answer: "图片已生成。",
-              steps: [
+              content: "生成一只小狗",
+              assets: [],
+              createdAt: "2026-06-22T00:00:00.000Z",
+              updatedAt: "2026-06-22T00:00:00.000Z"
+            },
+            {
+              id: "msg_assistant",
+              sessionId: "session_with_image",
+              role: "assistant",
+              status: "completed",
+              content: "图片已生成。",
+              assets: [
                 {
-                  type: "tool_call",
-                  toolName: "generate_image",
-                  arguments: { prompt: "一只小狗" },
-                  result: {
-                    provider: "volcengine_seedream",
-                    prompt: "一只小狗",
-                    imageUrls: ["https://example.com/dog.png"],
-                    binaryDataBase64: []
-                  }
+                  id: "asset_dog",
+                  sessionId: "session_with_image",
+                  messageId: "msg_assistant",
+                  toolCallId: "call_image",
+                  type: "image",
+                  url: "https://example.com/dog.png",
+                  prompt: "一只小狗",
+                  index: 0,
+                  createdAt: "2026-06-22T00:00:01.000Z"
                 }
               ],
               createdAt: "2026-06-22T00:00:00.000Z",
-              updatedAt: "2026-06-22T00:00:01.000Z",
-              completedAt: "2026-06-22T00:00:01.000Z"
+              updatedAt: "2026-06-22T00:00:01.000Z"
             }
           ]
         });
@@ -496,30 +533,25 @@ describe("App", () => {
     expect(screen.getByRole("link", { name: "下载图片 1" })).toHaveAttribute("href", "https://example.com/dog.png");
   });
 
-  it("裸地址不会从 localStorage 恢复旧会话", async () => {
+  it("裸地址不会恢复会话", async () => {
     window.history.replaceState(null, "", "/");
-    localStorage.setItem("agent.sessionId", "session_from_storage");
     mockAppFetch();
 
     render(<App />);
 
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/health", expect.any(Object)));
-    expect(localStorage.getItem("agent.sessionId")).toBeNull();
     expect(vi.mocked(globalThis.fetch).mock.calls.some(([url]) => String(url).includes("/agents/sessions/"))).toBe(false);
     expect(window.location.search).toBe("");
   });
 
   it("流式运行并展示 trace 时间线", async () => {
     mockAppFetch((url, init) => {
-      if (url.endsWith("/agents/runs") && init?.method === "POST") {
-        return jsonResponse({
-          session: { id: "session_1" },
-          run: { id: "run_1", sessionId: "session_1", status: "running", input: "你好" }
-        });
+      if (url.endsWith("/agents/messages") && init?.method === "POST") {
+        return jsonResponse(createStartMessageResponse({ input: "你好", assistantMessageId: "msg_1" }));
       }
 
-      if (url.endsWith("/agents/runs/run_1/events?after=0")) {
-        return createStoredSseResponse("run_1", [
+      if (url.endsWith("/agents/messages/msg_1/events?after=0")) {
+        return createStoredSseResponse("msg_1", [
           { type: "iteration_start", iteration: 0 },
           { type: "agent_state", iteration: 0, state: "thinking", label: "模型思考中" },
           { type: "llm_start", iteration: 0 },
@@ -568,35 +600,26 @@ describe("App", () => {
     expect(screen.getAllByText(/耗时 7ms/).length).toBeGreaterThan(0);
   });
 
-  it("流式运行中可以中断当前 run", async () => {
+  it("流式运行中可以中断当前 message", async () => {
     mockAppFetch((url, init) => {
-      if (url.endsWith("/agents/runs") && init?.method === "POST") {
-        return jsonResponse({
-          session: { id: "session_1" },
-          run: {
-            id: "run_1",
-            sessionId: "session_1",
-            status: "running",
-            input: "写一段很长的内容",
-            createdAt: "2026-06-22T00:00:00.000Z",
-            updatedAt: "2026-06-22T00:00:00.000Z"
-          }
-        });
+      if (url.endsWith("/agents/messages") && init?.method === "POST") {
+        return jsonResponse(createStartMessageResponse({ input: "写一段很长的内容", assistantMessageId: "msg_1" }));
       }
 
-      if (url.endsWith("/agents/runs/run_1/events?after=0")) {
+      if (url.endsWith("/agents/messages/msg_1/events?after=0")) {
         return createOpenSseResponse();
       }
 
-      if (url.endsWith("/agents/runs/run_1/cancel") && init?.method === "POST") {
+      if (url.endsWith("/agents/messages/msg_1/cancel") && init?.method === "POST") {
         return jsonResponse({
-          run: {
-            id: "run_1",
+          message: {
+            id: "msg_1",
             sessionId: "session_1",
+            role: "assistant",
             status: "cancelled",
-            input: "写一段很长的内容",
-            answer: "",
+            content: "",
             steps: [],
+            assets: [],
             createdAt: "2026-06-22T00:00:00.000Z",
             updatedAt: "2026-06-22T00:00:01.000Z",
             completedAt: "2026-06-22T00:00:01.000Z"
@@ -616,48 +639,39 @@ describe("App", () => {
     await userEvent.click(screen.getByRole("button", { name: "停止" }));
 
     await waitFor(() =>
-      expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/runs/run_1/cancel", {
+      expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/messages/msg_1/cancel", {
         method: "POST"
       })
     );
     expect(screen.getByText("已中断")).toBeInTheDocument();
   });
 
-  it("生成中按 Enter 会先中断当前 run 再发送新 run", async () => {
-    let runCreateCount = 0;
+  it("生成中按 Enter 会先中断当前 message 再发送新 message", async () => {
+    let messageCreateCount = 0;
 
     mockAppFetch((url, init) => {
-      if (url.endsWith("/agents/runs") && init?.method === "POST") {
-        runCreateCount += 1;
-        const runId = `run_${runCreateCount}`;
+      if (url.endsWith("/agents/messages") && init?.method === "POST") {
+        messageCreateCount += 1;
+        const messageId = `msg_${messageCreateCount}`;
         const body = JSON.parse(String(init.body)) as { input: string };
 
-        return jsonResponse({
-          session: { id: "session_1" },
-          run: {
-            id: runId,
-            sessionId: "session_1",
-            status: "running",
-            input: body.input,
-            createdAt: "2026-06-22T00:00:00.000Z",
-            updatedAt: "2026-06-22T00:00:00.000Z"
-          }
-        });
+        return jsonResponse(createStartMessageResponse({ input: body.input, assistantMessageId: messageId }));
       }
 
-      if (url.endsWith("/agents/runs/run_1/events?after=0")) {
+      if (url.endsWith("/agents/messages/msg_1/events?after=0")) {
         return createOpenSseResponse();
       }
 
-      if (url.endsWith("/agents/runs/run_1/cancel") && init?.method === "POST") {
+      if (url.endsWith("/agents/messages/msg_1/cancel") && init?.method === "POST") {
         return jsonResponse({
-          run: {
-            id: "run_1",
+          message: {
+            id: "msg_1",
             sessionId: "session_1",
+            role: "assistant",
             status: "cancelled",
-            input: "第一轮",
-            answer: "",
+            content: "",
             steps: [],
+            assets: [],
             createdAt: "2026-06-22T00:00:00.000Z",
             updatedAt: "2026-06-22T00:00:01.000Z",
             completedAt: "2026-06-22T00:00:01.000Z"
@@ -665,8 +679,8 @@ describe("App", () => {
         });
       }
 
-      if (url.endsWith("/agents/runs/run_2/events?after=0")) {
-        return createStoredSseResponse("run_2", [
+      if (url.endsWith("/agents/messages/msg_2/events?after=0")) {
+        return createStoredSseResponse("msg_2", [
           { type: "answer_chunk", iteration: 0, text: "第二轮答案" },
           { type: "final_answer", answer: "第二轮答案", steps: [] }
         ]);
@@ -684,23 +698,23 @@ describe("App", () => {
     await userEvent.type(screen.getByLabelText("发消息"), "第二轮{Enter}");
 
     await waitFor(() =>
-      expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/runs/run_1/cancel", {
+      expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/messages/msg_1/cancel", {
         method: "POST"
       })
     );
     await waitFor(() => expect(screen.getAllByText("第二轮答案").length).toBeGreaterThan(0));
 
-    const runBodies = vi
+    const messageBodies = vi
       .mocked(globalThis.fetch)
-      .mock.calls.filter(([url, init]) => String(url).endsWith("/agents/runs") && init?.method === "POST")
+      .mock.calls.filter(([url, init]) => String(url).endsWith("/agents/messages") && init?.method === "POST")
       .map(([, init]) => JSON.parse(String(init?.body)) as { input: string });
 
-    expect(runBodies.map((body) => body.input)).toEqual(["第一轮", "第二轮"]);
+    expect(messageBodies.map((body) => body.input)).toEqual(["第一轮", "第二轮"]);
   });
 
-  it("创建流式 run 失败后会恢复发送按钮", async () => {
+  it("创建流式 message 失败后会恢复发送按钮", async () => {
     mockAppFetch((url, init) => {
-      if (url.endsWith("/agents/runs") && init?.method === "POST") {
+      if (url.endsWith("/agents/messages") && init?.method === "POST") {
         return jsonResponse(
           {
             error: {
@@ -727,15 +741,12 @@ describe("App", () => {
 
   it("流式运行时用 answer_chunk 实时展示答案", async () => {
     mockAppFetch((url, init) => {
-      if (url.endsWith("/agents/runs") && init?.method === "POST") {
-        return jsonResponse({
-          session: { id: "session_1" },
-          run: { id: "run_1", sessionId: "session_1", status: "running", input: "用户问题" }
-        });
+      if (url.endsWith("/agents/messages") && init?.method === "POST") {
+        return jsonResponse(createStartMessageResponse({ input: "用户问题", assistantMessageId: "msg_1" }));
       }
 
-      if (url.endsWith("/agents/runs/run_1/events?after=0")) {
-        return createStoredSseResponse("run_1", [
+      if (url.endsWith("/agents/messages/msg_1/events?after=0")) {
+        return createStoredSseResponse("msg_1", [
           { type: "iteration_start", iteration: 0 },
           { type: "agent_state", iteration: 0, state: "thinking", label: "模型思考中" },
           { type: "llm_start", iteration: 0 },
@@ -755,40 +766,59 @@ describe("App", () => {
     expect(screen.getByText("请求模型")).toBeInTheDocument();
   });
 
-  it("刷新后根据本地 activeRunId 恢复事件流", async () => {
-    localStorage.setItem("agent.activeRunId", "run_1");
+  it("刷新后根据本地 activeMessageId 恢复事件流", async () => {
+    localStorage.setItem("agent.activeMessageId", "msg_1");
     mockAppFetch((url) => {
-      if (url.endsWith("/agents/runs/run_1")) {
+      if (url.endsWith("/agents/messages/msg_1")) {
         return jsonResponse({
-          run: {
-            id: "run_1",
+          message: {
+            id: "msg_1",
             sessionId: "session_1",
-            input: "继续刚才的话题",
+            role: "assistant",
             status: "completed",
-            answer: "恢复",
+            content: "恢复",
             steps: [],
+            assets: [],
             createdAt: "2026-06-22T00:00:00.000Z",
             updatedAt: "2026-06-22T00:00:01.000Z"
           },
           events: [
             {
-              id: 1,
-              runId: "run_1",
+              id: "event_1",
+              seq: 1,
+              messageId: "msg_1",
               event: { type: "iteration_start", iteration: 0 },
               createdAt: "2026-06-22T00:00:00.000Z"
             },
             {
-              id: 2,
-              runId: "run_1",
+              id: "event_2",
+              seq: 2,
+              messageId: "msg_1",
               event: { type: "answer_chunk", iteration: 0, text: "恢复" },
               createdAt: "2026-06-22T00:00:00.000Z"
             },
             {
-              id: 3,
-              runId: "run_1",
+              id: "event_3",
+              seq: 3,
+              messageId: "msg_1",
               event: { type: "final_answer", answer: "恢复", steps: [] },
               createdAt: "2026-06-22T00:00:00.000Z"
             }
+          ]
+        });
+      }
+
+      if (url.endsWith("/agents/sessions/session_1")) {
+        return jsonResponse({
+          session: {
+            id: "session_1",
+            title: "恢复会话",
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:01.000Z"
+          },
+          messages: [
+            createUserMessage("session_1", "继续刚才的话题", { id: "msg_user_1" }),
+            createAssistantMessage("session_1", "恢复", { id: "msg_1", steps: [] })
           ]
         });
       }
@@ -800,14 +830,13 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getAllByText("恢复").length).toBeGreaterThan(0));
     expect(window.location.search).toBe("?sessionId=session_1");
-    expect(localStorage.getItem("agent.sessionId")).toBeNull();
     expect(globalThis.fetch).toHaveBeenCalledWith(
-      "http://localhost:4001/agents/runs/run_1"
+      "http://localhost:4001/agents/messages/msg_1"
     );
   });
 
   it("卸载时取消刷新恢复的事件流订阅", async () => {
-    localStorage.setItem("agent.activeRunId", "run_1");
+    localStorage.setItem("agent.activeMessageId", "msg_1");
     let streamSignal: AbortSignal | undefined;
 
     globalThis.fetch = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
@@ -821,21 +850,40 @@ describe("App", () => {
         return Promise.resolve(jsonResponse({ sessions: [] }));
       }
 
-      if (url.endsWith("/agents/runs/run_1")) {
+      if (url.endsWith("/agents/messages/msg_1")) {
         return Promise.resolve({
           ok: true,
           json: async () => ({
-            run: {
-              id: "run_1",
+            message: {
+              id: "msg_1",
               sessionId: "session_1",
-              input: "你好",
+              role: "assistant",
               status: "running",
+              content: "",
+              assets: [],
               createdAt: "2026-06-22T00:00:00.000Z",
               updatedAt: "2026-06-22T00:00:00.000Z"
             },
             events: []
           })
         } as Response);
+      }
+
+      if (url.endsWith("/agents/sessions/session_1")) {
+        return Promise.resolve(
+          jsonResponse({
+            session: {
+              id: "session_1",
+              title: "恢复会话",
+              createdAt: "2026-06-22T00:00:00.000Z",
+              updatedAt: "2026-06-22T00:00:00.000Z"
+            },
+            messages: [
+              createUserMessage("session_1", "你好", { id: "msg_user_1" }),
+              createAssistantMessage("session_1", "", { id: "msg_1", status: "running" })
+            ]
+          })
+        );
       }
 
       streamSignal = init?.signal ?? undefined;

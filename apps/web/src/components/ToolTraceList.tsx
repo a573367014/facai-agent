@@ -11,8 +11,7 @@ interface ToolTraceListProps {
 }
 
 export function ToolTraceList({ events = [], onImageAction }: ToolTraceListProps) {
-  // 后端已经持续发出细粒度事件，第一版可观测 UI 不改协议。
-  // 这里在前端把事件聚合成 ToolTrace，既能复用旧 run 的事件，也避免为了展示层新增后端表结构。
+  // 后端已经持续发出细粒度事件，这里在前端聚合成可读的工具过程。
   const traces = buildToolTraces(events);
 
   if (traces.length === 0) {

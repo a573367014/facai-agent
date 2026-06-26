@@ -1,9 +1,9 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AgentRunForm } from "./AgentRunForm";
+import { AgentComposer } from "./AgentComposer";
 
-function renderForm(overrides: Partial<Parameters<typeof AgentRunForm>[0]> = {}) {
+function renderForm(overrides: Partial<Parameters<typeof AgentComposer>[0]> = {}) {
   const props = {
     input: "你好",
     maxIterations: 4,
@@ -15,7 +15,7 @@ function renderForm(overrides: Partial<Parameters<typeof AgentRunForm>[0]> = {})
     ...overrides
   };
 
-  render(<AgentRunForm {...props} />);
+  render(<AgentComposer {...props} />);
   return props;
 }
 
@@ -23,7 +23,7 @@ afterEach(() => {
   cleanup();
 });
 
-describe("AgentRunForm", () => {
+describe("AgentComposer", () => {
   it("输入框中按 Enter 直接提交", async () => {
     const props = renderForm();
 

@@ -36,7 +36,7 @@ function isToolEvent(event: AgentStreamEvent): event is ToolEvent {
 function getToolTraceId(event: ToolEvent) {
   // 新事件都有 toolCallId，它是最可靠的聚合 key。
   // 旧的持久化事件可能没有 toolCallId，所以用 iteration + toolName 做兜底；
-  // 这种兜底无法区分同一轮里同名工具的多次调用，但能保证历史 run 至少不会丢展示。
+  // 这种兜底无法区分同一轮里同名工具的多次调用，但能保证历史事件至少不会丢展示。
   return event.toolCallId ?? `fallback:${event.iteration}:${event.toolName}`;
 }
 

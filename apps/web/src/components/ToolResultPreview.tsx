@@ -117,7 +117,7 @@ function getImageItemSize(item: ImageResultItem) {
 
 function getBatchSummary(result: ImageResult) {
   const items = result.items ?? [];
-  // 后端会给 total/succeeded/failed；这里再按 items 兜底，是为了兼容旧事件或测试中只传明细的情况。
+  // 后端会给 total/succeeded/failed；这里再按 items 兜底，避免工具只返回明细时摘要为空。
   const total = result.total ?? items.length;
   const succeeded = result.succeeded ?? items.filter((item) => item.status === "success").length;
   const failed = result.failed ?? items.filter((item) => item.status === "failed").length;

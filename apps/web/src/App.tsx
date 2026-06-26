@@ -1,25 +1,24 @@
 import { Box, Chip, Paper, Typography } from "@mui/material";
 import { useEffect, useRef, useState } from "react";
 import {
-  cancelAgentRun,
-  getAgentRun,
+  cancelAgentMessage,
+  getAgentMessage,
   getAgentSession,
   listAgentSessions,
-  startAgentRun,
-  streamAgentRunEvents,
-  type AgentRunRecord,
+  startAgentMessage,
+  streamAgentMessageEvents,
+  type AgentMessageRecord,
   type AgentSessionRecord,
   type AgentStreamEvent,
   type StoredAgentEvent
 } from "./api/agent-client";
 import { AgentConversation, type ChatMessage } from "./components/AgentConversation";
 import { AgentTimeline } from "./components/AgentTimeline";
-import { AgentRunForm } from "./components/AgentRunForm";
+import { AgentComposer } from "./components/AgentComposer";
 import { SessionSidebar, type SessionHistoryItem } from "./components/SessionSidebar";
 import "./styles.css";
 
-const legacySessionIdKey = "agent.sessionId";
-const activeRunIdKey = "agent.activeRunId";
+const activeMessageIdKey = "agent.activeMessageId";
 const activeEventSeqKey = "agent.activeEventSeq";
 const sessionIdQueryKey = "sessionId";
 
@@ -27,78 +26,50 @@ function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === "AbortError";
 }
 
-function toAssistantStatus(run: AgentRunRecord): ChatMessage["status"] {
-  if (run.status === "failed") {
-    return "failed";
-  }
-
-  if (run.status === "cancelled") {
-    return "cancelled";
-  }
-
-  if (run.status === "completed") {
-    return "completed";
-  }
-
-  return "running";
+function toChatMessageStatus(status: AgentMessageRecord["status"]): ChatMessage["status"] {
+  return status;
 }
 
-function createRunMessages(run: AgentRunRecord): ChatMessage[] {
-  const error = run.error ? `${run.error.code}: ${run.error.message}` : undefined;
+function createMessageFromRecord(message: AgentMessageRecord): ChatMessage {
+  const error = message.error ? `${message.error.code}: ${message.error.message}` : undefined;
 
-  return [
-    {
-      id: `${run.id}:user`,
-      role: "user",
-      runId: run.id,
-      content: run.input,
-      status: "completed"
-    },
-    {
-      id: `${run.id}:assistant`,
-      role: "assistant",
-      runId: run.id,
-      content: run.answer ?? "",
-      status: toAssistantStatus(run),
-      steps: run.steps ?? [],
-      events: [],
-      error
-    }
-  ];
+  return {
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    status: toChatMessageStatus(message.status),
+    steps: message.steps ?? [],
+    assets: message.assets ?? [],
+    events: [],
+    error
+  };
 }
 
-function buildMessagesFromRuns(runs: AgentRunRecord[]): ChatMessage[] {
-  return [...runs]
-    .sort((leftRun, rightRun) => leftRun.createdAt.localeCompare(rightRun.createdAt))
-    .flatMap((run) => createRunMessages(run));
+function buildMessagesFromRecords(messages: AgentMessageRecord[]): ChatMessage[] {
+  return [...messages]
+    .sort((leftMessage, rightMessage) => leftMessage.createdAt.localeCompare(rightMessage.createdAt))
+    .map((message) => createMessageFromRecord(message));
 }
 
-function mergeMessages(baseMessages: ChatMessage[], currentMessages: ChatMessage[]): ChatMessage[] {
-  const currentById = new Map(currentMessages.map((message) => [message.id, message]));
-  const usedIds = new Set<string>();
-  const merged = baseMessages.map((message) => {
-    const current = currentById.get(message.id);
-    usedIds.add(message.id);
-    return current ?? message;
-  });
+function replaceMessage(currentMessages: ChatMessage[], nextMessage: ChatMessage): ChatMessage[] {
+  const exists = currentMessages.some((message) => message.id === nextMessage.id);
 
-  for (const message of currentMessages) {
-    if (!usedIds.has(message.id)) {
-      merged.push(message);
-    }
+  if (!exists) {
+    return [...currentMessages, nextMessage];
   }
 
-  return merged;
+  return currentMessages.map((message) => (message.id === nextMessage.id ? nextMessage : message));
 }
 
-function replaceRunMessages(currentMessages: ChatMessage[], runMessages: ChatMessage[]): ChatMessage[] {
-  const runId = runMessages[0]?.runId;
+function appendStartedMessages(
+  currentMessages: ChatMessage[],
+  userMessage: AgentMessageRecord,
+  assistantMessage: AgentMessageRecord
+): ChatMessage[] {
+  const nextMessages = [createMessageFromRecord(userMessage), createMessageFromRecord(assistantMessage)];
+  const nextIds = new Set(nextMessages.map((message) => message.id));
 
-  if (!runId) {
-    return currentMessages;
-  }
-
-  return [...currentMessages.filter((message) => message.runId !== runId), ...runMessages];
+  return [...currentMessages.filter((message) => !nextIds.has(message.id)), ...nextMessages];
 }
 
 function compactTitle(value: string) {
@@ -154,14 +125,10 @@ export default function App() {
   const [events, setEvents] = useState<AgentStreamEvent[]>([]);
   const [health, setHealth] = useState("检查中");
   const [activeSessionId, setActiveSessionId] = useState<string | undefined>(() => readSessionIdFromUrl());
-  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [activeMessageId, setActiveMessageId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<AgentSessionRecord[]>([]);
   const activeStreamControllerRef = useRef<AbortController | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
-
-  useEffect(() => {
-    localStorage.removeItem(legacySessionIdKey);
-  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -214,10 +181,10 @@ export default function App() {
     let cancelled = false;
 
     getAgentSession(sessionId)
-      .then(({ session, runs }) => {
+      .then(({ session, messages }) => {
         if (!cancelled) {
           upsertSession(session);
-          setMessages((currentMessages) => mergeMessages(buildMessagesFromRuns(runs), currentMessages));
+          setMessages(buildMessagesFromRecords(messages));
         }
       })
       .catch((sessionError) => {
@@ -234,32 +201,38 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const activeRunId = localStorage.getItem(activeRunIdKey);
+    const storedActiveMessageId = localStorage.getItem(activeMessageIdKey);
 
-    if (!activeRunId) {
+    if (!storedActiveMessageId) {
       return;
     }
 
-    const runId = activeRunId;
+    const messageId = storedActiveMessageId;
     let cancelled = false;
     const controller = new AbortController();
 
-    async function recoverActiveRun() {
+    async function recoverActiveMessage() {
       setIsStreaming(true);
-      setActiveRunId(runId);
+      setActiveMessageId(messageId);
       activeStreamControllerRef.current = controller;
       setError(null);
       setEvents([]);
 
       try {
-        const snapshot = await getAgentRun(runId);
+        const snapshot = await getAgentMessage(messageId);
 
         if (cancelled) {
           return;
         }
 
-        rememberSession(snapshot.run.sessionId);
-        setMessages((currentMessages) => replaceRunMessages(currentMessages, createRunMessages(snapshot.run)));
+        rememberSession(snapshot.message.sessionId);
+        const sessionSnapshot = await getAgentSession(snapshot.message.sessionId);
+
+        if (cancelled) {
+          return;
+        }
+
+        setMessages(buildMessagesFromRecords(sessionSnapshot.messages));
         setEvents([]);
 
         for (const storedEvent of snapshot.events) {
@@ -272,13 +245,13 @@ export default function App() {
 
         const lastEventSeq = snapshot.events[snapshot.events.length - 1]?.seq ?? 0;
 
-        if (snapshot.run.status !== "running") {
-          clearActiveRun();
+        if (snapshot.message.status !== "running") {
+          clearActiveMessage();
           return;
         }
 
-        await streamAgentRunEvents(
-          runId,
+        await streamAgentMessageEvents(
+          messageId,
           lastEventSeq,
           (storedEvent) => {
             if (!cancelled) {
@@ -301,7 +274,7 @@ export default function App() {
       }
     }
 
-    void recoverActiveRun();
+    void recoverActiveMessage();
 
     return () => {
       cancelled = true;
@@ -309,10 +282,10 @@ export default function App() {
     };
   }, []);
 
-  function clearActiveRun() {
-    localStorage.removeItem(activeRunIdKey);
+  function clearActiveMessage() {
+    localStorage.removeItem(activeMessageIdKey);
     localStorage.removeItem(activeEventSeqKey);
-    setActiveRunId(null);
+    setActiveMessageId(null);
   }
 
   function upsertSession(session: AgentSessionRecord) {
@@ -334,21 +307,19 @@ export default function App() {
     writeSessionIdToUrl(sessionId);
   }
 
-  function upsertRun(run: AgentRunRecord) {
-    setMessages((currentMessages) => replaceRunMessages(currentMessages, createRunMessages(run)));
+  function upsertMessage(message: AgentMessageRecord) {
+    setMessages((currentMessages) => replaceMessage(currentMessages, createMessageFromRecord(message)));
   }
 
-  function updateAssistantMessage(runId: string, update: (message: ChatMessage) => ChatMessage) {
-    setMessages((currentMessages) =>
-      currentMessages.map((message) => (message.id === `${runId}:assistant` ? update(message) : message))
-    );
+  function updateAssistantMessage(messageId: string, update: (message: ChatMessage) => ChatMessage) {
+    setMessages((currentMessages) => currentMessages.map((message) => (message.id === messageId ? update(message) : message)));
   }
 
-  function applyAgentEvent(event: AgentStreamEvent, runId?: string) {
+  function applyAgentEvent(event: AgentStreamEvent, messageId?: string) {
     setEvents((currentEvents) => [...currentEvents, event]);
 
-    if (runId) {
-      updateAssistantMessage(runId, (message) => {
+    if (messageId) {
+      updateAssistantMessage(messageId, (message) => {
         const nextEvents = [...(message.events ?? []), event];
 
         if (event.type === "answer_delta" || event.type === "answer_chunk") {
@@ -398,58 +369,58 @@ export default function App() {
     }
 
     if (event.type === "final_answer") {
-      clearActiveRun();
+      clearActiveMessage();
     }
 
     if (event.type === "error") {
       setError(`${event.code}: ${event.message}`);
-      clearActiveRun();
+      clearActiveMessage();
     }
 
     if (event.type === "cancelled") {
-      clearActiveRun();
+      clearActiveMessage();
     }
   }
 
   function applyStoredEvent(storedEvent: StoredAgentEvent) {
     localStorage.setItem(activeEventSeqKey, String(storedEvent.seq));
-    applyAgentEvent(storedEvent.event, storedEvent.runId);
+    applyAgentEvent(storedEvent.event, storedEvent.messageId);
   }
 
-  async function startRunWithCurrentSession(submittedInput: string) {
+  async function startMessageWithCurrentSession(submittedInput: string) {
     const sessionId = activeSessionId ?? readSessionIdFromUrl();
 
     try {
-      return await startAgentRun(submittedInput, maxIterations, sessionId);
+      return await startAgentMessage(submittedInput, maxIterations, sessionId);
     } catch (error) {
       if (sessionId) {
         clearSessionIdFromUrl(sessionId);
         setActiveSessionId(undefined);
-        return startAgentRun(submittedInput, maxIterations);
+        return startAgentMessage(submittedInput, maxIterations);
       }
 
       throw error;
     }
   }
 
-  async function cancelActiveRun({ refreshAfterCancel = true, settleStreaming = true } = {}) {
-    if (!activeRunId) {
+  async function cancelActiveMessage({ refreshAfterCancel = true, settleStreaming = true } = {}) {
+    if (!activeMessageId) {
       return;
     }
 
-    const runId = activeRunId;
+    const messageId = activeMessageId;
     const controller = activeStreamControllerRef.current;
 
     controller?.abort();
 
     try {
-      const { run } = await cancelAgentRun(runId);
-      upsertRun(run);
+      const { message } = await cancelAgentMessage(messageId);
+      upsertMessage(message);
       setError(null);
     } catch (cancelError) {
       setError(cancelError instanceof Error ? cancelError.message : "中断失败");
     } finally {
-      clearActiveRun();
+      clearActiveMessage();
 
       if (activeStreamControllerRef.current === controller) {
         activeStreamControllerRef.current = null;
@@ -465,36 +436,36 @@ export default function App() {
     }
   }
 
-  async function handleSubmitRun() {
+  async function handleSubmitMessage() {
     const submittedInput = input.trim();
 
     if (!submittedInput) {
       return;
     }
 
-    if (activeRunId) {
-      await cancelActiveRun({ refreshAfterCancel: false, settleStreaming: false });
+    if (activeMessageId) {
+      await cancelActiveMessage({ refreshAfterCancel: false, settleStreaming: false });
     }
 
     setIsStreaming(true);
     setError(null);
     setEvents([]);
-    clearActiveRun();
+    clearActiveMessage();
     const controller = new AbortController();
     let streamControllerAttached = false;
 
     try {
-      const { session, run } = await startRunWithCurrentSession(submittedInput);
+      const { session, userMessage, assistantMessage } = await startMessageWithCurrentSession(submittedInput);
       rememberSession(session.id);
       upsertSession(session);
-      setActiveRunId(run.id);
+      setActiveMessageId(assistantMessage.id);
       activeStreamControllerRef.current = controller;
       streamControllerAttached = true;
-      localStorage.setItem(activeRunIdKey, run.id);
+      localStorage.setItem(activeMessageIdKey, assistantMessage.id);
       localStorage.setItem(activeEventSeqKey, "0");
-      upsertRun(run);
+      setMessages((currentMessages) => appendStartedMessages(currentMessages, userMessage, assistantMessage));
       setInput("");
-      await streamAgentRunEvents(run.id, 0, applyStoredEvent, controller.signal);
+      await streamAgentMessageEvents(assistantMessage.id, 0, applyStoredEvent, controller.signal);
       await refreshSessions();
     } catch (streamError) {
       if (!isAbortError(streamError)) {
@@ -511,12 +482,12 @@ export default function App() {
     }
   }
 
-  async function handleCancelRun() {
-    await cancelActiveRun();
+  async function handleCancelMessage() {
+    await cancelActiveMessage();
   }
 
   function handleNewSession() {
-    clearActiveRun();
+    clearActiveMessage();
     clearSessionIdFromUrl();
     setActiveSessionId(undefined);
     setInput("");
@@ -535,15 +506,15 @@ export default function App() {
       return;
     }
 
-    clearActiveRun();
+    clearActiveMessage();
     setError(null);
     setEvents([]);
 
     try {
-      const { session, runs } = await getAgentSession(sessionId);
+      const { session, messages } = await getAgentSession(sessionId);
       upsertSession(session);
       rememberSession(session.id);
-      setMessages(buildMessagesFromRuns(runs));
+      setMessages(buildMessagesFromRecords(messages));
     } catch (sessionError) {
       setError(sessionError instanceof Error ? sessionError.message : "会话恢复失败");
     }
@@ -572,7 +543,7 @@ export default function App() {
               <Typography component="p">AI 生成可能有误，请核实工具结果</Typography>
             </Box>
             {isStreaming ? (
-              <Chip className="run-badge streaming" size="small" label="生成中" color="primary" variant="outlined" />
+              <Chip className="generation-badge streaming" size="small" label="生成中" color="primary" variant="outlined" />
             ) : null}
           </Box>
 
@@ -583,15 +554,15 @@ export default function App() {
             onSuggestionSelect={handleSuggestionSelect}
           />
 
-          <AgentRunForm
+          <AgentComposer
             input={input}
             inputRef={inputRef}
             maxIterations={maxIterations}
             isStreaming={isStreaming}
             onInputChange={setInput}
             onMaxIterationsChange={setMaxIterations}
-            onSubmit={handleSubmitRun}
-            onCancel={handleCancelRun}
+            onSubmit={handleSubmitMessage}
+            onCancel={handleCancelMessage}
           />
         </Box>
 

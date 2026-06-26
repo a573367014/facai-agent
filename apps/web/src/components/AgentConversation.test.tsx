@@ -25,7 +25,7 @@ describe("AgentConversation", () => {
   it("renders assistant answers as Markdown", () => {
     const messages: ChatMessage[] = [
       {
-        id: "run_1:assistant",
+        id: "msg_1:assistant",
         role: "assistant",
         content: "**重点**\n\n- 第一项\n\n```ts\nconst value = 1;\n```",
         status: "completed"
@@ -42,7 +42,7 @@ describe("AgentConversation", () => {
   it("在回答主体展示图片预览，工具过程只保留技术轨迹", async () => {
     const messages: ChatMessage[] = [
       {
-        id: "run_1:assistant",
+        id: "msg_1:assistant",
         role: "assistant",
         content: "我查到了资料，也生成了图片。",
         status: "completed",
@@ -133,7 +133,7 @@ describe("AgentConversation", () => {
   it("渲染正文时过滤当前图片资源链接", () => {
     const messages: ChatMessage[] = [
       {
-        id: "run_1:assistant",
+        id: "msg_1:assistant",
         role: "assistant",
         content:
           "图片已经生成。\n\n[点击查看生成的小狗图片](https://example.com/generated.png)\n\n画面中是一只可爱的小狗。",
@@ -167,7 +167,7 @@ describe("AgentConversation", () => {
   it("图片资源交互按钮浮在图片上并只在 hover 或 focus 时显示", () => {
     const messages: ChatMessage[] = [
       {
-        id: "run_1:assistant",
+        id: "msg_1:assistant",
         role: "assistant",
         content: "图片已生成。",
         status: "completed",
@@ -207,7 +207,7 @@ describe("AgentConversation", () => {
   it("图片点击预览使用 MUI Dialog 承载", async () => {
     const messages: ChatMessage[] = [
       {
-        id: "run_1:assistant",
+        id: "msg_1:assistant",
         role: "assistant",
         content: "图片已生成。",
         status: "completed",
@@ -250,7 +250,7 @@ describe("AgentConversation", () => {
   it("批量生图结果在回答主体展示每个子任务的图片和失败原因", () => {
     const messages: ChatMessage[] = [
       {
-        id: "run_2:assistant",
+        id: "msg_2:assistant",
         role: "assistant",
         content: "批量图片处理完成。",
         status: "completed",
@@ -312,7 +312,7 @@ describe("AgentConversation", () => {
   it("批量生图进度事件会在最终结果前先展示已完成图片", () => {
     const messages: ChatMessage[] = [
       {
-        id: "run_3:assistant",
+        id: "msg_3:assistant",
         role: "assistant",
         content: "",
         status: "running",
@@ -364,7 +364,7 @@ describe("AgentConversation", () => {
   it("图片生成中在回答主体展示固定占位 loading", () => {
     const messages: ChatMessage[] = [
       {
-        id: "run_1:assistant",
+        id: "msg_1:assistant",
         role: "assistant",
         content: "",
         status: "running",

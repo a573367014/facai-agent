@@ -1,22 +1,22 @@
 import type { OutgoingHttpHeaders } from "node:http";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import type { AgentRunCoordinator } from "../agent/run-coordinator.js";
-import type { StoredAgentEvent } from "../agent/run-store.js";
+import type { AgentMessageCoordinator } from "../agent/agent-message-coordinator.js";
+import type { StoredAgentEvent } from "../agent/agent-store.js";
 import { AppError } from "../errors/app-error.js";
 
-const runRequestSchema = z.object({
+const messageRequestSchema = z.object({
   input: z.string().trim().min(1),
   maxIterations: z.number().int().min(1).max(8).optional()
 });
-const runStartRequestSchema = runRequestSchema.extend({
+const messageStartRequestSchema = messageRequestSchema.extend({
   sessionId: z.string().min(1).optional()
 });
 const sessionRequestSchema = z.object({
   title: z.string().trim().min(1).optional()
 });
-const runParamsSchema = z.object({
-  runId: z.string().min(1)
+const messageParamsSchema = z.object({
+  messageId: z.string().min(1)
 });
 const sessionParamsSchema = z.object({
   sessionId: z.string().min(1)
@@ -25,8 +25,8 @@ const eventsQuerySchema = z.object({
   after: z.coerce.number().int().min(0).optional()
 });
 
-function parseRunRequest(body: unknown) {
-  const parsed = runRequestSchema.safeParse(body);
+function parseMessageRequest(body: unknown) {
+  const parsed = messageRequestSchema.safeParse(body);
 
   if (!parsed.success) {
     throw new AppError("VALIDATION_ERROR", "input 必须是非空字符串，maxIterations 必须是 1 到 8 之间的整数", 400);
@@ -35,8 +35,8 @@ function parseRunRequest(body: unknown) {
   return parsed.data;
 }
 
-function parseRunStartRequest(body: unknown) {
-  const parsed = runStartRequestSchema.safeParse(body);
+function parseMessageStartRequest(body: unknown) {
+  const parsed = messageStartRequestSchema.safeParse(body);
 
   if (!parsed.success) {
     throw new AppError("VALIDATION_ERROR", "input 必须是非空字符串，maxIterations 必须是 1 到 8 之间的整数", 400);
@@ -55,11 +55,11 @@ function parseSessionRequest(body: unknown) {
   return parsed.data;
 }
 
-function parseRunParams(params: unknown) {
-  const parsed = runParamsSchema.safeParse(params);
+function parseMessageParams(params: unknown) {
+  const parsed = messageParamsSchema.safeParse(params);
 
   if (!parsed.success) {
-    throw new AppError("VALIDATION_ERROR", "runId 必须是非空字符串", 400);
+    throw new AppError("VALIDATION_ERROR", "messageId 必须是非空字符串", 400);
   }
 
   return parsed.data;
@@ -86,8 +86,6 @@ function parseEventsQuery(query: unknown) {
 }
 
 function formatStoredSseEvent(event: StoredAgentEvent): string {
-  // SSE 协议里的 id 是断线续传游标。这里用 seq，而不是事件唯一 id，
-  // 因为客户端的 after 参数表达的是“从第几个事件之后继续”。
   return `id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`;
 }
 
@@ -111,51 +109,49 @@ function buildSseHeaders(headers: Record<string, number | string | string[] | un
   return sseHeaders;
 }
 
-export async function registerAgentRoutes(app: FastifyInstance, runCoordinator: AgentRunCoordinator): Promise<void> {
+export async function registerAgentRoutes(app: FastifyInstance, coordinator: AgentMessageCoordinator): Promise<void> {
   app.post("/agents/sessions", async (request, reply) => {
     const { title } = parseSessionRequest(request.body);
-    reply.status(201).send({ session: runCoordinator.createSession(title) });
+    reply.status(201).send({ session: coordinator.createSession(title) });
   });
 
   app.get("/agents/sessions", async () => {
-    return runCoordinator.listSessions();
+    return coordinator.listSessions();
   });
 
   app.get("/agents/sessions/:sessionId", async (request) => {
     const { sessionId } = parseSessionParams(request.params);
-    return runCoordinator.getSession(sessionId);
+    return coordinator.getSession(sessionId);
   });
 
-  app.post("/agents/runs", async (request, reply) => {
-    const input = parseRunStartRequest(request.body);
-    reply.status(202).send(runCoordinator.startRun(input));
+  app.post("/agents/messages", async (request, reply) => {
+    const input = parseMessageStartRequest(request.body);
+    reply.status(202).send(coordinator.startMessage(input));
   });
 
-  app.post("/agents/sessions/:sessionId/runs", async (request, reply) => {
+  app.post("/agents/sessions/:sessionId/messages", async (request, reply) => {
     const { sessionId } = parseSessionParams(request.params);
-    const input = parseRunRequest(request.body);
-    reply.status(202).send(runCoordinator.startRun({ ...input, sessionId }));
+    const input = parseMessageRequest(request.body);
+    reply.status(202).send(coordinator.startMessage({ ...input, sessionId }));
   });
 
-  app.get("/agents/runs/:runId", async (request) => {
-    const { runId } = parseRunParams(request.params);
-    return runCoordinator.getRun(runId);
+  app.get("/agents/messages/:messageId", async (request) => {
+    const { messageId } = parseMessageParams(request.params);
+    return coordinator.getMessage(messageId);
   });
 
-  app.post("/agents/runs/:runId/cancel", async (request) => {
-    const { runId } = parseRunParams(request.params);
-    return runCoordinator.cancelRun(runId);
+  app.post("/agents/messages/:messageId/cancel", async (request) => {
+    const { messageId } = parseMessageParams(request.params);
+    return coordinator.cancelMessage(messageId);
   });
 
-  app.get("/agents/runs/:runId/events", async (request, reply) => {
-    const { runId } = parseRunParams(request.params);
+  app.get("/agents/messages/:messageId/events", async (request, reply) => {
+    const { messageId } = parseMessageParams(request.params);
     const { after = 0 } = parseEventsQuery(request.query);
-    const { run } = runCoordinator.getRun(runId);
+    const { message } = coordinator.getMessage(messageId);
 
     reply.raw.writeHead(200, buildSseHeaders(reply.getHeaders()));
 
-    // 同一个请求会先回放历史事件，再订阅实时事件。
-    // 如果回放和订阅边界刚好撞上，用 seq 去重可以避免重复推送。
     const sentEventSeqs = new Set<number>();
     let ended = false;
     let unsubscribe = () => {};
@@ -169,7 +165,6 @@ export async function registerAgentRoutes(app: FastifyInstance, runCoordinator: 
       reply.raw.end();
     };
     const writeStoredEvent = (event: StoredAgentEvent) => {
-      // after 是客户端已经收到的最后一个 seq，只发送 seq 更大的事件。
       if (ended || event.seq <= after || sentEventSeqs.has(event.seq)) {
         return;
       }
@@ -182,7 +177,7 @@ export async function registerAgentRoutes(app: FastifyInstance, runCoordinator: 
       }
     };
 
-    unsubscribe = runCoordinator.subscribe(runId, writeStoredEvent);
+    unsubscribe = coordinator.subscribe(messageId, writeStoredEvent);
     request.raw.on("close", () => {
       if (!ended) {
         ended = true;
@@ -190,11 +185,11 @@ export async function registerAgentRoutes(app: FastifyInstance, runCoordinator: 
       }
     });
 
-    for (const event of runCoordinator.getEvents(runId, after)) {
+    for (const event of coordinator.getEvents(messageId, after)) {
       writeStoredEvent(event);
     }
 
-    if (run.status !== "running") {
+    if (message.status !== "running") {
       finish();
     }
   });

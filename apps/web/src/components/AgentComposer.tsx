@@ -2,7 +2,7 @@ import { Box, IconButton, Paper, Stack, TextField, Tooltip } from "@mui/material
 import { Send, Square } from "lucide-react";
 import type { FormEvent, KeyboardEvent, Ref } from "react";
 
-interface AgentRunFormProps {
+interface AgentComposerProps {
   input: string;
   maxIterations: number;
   isStreaming: boolean;
@@ -13,7 +13,7 @@ interface AgentRunFormProps {
   inputRef?: Ref<HTMLTextAreaElement>;
 }
 
-export function AgentRunForm(props: AgentRunFormProps) {
+export function AgentComposer(props: AgentComposerProps) {
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 

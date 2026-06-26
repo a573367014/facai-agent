@@ -4,7 +4,7 @@ import { ToolAccessPolicy } from "../tools/access-policy.js";
 import type { ToolExecutor } from "../tools/executor.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { SYSTEM_INSTRUCTIONS } from "./instructions.js";
-import type { AgentMessage, AgentRunInput, AgentRunResult, AgentStep, AgentStreamEvent } from "./types.js";
+import type { AgentMessage, AgentExecutionInput, AgentExecutionResult, AgentStep, AgentStreamEvent } from "./types.js";
 
 export interface AgentServiceOptions {
   provider: LlmProvider;
@@ -21,7 +21,7 @@ export class AgentService {
     this.toolAccessPolicy = options.toolAccessPolicy ?? ToolAccessPolicy.allowAll();
   }
 
-  async run(input: AgentRunInput): Promise<AgentRunResult> {
+  async run(input: AgentExecutionInput): Promise<AgentExecutionResult> {
     const maxIterations = input.maxIterations ?? this.options.defaultMaxIterations;
     const messages: AgentMessage[] = [
       { role: "system", content: SYSTEM_INSTRUCTIONS },
@@ -93,6 +93,8 @@ export class AgentService {
         // AgentService 只编排 Agent 流程，不直接校验/执行工具。
         // 工具治理细节交给 ToolExecutor，这样后续加权限、超时、取消时不会把这里写胖。
         const execution = await this.options.toolExecutor.execute({
+          messageId: input.messageId,
+          sessionId: input.sessionId,
           toolCallId: toolCall.id,
           toolName: toolCall.name,
           arguments: toolCall.arguments,
@@ -112,7 +114,7 @@ export class AgentService {
 
         if (!execution.ok) {
           // 工具失败也是 trace 的一部分，所以先发 tool_error，让前端和持久化都能看到失败细节。
-          // 随后抛 AppError，交给外层 run coordinator 把本次 run 标记为 failed。
+          // 随后抛 AppError，交给外层 message coordinator 把本次消息标记为 failed。
           await emit({
             type: "tool_error",
             iteration,
@@ -128,7 +130,7 @@ export class AgentService {
           }
 
           hasRecoverableToolError = true;
-          // 可恢复失败不是 run 的终点，而是一次“工具观察结果”。
+          // 可恢复失败不是消息的终点，而是一次“工具观察结果”。
           // 例如参数不合法、积分不足这类情况，LLM 需要知道失败原因，再把它整合成用户能理解的话。
           // UI 仍然依赖 tool_error 事件展示结构化操作，比如购买按钮；LLM 只负责自然语言解释。
           messages.push({

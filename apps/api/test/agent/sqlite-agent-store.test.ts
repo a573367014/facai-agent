@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentService } from "../../src/agent/agent-service.js";
-import { SqliteAgentRunStore } from "../../src/agent/sqlite-run-store.js";
+import { SqliteAgentStore } from "../../src/agent/sqlite-agent-store.js";
 import { buildApp } from "../../src/app.js";
 import type { LlmProvider } from "../../src/providers/types.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
@@ -37,42 +37,84 @@ function createTestAgentService(): AgentService {
   });
 }
 
-describe("SqliteAgentRunStore", () => {
-  it("重新创建 store 后仍能读回 session、run 和 events", async () => {
+describe("SqliteAgentStore", () => {
+  it("重新创建 store 后仍能读回 session、messages、assets 和 events", async () => {
     const databasePath = createTempDatabasePath();
-    const firstStore = await SqliteAgentRunStore.create({ databasePath, answerChunkCharLimit: 4 });
-    const session = firstStore.createSession("测试会话");
-    const run = firstStore.createRun({
+    const firstStore = await SqliteAgentStore.create({ databasePath, answerChunkCharLimit: 4 });
+    const session = firstStore.createSession("图片会话");
+    const userMessage = firstStore.createMessage({
       sessionId: session.id,
-      input: "生成一句话",
-      maxIterations: 4
+      role: "user",
+      status: "completed",
+      content: "生成图片"
+    });
+    const assistantMessage = firstStore.createMessage({
+      sessionId: session.id,
+      role: "assistant",
+      status: "running"
     });
 
-    firstStore.appendEvent(run.id, { type: "iteration_start", iteration: 0 });
-    firstStore.appendEvent(run.id, { type: "answer_delta", iteration: 0, delta: "你好" });
-    firstStore.appendEvent(run.id, { type: "answer_delta", iteration: 0, delta: "世界" });
-    firstStore.appendEvent(run.id, { type: "final_answer", answer: "你好世界", steps: [] });
-    firstStore.completeRun(run.id, { answer: "你好世界", steps: [] });
+    firstStore.appendEvent(assistantMessage.id, { type: "iteration_start", iteration: 0 });
+    firstStore.appendEvent(assistantMessage.id, { type: "answer_delta", iteration: 0, delta: "你好" });
+    firstStore.appendEvent(assistantMessage.id, { type: "answer_delta", iteration: 0, delta: "世界" });
+    firstStore.appendEvent(assistantMessage.id, { type: "final_answer", answer: "你好世界", steps: [] });
+    firstStore.updateMessage(assistantMessage.id, {
+      status: "completed",
+      content: "你好世界",
+      steps: [],
+      completedAt: "2026-06-25T00:00:01.000Z"
+    });
+    firstStore.createAsset({
+      sessionId: session.id,
+      messageId: assistantMessage.id,
+      toolCallId: "call_image",
+      type: "image",
+      url: "https://example.com/pig.png",
+      prompt: "温馨田园小猪",
+      index: 0,
+      metadata: { provider: "test_image" }
+    });
     firstStore.close();
 
-    const secondStore = await SqliteAgentRunStore.create({ databasePath, answerChunkCharLimit: 4 });
-    const storedEvents = secondStore.getEvents(run.id);
+    const secondStore = await SqliteAgentStore.create({ databasePath, answerChunkCharLimit: 4 });
+    const storedEvents = secondStore.getEvents(assistantMessage.id);
 
     expect(secondStore.getSession(session.id)).toMatchObject({
       id: session.id,
-      title: "测试会话"
+      title: "图片会话"
     });
-    expect(secondStore.getRun(run.id)).toMatchObject({
-      id: run.id,
-      sessionId: session.id,
-      input: "生成一句话",
-      status: "completed",
-      answer: "你好世界",
-      steps: []
-    });
+    expect(secondStore.getMessagesBySession(session.id)).toEqual([
+      expect.objectContaining({
+        id: userMessage.id,
+        role: "user",
+        status: "completed",
+        content: "生成图片"
+      }),
+      expect.objectContaining({
+        id: assistantMessage.id,
+        role: "assistant",
+        status: "completed",
+        content: "你好世界",
+        steps: []
+      })
+    ]);
+    expect(secondStore.getAssetsBySession(session.id)).toEqual([
+      expect.objectContaining({
+        messageId: assistantMessage.id,
+        toolCallId: "call_image",
+        type: "image",
+        url: "https://example.com/pig.png",
+        prompt: "温馨田园小猪",
+        index: 0,
+        metadata: { provider: "test_image" }
+      })
+    ]);
     expect(storedEvents.map((event) => event.seq)).toEqual([1, 2, 3]);
-    expect(storedEvents.every((event) => event.id.startsWith("event_"))).toBe(true);
-    expect(new Set(storedEvents.map((event) => event.id)).size).toBe(storedEvents.length);
+    expect(storedEvents.map((event) => event.messageId)).toEqual([
+      assistantMessage.id,
+      assistantMessage.id,
+      assistantMessage.id
+    ]);
     expect(storedEvents.map((event) => event.event)).toEqual([
       { type: "iteration_start", iteration: 0 },
       { type: "answer_chunk", iteration: 0, text: "你好世界" },
@@ -83,27 +125,26 @@ describe("SqliteAgentRunStore", () => {
 
   it("能按更新时间倒序列出持久化会话", async () => {
     const databasePath = createTempDatabasePath();
-    const firstStore = await SqliteAgentRunStore.create({ databasePath });
+    const firstStore = await SqliteAgentStore.create({ databasePath });
     const firstSession = firstStore.createSession("旧会话");
     const secondSession = firstStore.createSession("新会话");
-    firstStore.createRun({
+    firstStore.createMessage({
       sessionId: firstSession.id,
-      input: "更新旧会话",
-      maxIterations: 4
+      role: "user",
+      status: "completed",
+      content: "更新旧会话"
     });
     firstStore.close();
 
-    const secondStore = await SqliteAgentRunStore.create({ databasePath });
+    const secondStore = await SqliteAgentStore.create({ databasePath });
 
     expect(secondStore.listSessions().map((session) => session.id)).toEqual([firstSession.id, secondSession.id]);
     secondStore.close();
   });
 
-  it("应用配置为 sqlite 时会把会话写入 SQLite 文件", async () => {
+  it("应用会把会话写入配置的 SQLite 文件", async () => {
     const databasePath = createTempDatabasePath();
-    const previousStore = process.env.AGENT_STORE;
     const previousDatabasePath = process.env.AGENT_SQLITE_PATH;
-    process.env.AGENT_STORE = "sqlite";
     process.env.AGENT_SQLITE_PATH = databasePath;
 
     try {
@@ -117,19 +158,13 @@ describe("SqliteAgentRunStore", () => {
 
       await app.close();
 
-      const store = await SqliteAgentRunStore.create({ databasePath });
+      const store = await SqliteAgentStore.create({ databasePath });
       expect(store.getSession(payload.session.id)).toMatchObject({
         id: payload.session.id,
         title: "SQLite 会话"
       });
       store.close();
     } finally {
-      if (previousStore === undefined) {
-        delete process.env.AGENT_STORE;
-      } else {
-        process.env.AGENT_STORE = previousStore;
-      }
-
       if (previousDatabasePath === undefined) {
         delete process.env.AGENT_SQLITE_PATH;
       } else {

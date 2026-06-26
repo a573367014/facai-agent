@@ -3,7 +3,7 @@ import { Bot, CircleAlert, CircleStop, UserRound } from "lucide-react";
 import { useEffect, useRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { AgentState, AgentStep, AgentStreamEvent } from "../api/agent-client";
+import type { AgentAssetRecord, AgentState, AgentStep, AgentStreamEvent } from "../api/agent-client";
 import { buildToolTraces, type ToolTrace } from "../utils/tool-traces";
 import {
   asImageResult,
@@ -19,10 +19,10 @@ export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
-  runId?: string;
   status?: ChatMessageStatus;
   steps?: AgentStep[];
   events?: AgentStreamEvent[];
+  assets?: AgentAssetRecord[];
   error?: string;
 }
 
@@ -95,7 +95,10 @@ function getImageResourceUrls(message: ChatMessage) {
     return [];
   }
 
-  return getImageTraces(message.events, message.steps).flatMap((trace) => asImageResult(trace.result)?.imageUrls ?? []);
+  return [
+    ...(message.assets ?? []).map((asset) => asset.url),
+    ...getImageTraces(message.events, message.steps).flatMap((trace) => asImageResult(trace.result)?.imageUrls ?? [])
+  ];
 }
 
 function stripImageResourceReferences(content: string, imageUrls: string[]) {
@@ -134,14 +137,27 @@ function MessageContent({ message, showCursor }: { message: ChatMessage; showCur
 }
 
 function MessageImageAssets({
+  assets = [],
   events = [],
   steps = [],
   onImageAction
 }: {
+  assets?: AgentAssetRecord[];
   events?: AgentStreamEvent[];
   steps?: AgentStep[];
   onImageAction?: (payload: ToolImageActionPayload) => void;
 }) {
+  if (assets.length > 0) {
+    const trace = buildImageTraceFromAssets(assets);
+    const imageResult = asImageResult(trace.result);
+
+    return (
+      <div className="message-image-assets">
+        {imageResult ? <ImagePreview trace={trace} result={imageResult} onImageAction={onImageAction} /> : null}
+      </div>
+    );
+  }
+
   const imageTraces = getImageTraces(events, steps);
 
   if (imageTraces.length === 0) {
@@ -165,6 +181,39 @@ function MessageImageAssets({
       })}
     </div>
   );
+}
+
+function buildImageTraceFromAssets(assets: AgentAssetRecord[]): ToolTrace {
+  const sortedAssets = [...assets].sort((leftAsset, rightAsset) => (leftAsset.index ?? 0) - (rightAsset.index ?? 0));
+  const firstAsset = sortedAssets[0];
+  const hasMultipleAssets = sortedAssets.length > 1;
+
+  return {
+    id: `assets:${firstAsset?.messageId ?? firstAsset?.id ?? "image"}`,
+    iteration: 0,
+    toolName: "generate_image",
+    status: "success",
+    arguments: {
+      prompt: firstAsset?.prompt
+    },
+    result: {
+      prompt: !hasMultipleAssets ? firstAsset?.prompt : undefined,
+      imageUrls: sortedAssets.map((asset) => asset.url),
+      total: hasMultipleAssets ? sortedAssets.length : undefined,
+      succeeded: hasMultipleAssets ? sortedAssets.length : undefined,
+      failed: hasMultipleAssets ? 0 : undefined,
+      items: hasMultipleAssets
+        ? sortedAssets.map((asset) => ({
+            index: asset.index,
+            status: "success",
+            prompt: asset.prompt,
+            width: asset.width,
+            height: asset.height,
+            imageUrls: [asset.url]
+          }))
+        : undefined
+    }
+  };
 }
 
 function buildImageTracesFromSteps(steps: AgentStep[] = []): ToolTrace[] {
@@ -286,7 +335,12 @@ export function AgentConversation({ messages, isActive, error, onImageAction, on
                     ) : null}
 
                     {message.role === "assistant" ? (
-                      <MessageImageAssets events={message.events} steps={message.steps} onImageAction={onImageAction} />
+                      <MessageImageAssets
+                        assets={message.assets}
+                        events={message.events}
+                        steps={message.steps}
+                        onImageAction={onImageAction}
+                      />
                     ) : null}
 
                     {message.role === "assistant" ? <ToolTraceList events={message.events} onImageAction={onImageAction} /> : null}

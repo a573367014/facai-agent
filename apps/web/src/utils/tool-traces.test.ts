@@ -56,7 +56,7 @@ describe("buildToolTraces", () => {
     ]);
   });
 
-  it("没有 toolCallId 的旧事件用 iteration 和 toolName 做兜底聚合", () => {
+  it("没有 toolCallId 的事件用 iteration 和 toolName 做兜底聚合", () => {
     const events: AgentStreamEvent[] = [
       {
         type: "tool_start",

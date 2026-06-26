@@ -12,9 +12,9 @@ export interface ToolDefinition {
 }
 
 // 每一次工具执行都会带上这份上下文。当前主要使用 toolCallId 和 signal，
-// runId/sessionId 先预留给后续权限、审计、取消 run、工具日志等能力。
+// messageId/sessionId 先预留给后续权限、审计、取消、工具日志等能力。
 export interface ToolExecutionContext {
-  runId?: string;
+  messageId?: string;
   sessionId?: string;
   toolCallId?: string;
   signal?: AbortSignal;
@@ -63,7 +63,7 @@ export type ToolExecutionResult =
         code: string;
         message: string;
         // recoverable=true 时，AgentService 可以把错误作为 role=tool 的观察结果回灌给 LLM；
-        // recoverable=false 时，通常直接结束本次 run，避免模型在系统级错误上空转。
+        // recoverable=false 时，通常直接结束本次消息，避免模型在系统级错误上空转。
         recoverable: boolean;
       };
       durationMs: number;

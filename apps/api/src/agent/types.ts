@@ -21,15 +21,17 @@ export interface AgentStep {
   result: unknown;
 }
 
-export interface AgentRunInput {
+export interface AgentExecutionInput {
   input: string;
   history?: AgentMessage[];
   maxIterations?: number;
+  messageId?: string;
+  sessionId?: string;
   signal?: AbortSignal;
   onEvent?: (event: AgentStreamEvent) => void | Promise<void>;
 }
 
-export interface AgentRunResult {
+export interface AgentExecutionResult {
   answer: string;
   steps: AgentStep[];
 }
