@@ -167,19 +167,12 @@ export class AgentMessageCoordinator {
         return;
       }
 
-      const completedMessage = this.store.updateMessage(messageId, {
+      this.store.updateMessage(messageId, {
         status: "completed",
         parts: this.withAssistantText(messageId, result.answer),
         steps: result.steps,
         completedAt: now()
       });
-
-      if (completedMessage) {
-        this.persistGeneratedAssets({
-          sessionId: completedMessage.sessionId,
-          messageId
-        });
-      }
     } catch (error) {
       if (isAbortError(error) || this.store.getMessage(messageId)?.status === "cancelled") {
         return;
@@ -361,25 +354,6 @@ export class AgentMessageCoordinator {
     return assetsByMessageId;
   }
 
-  private persistGeneratedAssets(input: { sessionId: string; messageId: string }) {
-    const toolResultEvents = this.store
-      .getEvents(input.messageId)
-      .map((event) => event.event)
-      .filter(isGeneratedImageToolResult);
-    let assetIndex = 0;
-
-    for (const event of toolResultEvents) {
-      for (const asset of extractImageAssets(event.result, assetIndex)) {
-        this.store.createAsset({
-          sessionId: input.sessionId,
-          messageId: input.messageId,
-          toolCallId: event.toolCallId,
-          ...asset
-        });
-        assetIndex += 1;
-      }
-    }
-  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -419,12 +393,6 @@ function findToolPartIndex(parts: MessagePart[], toolCallId: string, outputIndex
       part.extra?.tool?.toolCallId === toolCallId &&
       part.extra.tool.outputIndex === outputIndex
   );
-}
-
-function isGeneratedImageToolResult(
-  event: AgentStreamEvent
-): event is Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: "generate_image" } {
-  return event.type === "tool_result" && event.toolName === "generate_image";
 }
 
 function extractImageAssets(result: unknown, startIndex: number) {

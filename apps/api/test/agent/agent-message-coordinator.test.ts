@@ -85,7 +85,7 @@ describe("AgentMessageCoordinator", () => {
     }
   });
 
-  it("图片工具结果会写入 assistant message 的 assets", async () => {
+  it("图片工具结果不再写入新 asset 行", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "generate_image",
@@ -140,12 +140,12 @@ describe("AgentMessageCoordinator", () => {
         expect.objectContaining({
           role: "assistant",
           content: "图片已生成。",
-          assets: [
+          assets: [],
+          parts: [
+            { type: "text", value: "图片已生成。" },
             expect.objectContaining({
-              type: "image",
-              url: "https://example.com/pig.png",
-              prompt: "小猪",
-              toolCallId: "call_image"
+              type: "media",
+              url: "https://example.com/pig.png"
             })
           ]
         })

@@ -370,7 +370,7 @@ describe("agent routes", () => {
     ]);
   });
 
-  it("GET /agents/sessions/:sessionId 返回带图片资源的消息列表", async () => {
+  it("GET /agents/sessions/:sessionId 返回带 media parts 的消息列表", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "generate_image",
@@ -438,6 +438,22 @@ describe("agent routes", () => {
         role: string;
         content: string;
         status: string;
+        parts: Array<{
+          type: string;
+          value?: string;
+          mime?: string;
+          url?: string;
+          extra?: {
+            generation?: {
+              prompt?: string;
+              provider?: string;
+            };
+            tool?: {
+              toolCallId?: string;
+              outputIndex?: number;
+            };
+          };
+        }>;
         assets: Array<{
           type: string;
           url: string;
@@ -454,6 +470,7 @@ describe("agent routes", () => {
         role: "user",
         content: "帮我生成小猪图",
         status: "completed",
+        parts: [{ type: "text", value: "帮我生成小猪图" }],
         assets: []
       }),
       expect.objectContaining({
@@ -461,13 +478,17 @@ describe("agent routes", () => {
         role: "assistant",
         content: "图片已经生成好了。",
         status: "completed",
-        assets: [
+        assets: [],
+        parts: [
+          { type: "text", value: "图片已经生成好了。" },
           expect.objectContaining({
-            type: "image",
+            type: "media",
+            mime: "image/png",
             url: "https://example.com/pig.png",
-            prompt: "温馨田园小猪",
-            toolCallId: "call_image",
-            index: 0
+            extra: expect.objectContaining({
+              generation: { prompt: "温馨田园小猪", provider: "test_image" },
+              tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 0 }
+            })
           })
         ]
       })
