@@ -1,13 +1,18 @@
-import { Box, Chip, Paper, Typography } from "@mui/material";
+import { Box, Chip, IconButton, Paper, Typography } from "@mui/material";
+import { ChevronsLeft, ChevronsRight } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import {
-  cancelAgentMessage,
-  getAgentMessage,
+  cancelAgentRun,
+  getAgentRun,
   getAgentSession,
+  getAgentSessionMessages,
   listAgentSessions,
-  startAgentMessage,
-  streamAgentMessageEvents,
+  startAgentRun,
+  streamAgentRunEvents,
+  type AgentMessagePageInfo,
   type AgentMessageRecord,
+  type AgentRunRecord,
+  type MessagePart,
   type AgentSessionRecord,
   type AgentStreamEvent,
   type StoredAgentEvent
@@ -16,11 +21,13 @@ import { AgentConversation, type ChatMessage } from "./components/AgentConversat
 import { AgentTimeline } from "./components/AgentTimeline";
 import { AgentComposer } from "./components/AgentComposer";
 import { SessionSidebar, type SessionHistoryItem } from "./components/SessionSidebar";
+import { stripRuntimeFields, type RuntimePart } from "./prosemirror/part-serialization";
 import "./styles.css";
 
-const activeMessageIdKey = "agent.activeMessageId";
+const activeRunIdKey = "agent.activeRunId";
 const activeEventSeqKey = "agent.activeEventSeq";
 const sessionIdQueryKey = "sessionId";
+const defaultMessagePageLimit = 30;
 
 function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === "AbortError";
@@ -36,19 +43,97 @@ function createMessageFromRecord(message: AgentMessageRecord): ChatMessage {
   return {
     id: message.id,
     role: message.role,
-    content: message.content,
+    parts: normalizeMessagePartsForDisplay(message),
     status: toChatMessageStatus(message.status),
-    steps: message.steps ?? [],
-    assets: message.assets ?? [],
     events: [],
     error
   };
 }
 
+function normalizeSummaryStatusText(value: string) {
+  return value
+    .replace("已自动压缩较早上下文，后续会基于摘要和最近消息继续对话", "上下文已自动压缩，后续会基于摘要和最近消息继续对话")
+    .replace("已自动压缩较早上下文", "上下文已自动压缩")
+    .replace("已自动整理较早上下文", "上下文已自动压缩")
+    .replace("已自动压缩上下文", "上下文已自动压缩");
+}
+
+function normalizeMessagePartsForDisplay(message: AgentMessageRecord): MessagePart[] {
+  if (message.role !== "system") {
+    return message.parts;
+  }
+
+  return message.parts.map((part) => (part.type === "text" ? { ...part, value: normalizeSummaryStatusText(part.value) } : part));
+}
+
+function getMessageText(parts: MessagePart[]) {
+  return parts
+    .filter((part): part is Extract<MessagePart, { type: "text" }> => part.type === "text")
+    .map((part) => part.value.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function isSummarySystemMessage(message: ChatMessage) {
+  if (message.role !== "system") {
+    return false;
+  }
+
+  const text = getMessageText(message.parts);
+
+  return text.includes("上下文") && (text.includes("压缩") || text.includes("整理"));
+}
+
+function shouldShowSummarySystemMessage(message: ChatMessage, options: { showRunningSummary?: boolean }) {
+  if (!isSummarySystemMessage(message)) {
+    return true;
+  }
+
+  if (message.status === "completed") {
+    return true;
+  }
+
+  return Boolean(options.showRunningSummary && message.status === "running");
+}
+
+function normalizeVisibleMessages(messages: ChatMessage[], options: { showRunningSummary?: boolean } = {}): ChatMessage[] {
+  const latestSummarySystemMessageId = [...messages].reverse().find((message) => shouldShowSummarySystemMessage(message, options) && isSummarySystemMessage(message))?.id;
+
+  return messages.filter((message) => {
+    if (!shouldShowSummarySystemMessage(message, options)) {
+      return false;
+    }
+
+    return !isSummarySystemMessage(message) || message.id === latestSummarySystemMessageId;
+  });
+}
+
 function buildMessagesFromRecords(messages: AgentMessageRecord[]): ChatMessage[] {
-  return [...messages]
+  const chatMessages = [...messages]
     .sort((leftMessage, rightMessage) => leftMessage.createdAt.localeCompare(rightMessage.createdAt))
     .map((message) => createMessageFromRecord(message));
+
+  return normalizeVisibleMessages(chatMessages);
+}
+
+function createDefaultMessagePageInfo(): AgentMessagePageInfo {
+  return {
+    hasMore: false,
+    limit: defaultMessagePageLimit
+  };
+}
+
+function normalizeMessagePageInfo(pageInfo?: AgentMessagePageInfo): AgentMessagePageInfo {
+  return pageInfo ?? createDefaultMessagePageInfo();
+}
+
+function prependMessagesFromRecords(currentMessages: ChatMessage[], olderMessages: AgentMessageRecord[]): ChatMessage[] {
+  const prependedMessages = buildMessagesFromRecords(olderMessages);
+  const prependedIds = new Set(prependedMessages.map((message) => message.id));
+
+  return normalizeVisibleMessages([...prependedMessages, ...currentMessages.filter((message) => !prependedIds.has(message.id))], {
+    showRunningSummary: true
+  });
 }
 
 function replaceMessage(currentMessages: ChatMessage[], nextMessage: ChatMessage): ChatMessage[] {
@@ -61,12 +146,75 @@ function replaceMessage(currentMessages: ChatMessage[], nextMessage: ChatMessage
   return currentMessages.map((message) => (message.id === nextMessage.id ? nextMessage : message));
 }
 
-function appendStartedMessages(
-  currentMessages: ChatMessage[],
-  userMessage: AgentMessageRecord,
-  assistantMessage: AgentMessageRecord
-): ChatMessage[] {
-  const nextMessages = [createMessageFromRecord(userMessage), createMessageFromRecord(assistantMessage)];
+function upsertMessageRecord(currentMessages: ChatMessage[], message: AgentMessageRecord): ChatMessage[] {
+  return normalizeVisibleMessages(replaceMessage(currentMessages, createMessageFromRecord(message)), {
+    showRunningSummary: true
+  });
+}
+
+function markRunMessagesCancelled(currentMessages: ChatMessage[], run: AgentRunRecord): ChatMessage[] {
+  const cancelledMessageIds = new Set([run.assistantMessageId, run.systemMessageId].filter((messageId): messageId is string => Boolean(messageId)));
+
+  if (cancelledMessageIds.size === 0) {
+    return currentMessages;
+  }
+
+  return normalizeVisibleMessages(currentMessages.flatMap((message) => {
+    if (!cancelledMessageIds.has(message.id) || message.status !== "running") {
+      return [message];
+    }
+
+    if (message.role === "system") {
+      return [];
+    }
+
+    return [{
+      ...message,
+      status: "cancelled",
+      error: undefined,
+      parts: message.parts
+    }];
+  }), { showRunningSummary: true });
+}
+
+function setTextPartValue(parts: MessagePart[] = [], value: string): MessagePart[] {
+  const textPartIndex = parts.findIndex((part) => part.type === "text");
+
+  if (textPartIndex === -1) {
+    return value ? [{ type: "text", value }, ...parts] : parts;
+  }
+
+  return parts.map((part, index) => (index === textPartIndex && part.type === "text" ? { ...part, value } : part));
+}
+
+function applyPartEventToMessage(message: ChatMessage, event: AgentStreamEvent): ChatMessage {
+  if (event.type === "message.part.created") {
+    const parts = [...(message.parts ?? [])];
+    parts.splice(event.partIndex, 0, event.part);
+    return { ...message, parts };
+  }
+
+  if (event.type === "message.part.delta") {
+    return {
+      ...message,
+      parts: (message.parts ?? []).map((part, index) =>
+        index === event.partIndex && part.type === "text" ? { ...part, value: part.value + event.delta } : part
+      )
+    };
+  }
+
+  if (event.type === "message.part.updated") {
+    return {
+      ...message,
+      parts: (message.parts ?? []).map((part, index) => (index === event.partIndex ? event.part : part))
+    };
+  }
+
+  return message;
+}
+
+function appendStartedMessages(currentMessages: ChatMessage[], userMessage: AgentMessageRecord): ChatMessage[] {
+  const nextMessages = [createMessageFromRecord(userMessage)];
   const nextIds = new Set(nextMessages.map((message) => message.id));
 
   return [...currentMessages.filter((message) => !nextIds.has(message.id)), ...nextMessages];
@@ -117,18 +265,23 @@ function buildHistoryItems(sessions: AgentSessionRecord[]): SessionHistoryItem[]
 }
 
 export default function App() {
-  const [input, setInput] = useState("");
+  const [composerParts, setComposerParts] = useState<RuntimePart[]>([{ type: "text", value: "" }]);
+  const [composerFocusToken, setComposerFocusToken] = useState(0);
   const [maxIterations, setMaxIterations] = useState(4);
   const [isStreaming, setIsStreaming] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messagePageInfo, setMessagePageInfo] = useState<AgentMessagePageInfo>(() => createDefaultMessagePageInfo());
+  const [isLoadingOlderMessages, setIsLoadingOlderMessages] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [events, setEvents] = useState<AgentStreamEvent[]>([]);
   const [health, setHealth] = useState("检查中");
   const [activeSessionId, setActiveSessionId] = useState<string | undefined>(() => readSessionIdFromUrl());
-  const [activeMessageId, setActiveMessageId] = useState<string | null>(null);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<AgentSessionRecord[]>([]);
+  const [isSessionSidebarCollapsed, setIsSessionSidebarCollapsed] = useState(false);
+  const [isTracePanelCollapsed, setIsTracePanelCollapsed] = useState(false);
   const activeStreamControllerRef = useRef<AbortController | null>(null);
-  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const activeRunIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -181,10 +334,11 @@ export default function App() {
     let cancelled = false;
 
     getAgentSession(sessionId)
-      .then(({ session, messages }) => {
+      .then(({ session, messages, pageInfo }) => {
         if (!cancelled) {
           upsertSession(session);
           setMessages(buildMessagesFromRecords(messages));
+          setMessagePageInfo(normalizeMessagePageInfo(pageInfo));
         }
       })
       .catch((sessionError) => {
@@ -201,38 +355,39 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const storedActiveMessageId = localStorage.getItem(activeMessageIdKey);
+    const storedActiveRunId = localStorage.getItem(activeRunIdKey);
 
-    if (!storedActiveMessageId) {
+    if (!storedActiveRunId) {
       return;
     }
 
-    const messageId = storedActiveMessageId;
+    const runId = storedActiveRunId;
     let cancelled = false;
     const controller = new AbortController();
 
-    async function recoverActiveMessage() {
+    async function recoverActiveRun() {
       setIsStreaming(true);
-      setActiveMessageId(messageId);
+      setActiveRun(runId);
       activeStreamControllerRef.current = controller;
       setError(null);
       setEvents([]);
 
       try {
-        const snapshot = await getAgentMessage(messageId);
+        const snapshot = await getAgentRun(runId);
 
         if (cancelled) {
           return;
         }
 
-        rememberSession(snapshot.message.sessionId);
-        const sessionSnapshot = await getAgentSession(snapshot.message.sessionId);
+        rememberSession(snapshot.run.sessionId);
+        const sessionSnapshot = await getAgentSession(snapshot.run.sessionId);
 
         if (cancelled) {
           return;
         }
 
         setMessages(buildMessagesFromRecords(sessionSnapshot.messages));
+        setMessagePageInfo(normalizeMessagePageInfo(sessionSnapshot.pageInfo));
         setEvents([]);
 
         for (const storedEvent of snapshot.events) {
@@ -245,13 +400,13 @@ export default function App() {
 
         const lastEventSeq = snapshot.events[snapshot.events.length - 1]?.seq ?? 0;
 
-        if (snapshot.message.status !== "running") {
-          clearActiveMessage();
+        if (snapshot.run.status !== "running") {
+          clearActiveRun();
           return;
         }
 
-        await streamAgentMessageEvents(
-          messageId,
+        await streamAgentRunEvents(
+          runId,
           lastEventSeq,
           (storedEvent) => {
             if (!cancelled) {
@@ -274,7 +429,7 @@ export default function App() {
       }
     }
 
-    void recoverActiveMessage();
+    void recoverActiveRun();
 
     return () => {
       cancelled = true;
@@ -282,10 +437,26 @@ export default function App() {
     };
   }, []);
 
-  function clearActiveMessage() {
-    localStorage.removeItem(activeMessageIdKey);
+  function clearActiveRun() {
+    activeRunIdRef.current = null;
+    localStorage.removeItem(activeRunIdKey);
     localStorage.removeItem(activeEventSeqKey);
-    setActiveMessageId(null);
+    setActiveRunId(null);
+  }
+
+  function setActiveRun(runId: string) {
+    activeRunIdRef.current = runId;
+    setActiveRunId(runId);
+  }
+
+  function releaseActiveRun(runId?: string) {
+    if (runId && activeRunIdRef.current !== runId) {
+      return;
+    }
+
+    clearActiveRun();
+    activeStreamControllerRef.current = null;
+    setIsStreaming(false);
   }
 
   function upsertSession(session: AgentSessionRecord) {
@@ -307,26 +478,28 @@ export default function App() {
     writeSessionIdToUrl(sessionId);
   }
 
-  function upsertMessage(message: AgentMessageRecord) {
-    setMessages((currentMessages) => replaceMessage(currentMessages, createMessageFromRecord(message)));
-  }
-
   function updateAssistantMessage(messageId: string, update: (message: ChatMessage) => ChatMessage) {
     setMessages((currentMessages) => currentMessages.map((message) => (message.id === messageId ? update(message) : message)));
   }
 
-  function applyAgentEvent(event: AgentStreamEvent, messageId?: string) {
+  function applyAgentEvent(event: AgentStreamEvent, messageId?: string, runId?: string) {
     setEvents((currentEvents) => [...currentEvents, event]);
+
+    if (event.type === "session.message.created" || event.type === "session.message.updated") {
+      setMessages((currentMessages) => upsertMessageRecord(currentMessages, event.message));
+    }
 
     if (messageId) {
       updateAssistantMessage(messageId, (message) => {
         const nextEvents = [...(message.events ?? []), event];
 
-        if (event.type === "answer_delta" || event.type === "answer_chunk") {
+        if (
+          event.type === "message.part.created" ||
+          event.type === "message.part.delta" ||
+          event.type === "message.part.updated"
+        ) {
           return {
-            ...message,
-            content: message.content + (event.type === "answer_delta" ? event.delta : event.text),
-            status: "running",
+            ...applyPartEventToMessage(message, event),
             events: nextEvents
           };
         }
@@ -334,9 +507,8 @@ export default function App() {
         if (event.type === "final_answer") {
           return {
             ...message,
-            content: event.answer,
+            parts: setTextPartValue(message.parts, event.answer),
             status: "completed",
-            steps: event.steps,
             events: nextEvents,
             error: undefined
           };
@@ -368,59 +540,59 @@ export default function App() {
       });
     }
 
-    if (event.type === "final_answer") {
-      clearActiveMessage();
-    }
-
     if (event.type === "error") {
       setError(`${event.code}: ${event.message}`);
-      clearActiveMessage();
+      clearActiveRun();
     }
 
     if (event.type === "cancelled") {
-      clearActiveMessage();
+      clearActiveRun();
+    }
+
+    if (event.type === "run_completed") {
+      releaseActiveRun(runId);
     }
   }
 
   function applyStoredEvent(storedEvent: StoredAgentEvent) {
     localStorage.setItem(activeEventSeqKey, String(storedEvent.seq));
-    applyAgentEvent(storedEvent.event, storedEvent.messageId);
+    applyAgentEvent(storedEvent.event, storedEvent.messageId, storedEvent.runId);
   }
 
-  async function startMessageWithCurrentSession(submittedInput: string) {
+  async function startRunWithCurrentSession(submittedParts: MessagePart[]) {
     const sessionId = activeSessionId ?? readSessionIdFromUrl();
 
     try {
-      return await startAgentMessage(submittedInput, maxIterations, sessionId);
+      return await startAgentRun(submittedParts, maxIterations, sessionId);
     } catch (error) {
       if (sessionId) {
         clearSessionIdFromUrl(sessionId);
         setActiveSessionId(undefined);
-        return startAgentMessage(submittedInput, maxIterations);
+        return startAgentRun(submittedParts, maxIterations);
       }
 
       throw error;
     }
   }
 
-  async function cancelActiveMessage({ refreshAfterCancel = true, settleStreaming = true } = {}) {
-    if (!activeMessageId) {
+  async function cancelActiveRun({ refreshAfterCancel = true, settleStreaming = true } = {}) {
+    if (!activeRunId) {
       return;
     }
 
-    const messageId = activeMessageId;
+    const runId = activeRunId;
     const controller = activeStreamControllerRef.current;
 
     controller?.abort();
 
     try {
-      const { message } = await cancelAgentMessage(messageId);
-      upsertMessage(message);
+      const { run } = await cancelAgentRun(runId);
+      setMessages((currentMessages) => markRunMessagesCancelled(currentMessages, run));
       setError(null);
     } catch (cancelError) {
       setError(cancelError instanceof Error ? cancelError.message : "中断失败");
     } finally {
-      clearActiveMessage();
+      clearActiveRun();
 
       if (activeStreamControllerRef.current === controller) {
         activeStreamControllerRef.current = null;
@@ -432,43 +604,53 @@ export default function App() {
     }
 
     if (refreshAfterCancel) {
+      const sessionId = activeSessionId ?? readSessionIdFromUrl();
+
+      if (sessionId) {
+        const sessionSnapshot = await getAgentSession(sessionId);
+        setMessages(buildMessagesFromRecords(sessionSnapshot.messages));
+        setMessagePageInfo(normalizeMessagePageInfo(sessionSnapshot.pageInfo));
+      }
+
       await refreshSessions();
     }
   }
 
   async function handleSubmitMessage() {
-    const submittedInput = input.trim();
+    const submittedParts = stripRuntimeFields(composerParts).filter(
+      (part) => part.type === "media" || (part.type === "text" && part.value.trim())
+    );
 
-    if (!submittedInput) {
+    if (submittedParts.length === 0) {
       return;
     }
 
-    if (activeMessageId) {
-      await cancelActiveMessage({ refreshAfterCancel: false, settleStreaming: false });
+    if (activeRunId) {
+      await cancelActiveRun({ refreshAfterCancel: false, settleStreaming: false });
     }
 
     setIsStreaming(true);
     setError(null);
     setEvents([]);
-    clearActiveMessage();
+    clearActiveRun();
     const controller = new AbortController();
     let streamControllerAttached = false;
 
     try {
-      const { session, userMessage, assistantMessage } = await startMessageWithCurrentSession(submittedInput);
+      const { run, session, userMessage } = await startRunWithCurrentSession(submittedParts);
       rememberSession(session.id);
       upsertSession(session);
-      setActiveMessageId(assistantMessage.id);
+      setActiveRun(run.id);
       activeStreamControllerRef.current = controller;
       streamControllerAttached = true;
-      localStorage.setItem(activeMessageIdKey, assistantMessage.id);
+      localStorage.setItem(activeRunIdKey, run.id);
       localStorage.setItem(activeEventSeqKey, "0");
-      setMessages((currentMessages) => appendStartedMessages(currentMessages, userMessage, assistantMessage));
-      setInput("");
-      await streamAgentMessageEvents(assistantMessage.id, 0, applyStoredEvent, controller.signal);
+      setMessages((currentMessages) => appendStartedMessages(currentMessages, userMessage));
+      setComposerParts([{ type: "text", value: "" }]);
+      await streamAgentRunEvents(run.id, 0, applyStoredEvent, controller.signal);
       await refreshSessions();
     } catch (streamError) {
-      if (!isAbortError(streamError)) {
+      if (!isAbortError(streamError) && (!streamControllerAttached || activeStreamControllerRef.current === controller)) {
         setError(streamError instanceof Error ? streamError.message : "流式请求失败");
       }
     } finally {
@@ -483,22 +665,24 @@ export default function App() {
   }
 
   async function handleCancelMessage() {
-    await cancelActiveMessage();
+    await cancelActiveRun();
   }
 
   function handleNewSession() {
-    clearActiveMessage();
+    clearActiveRun();
     clearSessionIdFromUrl();
     setActiveSessionId(undefined);
-    setInput("");
+    setComposerParts([{ type: "text", value: "" }]);
     setMessages([]);
+    setMessagePageInfo(createDefaultMessagePageInfo());
+    setIsLoadingOlderMessages(false);
     setEvents([]);
     setError(null);
   }
 
   function handleSuggestionSelect(suggestion: string) {
-    setInput(suggestion);
-    inputRef.current?.focus();
+    setComposerParts([{ type: "text", value: suggestion }]);
+    setComposerFocusToken((currentToken) => currentToken + 1);
   }
 
   async function handleSelectSession(sessionId: string) {
@@ -506,29 +690,64 @@ export default function App() {
       return;
     }
 
-    clearActiveMessage();
+    clearActiveRun();
     setError(null);
     setEvents([]);
 
     try {
-      const { session, messages } = await getAgentSession(sessionId);
+      const { session, messages, pageInfo } = await getAgentSession(sessionId);
       upsertSession(session);
       rememberSession(session.id);
       setMessages(buildMessagesFromRecords(messages));
+      setMessagePageInfo(normalizeMessagePageInfo(pageInfo));
     } catch (sessionError) {
       setError(sessionError instanceof Error ? sessionError.message : "会话恢复失败");
     }
   }
 
+  async function handleLoadOlderMessages() {
+    const sessionId = activeSessionId ?? readSessionIdFromUrl();
+    const before = messagePageInfo.oldestCursor;
+
+    if (!sessionId || !before || !messagePageInfo.hasMore || isLoadingOlderMessages) {
+      return;
+    }
+
+    setIsLoadingOlderMessages(true);
+    setError(null);
+
+    try {
+      const response = await getAgentSessionMessages(sessionId, {
+        before,
+        limit: messagePageInfo.limit || defaultMessagePageLimit
+      });
+
+      setMessages((currentMessages) => prependMessagesFromRecords(currentMessages, response.messages));
+      setMessagePageInfo(response.pageInfo);
+    } catch (sessionError) {
+      setError(sessionError instanceof Error ? sessionError.message : "加载历史消息失败");
+    } finally {
+      setIsLoadingOlderMessages(false);
+    }
+  }
+
   const historyItems = buildHistoryItems(sessions);
+  const workspaceClassName = [
+    "workspace",
+    isSessionSidebarCollapsed ? "sidebar-collapsed" : null,
+    isTracePanelCollapsed ? "trace-collapsed" : null
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <Box component="main" className="app-shell fullscreen-shell">
-      <Box className="workspace">
+      <Box className={workspaceClassName}>
         <SessionSidebar
           activeSessionId={activeSessionId}
           health={health}
           historyItems={historyItems}
+          isCollapsed={isSessionSidebarCollapsed}
           isBusy={isStreaming}
           onNewSession={handleNewSession}
           onSelectSession={handleSelectSession}
@@ -536,37 +755,66 @@ export default function App() {
 
         <Box component="section" className="chat-main response-column">
           <Box component="header" className="chat-main-header">
-            <Box>
+            <Box className="chat-header-side left">
+              <IconButton
+                aria-expanded={!isSessionSidebarCollapsed}
+                aria-label={isSessionSidebarCollapsed ? "展开会话栏" : "收起会话栏"}
+                className="sidebar-toggle chat-header-toggle"
+                onClick={() => setIsSessionSidebarCollapsed((current) => !current)}
+                size="small"
+                type="button"
+              >
+                {isSessionSidebarCollapsed ? <ChevronsRight size={18} /> : <ChevronsLeft size={18} />}
+              </IconButton>
+            </Box>
+
+            <Box className="chat-main-title">
               <Typography component="h1" variant="h6">
                 {activeSessionId ? "当前会话" : "新对话"}
               </Typography>
               <Typography component="p">AI 生成可能有误，请核实工具结果</Typography>
             </Box>
-            {isStreaming ? (
-              <Chip className="generation-badge streaming" size="small" label="生成中" color="primary" variant="outlined" />
-            ) : null}
+
+            <Box className="chat-header-side right">
+              {isStreaming ? (
+                <Chip className="generation-badge streaming" size="small" label="生成中" color="primary" variant="outlined" />
+              ) : null}
+              <IconButton
+                aria-expanded={!isTracePanelCollapsed}
+                aria-label={isTracePanelCollapsed ? "展开事件时间线" : "收起事件时间线"}
+                className="sidebar-toggle chat-header-toggle"
+                onClick={() => setIsTracePanelCollapsed((current) => !current)}
+                size="small"
+                type="button"
+              >
+                {isTracePanelCollapsed ? <ChevronsLeft size={18} /> : <ChevronsRight size={18} />}
+              </IconButton>
+            </Box>
           </Box>
 
           <AgentConversation
             messages={messages}
             isActive={isStreaming}
             error={error}
+            hasMoreMessages={messagePageInfo.hasMore}
+            isLoadingOlderMessages={isLoadingOlderMessages}
+            onLoadOlderMessages={handleLoadOlderMessages}
             onSuggestionSelect={handleSuggestionSelect}
           />
 
           <AgentComposer
-            input={input}
-            inputRef={inputRef}
+            parts={composerParts}
             maxIterations={maxIterations}
             isStreaming={isStreaming}
-            onInputChange={setInput}
+            focusToken={composerFocusToken}
+            onPartsChange={setComposerParts}
             onMaxIterationsChange={setMaxIterations}
             onSubmit={handleSubmitMessage}
             onCancel={handleCancelMessage}
           />
         </Box>
 
-        <Box component="aside" className="trace-column">
+        <Box component="aside" className={isTracePanelCollapsed ? "trace-column collapsed" : "trace-column"} aria-hidden={isTracePanelCollapsed ? true : undefined}>
           <Paper component="section" className="panel trace-panel" elevation={0}>
             <Box className="panel-heading compact">
               <Box>

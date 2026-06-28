@@ -1,39 +1,35 @@
 import { Box, IconButton, Paper, Stack, TextField, Tooltip } from "@mui/material";
 import { Send, Square } from "lucide-react";
-import type { FormEvent, KeyboardEvent, Ref } from "react";
+import type { FormEvent } from "react";
+import { PartComposer } from "./PartComposer";
+import type { RuntimePart } from "../prosemirror/part-serialization";
 
 interface AgentComposerProps {
-  input: string;
+  parts: RuntimePart[];
   maxIterations: number;
   isStreaming: boolean;
-  onInputChange: (value: string) => void;
+  focusToken?: number;
+  onPartsChange: (parts: RuntimePart[]) => void;
   onMaxIterationsChange: (value: number) => void;
   onSubmit: () => void;
   onCancel: () => void;
-  inputRef?: Ref<HTMLTextAreaElement>;
 }
 
 export function AgentComposer(props: AgentComposerProps) {
+  const canSubmit = hasSubmittableParts(props.parts);
+
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    if (!props.input.trim()) {
+    if (!canSubmit) {
       return;
     }
 
     props.onSubmit();
   }
 
-  function handleInputKeyDown(event: KeyboardEvent<HTMLDivElement>) {
-    const nativeEvent = event.nativeEvent as globalThis.KeyboardEvent;
-
-    if (event.key !== "Enter" || event.shiftKey || nativeEvent.isComposing) {
-      return;
-    }
-
-    event.preventDefault();
-
-    if (!props.input.trim()) {
+  function handleComposerSubmit() {
+    if (!canSubmit) {
       return;
     }
 
@@ -44,23 +40,12 @@ export function AgentComposer(props: AgentComposerProps) {
 
   return (
     <Paper component="form" className="chat-composer" elevation={0} onSubmit={handleSubmit}>
-      <TextField
-        className="field"
-        id="agent-input"
-        placeholder="发消息..."
-        value={props.input}
-        inputRef={props.inputRef}
-        onChange={(event) => props.onInputChange(event.target.value)}
-        onKeyDown={handleInputKeyDown}
-        multiline
-        minRows={2}
-        maxRows={6}
-        fullWidth
-        slotProps={{
-          htmlInput: {
-            "aria-label": "发消息"
-          }
-        }}
+      <PartComposer
+        parts={props.parts}
+        focusToken={props.focusToken}
+        onChange={props.onPartsChange}
+        onSubmit={handleComposerSubmit}
+        onCancel={props.onCancel}
       />
 
       <Stack className="composer-toolbar" direction="row" spacing={1}>
@@ -87,7 +72,7 @@ export function AgentComposer(props: AgentComposerProps) {
               type={props.isStreaming ? "button" : "submit"}
               size="small"
               aria-label={submitButtonLabel}
-              disabled={!props.isStreaming && !props.input.trim()}
+              disabled={!props.isStreaming && !canSubmit}
               onClick={props.isStreaming ? props.onCancel : undefined}
             >
               {props.isStreaming ? <Square size={18} /> : <Send size={18} />}
@@ -97,4 +82,8 @@ export function AgentComposer(props: AgentComposerProps) {
       </Stack>
     </Paper>
   );
+}
+
+function hasSubmittableParts(parts: RuntimePart[]) {
+  return parts.some((part) => part.type === "media" || (part.type === "text" && part.value.trim().length > 0));
 }

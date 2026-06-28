@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentConversation, type ChatMessage } from "./AgentConversation";
@@ -12,6 +12,173 @@ afterEach(() => {
 });
 
 describe("AgentConversation", () => {
+  it("滚动到消息列表顶部附近时自动加载更早消息", () => {
+    const onLoadOlderMessages = vi.fn();
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_1",
+        role: "assistant",
+        parts: [{ type: "text", value: "最近回答" }],
+        status: "completed"
+      }
+    ];
+
+    const { container } = render(
+      <AgentConversation
+        messages={messages}
+        isActive={false}
+        hasMoreMessages
+        isLoadingOlderMessages={false}
+        onLoadOlderMessages={onLoadOlderMessages}
+      />
+    );
+    const scrollElement = container.querySelector(".chat-scroll") as HTMLDivElement;
+
+    Object.defineProperty(scrollElement, "scrollTop", {
+      configurable: true,
+      value: 48
+    });
+
+    fireEvent.wheel(scrollElement, { deltaY: -120 });
+    fireEvent.scroll(scrollElement);
+
+    expect(onLoadOlderMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it("程序滚动到顶部附近时不会误触发加载更早消息", () => {
+    const onLoadOlderMessages = vi.fn();
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_1",
+        role: "assistant",
+        parts: [{ type: "text", value: "最近回答" }],
+        status: "completed"
+      }
+    ];
+    const { container } = render(
+      <AgentConversation messages={messages} isActive={false} hasMoreMessages onLoadOlderMessages={onLoadOlderMessages} />
+    );
+    const scrollElement = container.querySelector(".chat-scroll") as HTMLDivElement;
+
+    Object.defineProperty(scrollElement, "scrollTop", {
+      configurable: true,
+      value: 48
+    });
+
+    fireEvent.scroll(scrollElement);
+
+    expect(onLoadOlderMessages).not.toHaveBeenCalled();
+  });
+
+  it("加载更早消息后保持当前可视内容位置不变", async () => {
+    const onLoadOlderMessages = vi.fn();
+    const recentMessages: ChatMessage[] = [
+      {
+        id: "msg_3",
+        role: "user",
+        parts: [{ type: "text", value: "最近问题" }],
+        status: "completed"
+      },
+      {
+        id: "msg_4",
+        role: "assistant",
+        parts: [{ type: "text", value: "最近回答" }],
+        status: "completed"
+      }
+    ];
+    const olderMessages: ChatMessage[] = [
+      {
+        id: "msg_1",
+        role: "user",
+        parts: [{ type: "text", value: "更早问题" }],
+        status: "completed"
+      },
+      {
+        id: "msg_2",
+        role: "assistant",
+        parts: [{ type: "text", value: "更早回答" }],
+        status: "completed"
+      }
+    ];
+    const { container, rerender } = render(
+      <AgentConversation messages={recentMessages} isActive={false} hasMoreMessages onLoadOlderMessages={onLoadOlderMessages} />
+    );
+    const scrollElement = container.querySelector(".chat-scroll") as HTMLDivElement;
+    let scrollHeight = 1000;
+    let scrollTop = 120;
+
+    Object.defineProperty(scrollElement, "scrollHeight", {
+      configurable: true,
+      get: () => scrollHeight
+    });
+    Object.defineProperty(scrollElement, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value) => {
+        scrollTop = Number(value);
+      }
+    });
+
+    scrollTop = 48;
+    fireEvent.wheel(scrollElement, { deltaY: -120 });
+    fireEvent.scroll(scrollElement);
+
+    scrollHeight = 1300;
+    rerender(
+      <AgentConversation
+        messages={[...olderMessages, ...recentMessages]}
+        isActive={false}
+        hasMoreMessages
+        onLoadOlderMessages={onLoadOlderMessages}
+      />
+    );
+
+    expect(onLoadOlderMessages).toHaveBeenCalledTimes(1);
+    expect(scrollTop).toBe(348);
+  });
+
+  it("程序滚到底部时直接定位，不使用 smooth 滚动", () => {
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_1",
+        role: "user",
+        parts: [{ type: "text", value: "问题" }],
+        status: "completed"
+      },
+      {
+        id: "msg_2",
+        role: "assistant",
+        parts: [{ type: "text", value: "回答" }],
+        status: "completed"
+      }
+    ];
+    const { container, rerender } = render(<AgentConversation messages={[]} isActive={false} />);
+    const scrollElement = container.querySelector(".chat-scroll") as HTMLDivElement;
+    const scrollTo = vi.fn();
+    let scrollTop = 0;
+
+    Object.defineProperty(scrollElement, "scrollHeight", {
+      configurable: true,
+      get: () => 1200
+    });
+    Object.defineProperty(scrollElement, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value) => {
+        scrollTop = Number(value);
+      }
+    });
+    Object.defineProperty(scrollElement, "scrollTo", {
+      configurable: true,
+      value: scrollTo
+    });
+
+    rerender(<AgentConversation messages={messages} isActive={false} />);
+
+    expect(scrollTo).not.toHaveBeenCalled();
+    expect(scrollTop).toBe(1200);
+  });
+
   it("空状态建议项可以点击并回填输入框", async () => {
     const onSuggestionSelect = vi.fn();
 
@@ -22,12 +189,58 @@ describe("AgentConversation", () => {
     expect(onSuggestionSelect).toHaveBeenCalledWith("现在上海时间是多少？");
   });
 
+  it("把 system 消息渲染成居中的轻量状态条，而不是普通气泡", () => {
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_system_summary",
+        role: "system",
+        parts: [{ type: "text", value: "上下文已自动压缩，后续会基于摘要和最近消息继续对话" }],
+        status: "completed"
+      }
+    ];
+
+    const { container } = render(<AgentConversation messages={messages} isActive={false} />);
+
+    expect(screen.getByRole("status")).toHaveTextContent("上下文已自动压缩");
+    expect(container.querySelector(".chat-system-row")).toBeInTheDocument();
+    expect(container.querySelector(".chat-avatar")).toBeNull();
+    expect(container.querySelector(".chat-bubble")).toBeNull();
+  });
+
+  it("普通消息不展示头像和昵称，assistant 以无气泡正文展示", () => {
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_user",
+        role: "user",
+        parts: [{ type: "text", value: "你好" }],
+        status: "completed"
+      },
+      {
+        id: "msg_assistant",
+        role: "assistant",
+        parts: [{ type: "text", value: "你好，我是回答正文。" }],
+        status: "completed"
+      }
+    ];
+
+    const { container } = render(<AgentConversation messages={messages} isActive={false} />);
+
+    expect(container.querySelector(".chat-scroll > .chat-scroll-content")).toBeInTheDocument();
+    expect(container.querySelector(".chat-avatar")).toBeNull();
+    expect(container.querySelector(".chat-meta")).toBeNull();
+    expect(container.querySelector(".chat-bubble.assistant")).toBeNull();
+    expect(container.querySelector(".chat-answer.assistant")).toHaveTextContent("你好，我是回答正文。");
+    expect(container.querySelector(".chat-bubble.user")).toHaveTextContent("你好");
+    expect(screen.queryByText("Agent")).not.toBeInTheDocument();
+    expect(screen.queryByText("你")).not.toBeInTheDocument();
+  });
+
   it("renders assistant answers as Markdown", () => {
     const messages: ChatMessage[] = [
       {
         id: "msg_1:assistant",
         role: "assistant",
-        content: "**重点**\n\n- 第一项\n\n```ts\nconst value = 1;\n```",
+        parts: [{ type: "text", value: "**重点**\n\n- 第一项\n\n```ts\nconst value = 1;\n```" }],
         status: "completed"
       }
     ];
@@ -39,12 +252,54 @@ describe("AgentConversation", () => {
     expect(container.querySelector("pre code")).toHaveTextContent("const value = 1;");
   });
 
+  it("renders assistant text and media from message parts", () => {
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_1:assistant",
+        role: "assistant",
+        parts: [
+          { type: "text", value: "**图片已生成。**" },
+          {
+            type: "media",
+            mime: "image/png",
+            url: "https://example.com/part-image.png",
+            width: 1024,
+            height: 768,
+            extra: {
+              lifecycle: { state: "succeeded" },
+              tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 0 },
+              generation: { prompt: "田园小猪", provider: "test" }
+            }
+          }
+        ],
+        status: "completed"
+      }
+    ];
+
+    render(<AgentConversation messages={messages} isActive={false} />);
+
+    expect(screen.getByText("图片已生成。").tagName.toLowerCase()).toBe("strong");
+    expect(screen.getByRole("img", { name: "田园小猪" })).toHaveAttribute("src", "https://example.com/part-image.png");
+  });
+
   it("在回答主体展示图片预览，工具过程只保留技术轨迹", async () => {
     const messages: ChatMessage[] = [
       {
         id: "msg_1:assistant",
         role: "assistant",
-        content: "我查到了资料，也生成了图片。",
+        parts: [
+          { type: "text", value: "我查到了资料，也生成了图片。" },
+          {
+            type: "media",
+            mime: "image/png",
+            url: "https://example.com/generated.png",
+            extra: {
+              lifecycle: { state: "succeeded" },
+              tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 0 },
+              generation: { prompt: "赛博茶馆", provider: "volcengine_seedream" }
+            }
+          }
+        ],
         status: "completed",
         events: [
           {
@@ -110,7 +365,7 @@ describe("AgentConversation", () => {
     expect(screen.getByRole("link", { name: "Fastify" })).toHaveAttribute("href", "https://fastify.dev/");
     expect(screen.getByText("generate_image")).toBeInTheDocument();
     expect(screen.getAllByText("赛博茶馆").length).toBeGreaterThan(0);
-    expect(screen.getByRole("img", { name: "生成图片 1" })).toHaveAttribute("src", "https://example.com/generated.png");
+    expect(screen.getByRole("img", { name: "赛博茶馆" })).toHaveAttribute("src", "https://example.com/generated.png");
     expect(screen.getByRole("button", { name: "预览图片 1" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "下载图片 1" })).toHaveAttribute("href", "https://example.com/generated.png");
     expect(screen.getByRole("button", { name: "更多图片操作 1" })).toBeInTheDocument();
@@ -126,17 +381,16 @@ describe("AgentConversation", () => {
     const toolEventArea = container.querySelector(".tool-events");
 
     expect(mainAssetArea).not.toBeNull();
-    expect(mainAssetArea?.querySelector('img[alt="生成图片 1"]')).not.toBeNull();
-    expect(toolEventArea?.querySelector('img[alt="生成图片 1"]')).toBeNull();
+    expect(mainAssetArea?.querySelector('img[alt="赛博茶馆"]')).not.toBeNull();
+    expect(toolEventArea?.querySelector('img[alt="赛博茶馆"]')).toBeNull();
   });
 
-  it("渲染正文时过滤当前图片资源链接", () => {
+  it("工具事件里的图片不会自动变成正文资源", () => {
     const messages: ChatMessage[] = [
       {
         id: "msg_1:assistant",
         role: "assistant",
-        content:
-          "图片已经生成。\n\n[点击查看生成的小狗图片](https://example.com/generated.png)\n\n画面中是一只可爱的小狗。",
+        parts: [{ type: "text", value: "图片已经生成。" }],
         status: "completed",
         events: [
           {
@@ -156,12 +410,10 @@ describe("AgentConversation", () => {
       }
     ];
 
-    render(<AgentConversation messages={messages} isActive={false} />);
+    const { container } = render(<AgentConversation messages={messages} isActive={false} />);
 
     expect(screen.getByText("图片已经生成。")).toBeInTheDocument();
-    expect(screen.getByText("画面中是一只可爱的小狗。")).toBeInTheDocument();
-    expect(screen.queryByText("点击查看生成的小狗图片")).not.toBeInTheDocument();
-    expect(screen.getByRole("img", { name: "生成图片 1" })).toHaveAttribute("src", "https://example.com/generated.png");
+    expect(container.querySelector(".message-image-assets")).toBeNull();
   });
 
   it("图片资源交互按钮浮在图片上并只在 hover 或 focus 时显示", () => {
@@ -169,7 +421,19 @@ describe("AgentConversation", () => {
       {
         id: "msg_1:assistant",
         role: "assistant",
-        content: "图片已生成。",
+        parts: [
+          { type: "text", value: "图片已生成。" },
+          {
+            type: "media",
+            mime: "image/png",
+            url: "https://example.com/generated.png",
+            extra: {
+              lifecycle: { state: "succeeded" },
+              tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 0 },
+              generation: { prompt: "小狗", provider: "volcengine_seedream" }
+            }
+          }
+        ],
         status: "completed",
         events: [
           {
@@ -209,7 +473,19 @@ describe("AgentConversation", () => {
       {
         id: "msg_1:assistant",
         role: "assistant",
-        content: "图片已生成。",
+        parts: [
+          { type: "text", value: "图片已生成。" },
+          {
+            type: "media",
+            mime: "image/png",
+            url: "https://example.com/generated.png",
+            extra: {
+              lifecycle: { state: "succeeded" },
+              tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 0 },
+              generation: { prompt: "小狗", provider: "volcengine_seedream" }
+            }
+          }
+        ],
         status: "completed",
         events: [
           {
@@ -247,12 +523,26 @@ describe("AgentConversation", () => {
     expect(imageRule).toContain("object-fit: contain");
   });
 
-  it("批量生图结果在回答主体展示每个子任务的图片和失败原因", () => {
+  it("批量生图结果在回答主体展示 media parts", () => {
     const messages: ChatMessage[] = [
       {
         id: "msg_2:assistant",
         role: "assistant",
-        content: "批量图片处理完成。",
+        parts: [
+          { type: "text", value: "批量图片处理完成。" },
+          {
+            type: "media",
+            mime: "image/png",
+            url: "https://example.com/watercolor-pig.png",
+            width: 1024,
+            height: 1024,
+            extra: {
+              lifecycle: { state: "succeeded" },
+              tool: { name: "generate_image", toolCallId: "call_batch_image", outputIndex: 0 },
+              generation: { prompt: "水彩风格的小猪", provider: "volcengine_seedream" }
+            }
+          }
+        ],
         status: "completed",
         events: [
           {
@@ -299,61 +589,41 @@ describe("AgentConversation", () => {
 
     render(<AgentConversation messages={messages} isActive={false} />);
 
-    expect(screen.getByText("批量 2 项，成功 1 项，失败 1 项")).toBeInTheDocument();
+    expect(screen.getByText("批量图片处理完成。")).toBeInTheDocument();
     expect(screen.getByText("水彩风格的小猪")).toBeInTheDocument();
     expect(screen.getByRole("img", { name: "水彩风格的小猪" })).toHaveAttribute(
       "src",
       "https://example.com/watercolor-pig.png"
     );
-    expect(screen.getByText("像素风格的小猪")).toBeInTheDocument();
-    expect(screen.getByText("火山通用文生图任务未在限定时间内完成")).toBeInTheDocument();
   });
 
-  it("批量生图进度事件会在最终结果前先展示已完成图片", () => {
+  it("图片生成成功后通过 media part 展示图片", () => {
     const messages: ChatMessage[] = [
       {
         id: "msg_3:assistant",
         role: "assistant",
-        content: "",
-        status: "running",
-        events: [
+        parts: [
+          { type: "text", value: "图片已生成。" },
           {
-            type: "tool_start",
-            iteration: 0,
-            toolCallId: "call_batch_image",
-            toolName: "generate_image",
-            arguments: {
-              items: [{ prompt: "水彩小猪" }, { prompt: "像素小猪" }]
-            }
-          },
-          {
-            type: "tool_progress",
-            iteration: 0,
-            toolCallId: "call_batch_image",
-            toolName: "generate_image",
-            progress: {
-              kind: "image_batch_item",
-              total: 2,
-              item: {
-                index: 1,
-                status: "success",
-                prompt: "像素小猪",
-                width: 1328,
-                height: 1328,
-                seed: -1,
-                taskId: "task_fast",
-                imageUrls: ["https://example.com/fast-pixel-pig.png"],
-                binaryDataBase64: []
-              }
+            type: "media",
+            mime: "image/png",
+            url: "https://example.com/fast-pixel-pig.png",
+            width: 1328,
+            height: 1328,
+            extra: {
+              lifecycle: { state: "succeeded" },
+              tool: { name: "generate_image", toolCallId: "call_batch_image", outputIndex: 1 },
+              generation: { prompt: "像素小猪", provider: "volcengine_seedream" }
             }
           }
-        ] as unknown as ChatMessage["events"]
+        ],
+        status: "completed",
+        events: []
       }
     ];
 
-    render(<AgentConversation messages={messages} isActive />);
+    render(<AgentConversation messages={messages} isActive={false} />);
 
-    expect(screen.getByText("批量 2 项，成功 1 项，失败 0 项")).toBeInTheDocument();
     expect(screen.getByText("像素小猪")).toBeInTheDocument();
     expect(screen.getByRole("img", { name: "像素小猪" })).toHaveAttribute(
       "src",
@@ -366,7 +636,22 @@ describe("AgentConversation", () => {
       {
         id: "msg_1:assistant",
         role: "assistant",
-        content: "",
+        parts: [
+          { type: "text", value: "我正在为你生成图片" },
+          {
+            type: "media",
+            mime: "image/png",
+            url: "",
+            width: 1328,
+            height: 1328,
+            extra: {
+              placeholder: { type: "image", label: "图片生成中" },
+              lifecycle: { state: "pending" },
+              tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 0 },
+              generation: { prompt: "粉色小猪", provider: "volcengine_seedream" }
+            }
+          }
+        ],
         status: "running",
         events: [
           {

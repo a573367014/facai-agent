@@ -4,7 +4,11 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import type { FastifyInstance } from "fastify";
+import { AgentContextBuilder } from "../../src/agent/context-builder.js";
+import { AgentMessageCoordinator } from "../../src/agent/agent-message-coordinator.js";
 import { AgentService } from "../../src/agent/agent-service.js";
+import { AgentSummaryService } from "../../src/agent/agent-summary-service.js";
+import { SqliteAgentStore } from "../../src/agent/sqlite-agent-store.js";
 import { buildApp } from "../../src/app.js";
 import type { LlmProvider } from "../../src/providers/types.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
@@ -71,6 +75,21 @@ async function waitForMessage(app: FastifyInstance, messageId: string) {
   throw new Error("message did not finish in time");
 }
 
+async function waitForRun(app: FastifyInstance, runId: string) {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const response = await app.inject({ method: "GET", url: `/agents/runs/${runId}` });
+    const payload = response.json() as { run: { status: string } };
+
+    if (payload.run.status !== "running") {
+      return payload;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
+  throw new Error("run did not finish in time");
+}
+
 describe("agent routes", () => {
   it("GET /health 返回 ok", async () => {
     const app = await buildTestApp({ agentService: createTestAgentService() });
@@ -105,24 +124,27 @@ describe("agent routes", () => {
     expect(response.statusCode).toBe(202);
     const payload = response.json() as {
       session: { id: string };
-      userMessage: { id: string; role: string; content: string; status: string; assets: unknown[] };
-      assistantMessage: { id: string; sessionId: string; role: string; status: string; content: string };
+      userMessage: { id: string; role: string; status: string; parts: unknown[] };
+      assistantMessage: { id: string; sessionId: string; role: string; status: string; parts: unknown[] };
     };
 
     expect(payload.session.id).toMatch(/^session_/);
     expect(payload.userMessage).toMatchObject({
       role: "user",
-      content: "你好",
       status: "completed",
-      assets: []
+      parts: [{ type: "text", value: "你好" }]
     });
+    expect(payload.userMessage).not.toHaveProperty("content");
+    expect(payload.userMessage).not.toHaveProperty("assets");
     expect(payload.assistantMessage.id).toMatch(/^msg_/);
     expect(payload.assistantMessage.sessionId).toBe(payload.session.id);
     expect(payload.assistantMessage).toMatchObject({
       role: "assistant",
       status: "running",
-      content: ""
+      parts: [{ type: "text", value: "" }]
     });
+    expect(payload.assistantMessage).not.toHaveProperty("content");
+    expect(payload.assistantMessage).not.toHaveProperty("assets");
 
     const completed = await waitForMessage(app, payload.assistantMessage.id);
     expect(completed.message).toMatchObject({
@@ -130,8 +152,212 @@ describe("agent routes", () => {
       sessionId: payload.session.id,
       role: "assistant",
       status: "completed",
-      content: "测试回答"
+      parts: [{ type: "text", value: "测试回答" }]
     });
+    expect(completed.message).not.toHaveProperty("content");
+    expect(completed.message).not.toHaveProperty("assets");
+    expect(completed.message).not.toHaveProperty("steps");
+  });
+
+  it("POST /agents/messages 支持直接提交 message parts", async () => {
+    const app = await buildTestApp({ agentService: createTestAgentService() });
+    const response = await app.inject({
+      method: "POST",
+      url: "/agents/messages",
+      payload: {
+        parts: [
+          { type: "text", value: "帮我生成图片" },
+          {
+            type: "text",
+            value: "warm_pastoral",
+            extra: {
+              placeholder: {
+                type: "select",
+                label: "风格",
+                options: [{ label: "温馨田园风", value: "warm_pastoral" }]
+              }
+            }
+          }
+        ]
+      }
+    });
+
+    expect(response.statusCode).toBe(202);
+    const payload = response.json() as {
+      userMessage: {
+        parts: unknown[];
+      };
+    };
+
+    expect(payload.userMessage.parts).toEqual([
+      { type: "text", value: "帮我生成图片" },
+      {
+        type: "text",
+        value: "warm_pastoral",
+        extra: {
+          placeholder: {
+            type: "select",
+            label: "风格",
+            options: [{ label: "温馨田园风", value: "warm_pastoral" }]
+          }
+        }
+      }
+    ]);
+    expect(payload.userMessage).not.toHaveProperty("content");
+  });
+
+  it("POST /agents/runs 创建 run，并在后台生成 assistant message", async () => {
+    const app = await buildTestApp({ agentService: createTestAgentService() });
+    const response = await app.inject({
+      method: "POST",
+      url: "/agents/runs",
+      payload: { input: "你好" }
+    });
+
+    expect(response.statusCode).toBe(202);
+    const payload = response.json() as {
+      run: { id: string; status: string; phase: string; userMessageId: string; assistantMessageId?: string };
+      session: { id: string };
+      userMessage: { id: string; role: string; status: string; parts: unknown[] };
+      assistantMessage?: unknown;
+    };
+
+    expect(payload.run.id).toMatch(/^run_/);
+    expect(payload.run).toMatchObject({
+      status: "running",
+      phase: "compressing",
+      userMessageId: payload.userMessage.id
+    });
+    expect(payload.assistantMessage).toBeUndefined();
+    expect(payload.userMessage).toMatchObject({
+      role: "user",
+      status: "completed",
+      parts: [{ type: "text", value: "你好" }]
+    });
+
+    const completed = await waitForRun(app, payload.run.id);
+    expect(completed.run).toMatchObject({
+      id: payload.run.id,
+      sessionId: payload.session.id,
+      status: "completed",
+      phase: "completed",
+      userMessageId: payload.userMessage.id,
+      assistantMessageId: expect.stringMatching(/^msg_/)
+    });
+  });
+
+  it("GET /agents/runs/:runId/events 回放 run 级事件", async () => {
+    const app = await buildTestApp({ agentService: createTestAgentService() });
+    const createResponse = await app.inject({
+      method: "POST",
+      url: "/agents/runs",
+      payload: { input: "你好" }
+    });
+    const { run } = createResponse.json() as { run: { id: string } };
+
+    await waitForRun(app, run.id);
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/agents/runs/${run.id}/events?after=0`
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-type"]).toContain("text/event-stream");
+    expect(response.body).toContain("id: 1");
+    expect(response.body).toContain("\"id\":\"event_");
+    expect(response.body).toContain(`"runId":"${run.id}"`);
+    expect(response.body).toContain("\"type\":\"session.message.created\"");
+    expect(response.body).toContain("\"type\":\"final_answer\"");
+    expect(response.body).toContain("\"answer\":\"测试回答\"");
+  });
+
+  it("POST /agents/sessions/:sessionId/messages 不返回压缩 prelude，摘要在 message 完成后静默刷新", async () => {
+    let answerCount = 0;
+    const registry = new ToolRegistry();
+    const answerProvider: LlmProvider = {
+      complete: async () => {
+        answerCount += 1;
+        return { content: `第 ${answerCount} 轮回答` };
+      }
+    };
+    const summaryProvider: LlmProvider = {
+      complete: async () => ({
+        content: JSON.stringify({
+          userGoal: "理解 Agent 上下文压缩",
+          currentTask: "message 完成后压缩",
+          decisions: ["在 assistant message 完成后静默压缩旧上下文"],
+          preferences: ["中文"],
+          constraints: [],
+          importantFacts: ["前两轮已经完成"],
+          openQuestions: [],
+          recentProgress: ["摘要已完成"]
+        })
+      })
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService(answerProvider, registry),
+      store,
+      new AgentContextBuilder({ maxHistoryMessages: 10 }),
+      new AgentSummaryService({
+        provider: summaryProvider,
+        triggerMessageCount: 3,
+        keepRecentMessages: 2,
+        triggerCharacterCount: 0
+      })
+    );
+    const app = await buildApp({ coordinator });
+    apps.push(app);
+
+    try {
+      const firstResponse = await app.inject({
+        method: "POST",
+        url: "/agents/messages",
+        payload: { input: "第一轮问题" }
+      });
+      const firstPayload = firstResponse.json() as {
+        session: { id: string };
+        assistantMessage: { id: string };
+      };
+      await waitForMessage(app, firstPayload.assistantMessage.id);
+
+      const secondResponse = await app.inject({
+        method: "POST",
+        url: `/agents/sessions/${firstPayload.session.id}/messages`,
+        payload: { input: "第二轮问题" }
+      });
+      const secondPayload = secondResponse.json() as { assistantMessage: { id: string } };
+      await waitForMessage(app, secondPayload.assistantMessage.id);
+
+      const thirdResponse = await app.inject({
+        method: "POST",
+        url: `/agents/sessions/${firstPayload.session.id}/messages`,
+        payload: { input: "第三轮问题" }
+      });
+      const thirdPayload = thirdResponse.json() as {
+        userMessage: { role: string; parts: Array<{ type: string; value: string }> };
+        assistantMessage: { id: string; role: string; status: string };
+        preludeMessages?: unknown[];
+        preludeEvents?: unknown[];
+      };
+
+      expect(thirdResponse.statusCode).toBe(202);
+      expect(thirdPayload.preludeMessages).toBeUndefined();
+      expect(thirdPayload.preludeEvents).toBeUndefined();
+      expect(thirdPayload.userMessage).toMatchObject({
+        role: "user",
+        parts: [{ type: "text", value: "第三轮问题" }]
+      });
+      expect(thirdPayload.assistantMessage).toMatchObject({
+        role: "assistant",
+        status: "running"
+      });
+      expect(store.getSessionSummary(firstPayload.session.id)).toBeDefined();
+      expect(store.getMessagesBySession(firstPayload.session.id).some((message) => message.role === "system")).toBe(false);
+    } finally {
+      store.close();
+    }
   });
 
   it("GET /agents/sessions 按更新时间倒序返回会话列表", async () => {
@@ -191,7 +417,7 @@ describe("agent routes", () => {
     expect(response.body).toContain("\"answer\":\"测试回答\"");
   });
 
-  it("GET /agents/messages/:messageId/events 会把高频 answer_delta 合并成 answer_chunk", async () => {
+  it("GET /agents/messages/:messageId/events 只持久化 message part delta 文本事件", async () => {
     const deltaParts = ["这", "是", "一", "段", "需", "要", "合", "并", "的", "流", "式", "回", "答"];
     const registry = new ToolRegistry();
     const provider: LlmProvider = {
@@ -223,15 +449,14 @@ describe("agent routes", () => {
       url: `/agents/messages/${assistantMessage.id}`
     });
     const snapshot = snapshotResponse.json() as {
-      events: Array<{ event: { type: string; text?: string; delta?: string } }>;
+      events: Array<{ event: { type: string; delta?: string } }>;
     };
     const answerDeltaEvents = snapshot.events.filter((event) => event.event.type === "answer_delta");
-    const answerChunkEvents = snapshot.events.filter((event) => event.event.type === "answer_chunk");
+    const partDeltaEvents = snapshot.events.filter((event) => event.event.type === "message.part.delta");
 
     expect(answerDeltaEvents).toEqual([]);
-    expect(answerChunkEvents.length).toBeGreaterThan(0);
-    expect(answerChunkEvents.length).toBeLessThan(deltaParts.length);
-    expect(answerChunkEvents.map((event) => event.event.text).join("")).toBe(deltaParts.join(""));
+    expect(partDeltaEvents).toHaveLength(deltaParts.length);
+    expect(partDeltaEvents.map((event) => event.event.delta).join("")).toBe(deltaParts.join(""));
   });
 
   it("POST /agents/messages/:messageId/cancel 会中断运行中的 assistant message", async () => {
@@ -322,7 +547,7 @@ describe("agent routes", () => {
     ]);
   });
 
-  it("GET /agents/sessions/:sessionId 返回带图片资源的消息列表", async () => {
+  it("GET /agents/sessions/:sessionId 返回带 media parts 的消息列表", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "generate_image",
@@ -388,14 +613,22 @@ describe("agent routes", () => {
     const payload = sessionResponse.json() as {
       messages: Array<{
         role: string;
-        content: string;
         status: string;
-        assets: Array<{
+        parts: Array<{
           type: string;
-          url: string;
-          prompt?: string;
-          toolCallId?: string;
-          index?: number;
+          value?: string;
+          mime?: string;
+          url?: string;
+          extra?: {
+            generation?: {
+              prompt?: string;
+              provider?: string;
+            };
+            tool?: {
+              toolCallId?: string;
+              outputIndex?: number;
+            };
+          };
         }>;
       }>;
     };
@@ -404,25 +637,93 @@ describe("agent routes", () => {
     expect(payload.messages).toEqual([
       expect.objectContaining({
         role: "user",
-        content: "帮我生成小猪图",
         status: "completed",
-        assets: []
+        parts: [{ type: "text", value: "帮我生成小猪图" }]
       }),
       expect.objectContaining({
         id: created.assistantMessage.id,
         role: "assistant",
-        content: "图片已经生成好了。",
         status: "completed",
-        assets: [
+        parts: [
+          { type: "text", value: "图片已经生成好了。" },
           expect.objectContaining({
-            type: "image",
+            type: "media",
+            mime: "image/png",
             url: "https://example.com/pig.png",
-            prompt: "温馨田园小猪",
-            toolCallId: "call_image",
-            index: 0
+            extra: expect.objectContaining({
+              generation: { prompt: "温馨田园小猪", provider: "test_image" },
+              tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 0 }
+            })
           })
         ]
       })
     ]);
+  });
+
+  it("GET /agents/sessions/:sessionId 默认按最近消息分页，并支持 before 游标加载更早消息", async () => {
+    let answerCount = 0;
+    const registry = new ToolRegistry();
+    const provider: LlmProvider = {
+      complete: async () => {
+        answerCount += 1;
+        return { content: `第 ${answerCount} 轮回答` };
+      }
+    };
+    const app = await buildTestApp({
+      agentService: createAgentService(provider, registry)
+    });
+    const firstResponse = await app.inject({
+      method: "POST",
+      url: "/agents/messages",
+      payload: { input: "第 1 轮问题" }
+    });
+    const firstPayload = firstResponse.json() as {
+      session: { id: string };
+      assistantMessage: { id: string };
+    };
+
+    await waitForMessage(app, firstPayload.assistantMessage.id);
+
+    for (const round of [2, 3, 4]) {
+      const response = await app.inject({
+        method: "POST",
+        url: `/agents/sessions/${firstPayload.session.id}/messages`,
+        payload: { input: `第 ${round} 轮问题` }
+      });
+      const payload = response.json() as { assistantMessage: { id: string } };
+      await waitForMessage(app, payload.assistantMessage.id);
+    }
+
+    const recentResponse = await app.inject({
+      method: "GET",
+      url: `/agents/sessions/${firstPayload.session.id}?limit=2`
+    });
+    const recentPayload = recentResponse.json() as {
+      messages: Array<{ id: string; role: string; parts: Array<{ type: string; value: string }> }>;
+      pageInfo: { hasMore: boolean; oldestCursor?: string; limit: number };
+    };
+
+    expect(recentResponse.statusCode).toBe(200);
+    expect(recentPayload.messages.map((message) => message.parts[0]?.value)).toEqual(["第 4 轮问题", "第 4 轮回答"]);
+    expect(recentPayload.pageInfo.hasMore).toBe(true);
+    expect(recentPayload.pageInfo.limit).toBe(2);
+    expect(recentPayload.pageInfo.oldestCursor).toBe(recentPayload.messages[0].id);
+
+    const previousResponse = await app.inject({
+      method: "GET",
+      url: `/agents/sessions/${firstPayload.session.id}/messages?before=${recentPayload.pageInfo.oldestCursor}&limit=2`
+    });
+    const previousPayload = previousResponse.json() as {
+      messages: Array<{ parts: Array<{ type: string; value: string }> }>;
+      pageInfo: { hasMore: boolean; oldestCursor?: string; limit: number };
+    };
+
+    expect(previousResponse.statusCode).toBe(200);
+    expect(previousPayload.messages.map((message) => message.parts[0]?.value)).toEqual(["第 3 轮问题", "第 3 轮回答"]);
+    expect(previousPayload.pageInfo).toEqual({
+      hasMore: true,
+      oldestCursor: previousPayload.messages[0] ? expect.any(String) : undefined,
+      limit: 2
+    });
   });
 });

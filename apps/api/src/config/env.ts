@@ -9,6 +9,9 @@ const envSchema = z.object({
   AGENT_MAX_ITERATIONS: z.coerce.number().int().min(1).max(8).default(4),
   AGENT_CONTEXT_MAX_MESSAGES: z.coerce.number().int().min(0).max(50).default(12),
   AGENT_CONTEXT_MAX_HISTORY_CHARS: z.coerce.number().int().min(0).max(200_000).default(12_000),
+  AGENT_SUMMARY_TRIGGER_MESSAGES: z.coerce.number().int().min(0).max(100).default(16),
+  AGENT_SUMMARY_KEEP_RECENT_MESSAGES: z.coerce.number().int().min(1).max(50).default(8),
+  AGENT_SUMMARY_TRIGGER_CHARS: z.coerce.number().int().min(0).max(200_000).default(2000),
   AGENT_TOOL_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
   AGENT_ALLOWED_TOOLS: z
     .string()
