@@ -4,7 +4,7 @@ import { ToolAccessPolicy } from "../tools/access-policy.js";
 import type { ToolExecutor } from "../tools/executor.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { SYSTEM_INSTRUCTIONS } from "./instructions.js";
-import type { AgentMessage, AgentExecutionInput, AgentExecutionResult, AgentStep, AgentStreamEvent } from "./types.js";
+import type { AgentMessage, AgentExecutionInput, AgentExecutionResult, AgentStreamEvent } from "./types.js";
 
 export interface AgentServiceOptions {
   provider: LlmProvider;
@@ -28,7 +28,6 @@ export class AgentService {
       ...(input.history ?? []),
       { role: "user", content: input.input }
     ];
-    const steps: AgentStep[] = [];
     // LLM 只能看到当前策略允许的工具。这里不是唯一安全边界，
     // ToolExecutor 执行前还会再检查一次；双层处理能同时减少误调用和阻止越权执行。
     const tools = this.toolAccessPolicy.filterDefinitions(this.options.toolRegistry.getDefinitions());
@@ -63,8 +62,8 @@ export class AgentService {
         await emit({ type: "agent_state", iteration, state: "answering", label: "生成最终答案" });
         await emit({ type: "iteration_end", iteration, outcome: "final_answer" });
         await emit({ type: "agent_state", iteration, state: "done", label: "运行完成" });
-        await emit({ type: "final_answer", answer: response.content, steps });
-        return { answer: response.content, steps };
+        await emit({ type: "final_answer", answer: response.content });
+        return { answer: response.content };
       }
 
       for (const toolCall of response.toolCalls) {
@@ -146,12 +145,6 @@ export class AgentService {
         }
 
         hasSuccessfulToolResult = true;
-        steps.push({
-          type: "tool_call",
-          toolName: toolCall.name,
-          arguments: toolCall.arguments,
-          result: execution.data
-        });
         await emit({
           type: "tool_result",
           iteration,

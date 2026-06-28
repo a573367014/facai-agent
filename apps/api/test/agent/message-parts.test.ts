@@ -2,8 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   appendTextDelta,
   createTextPart,
-  legacyContentToParts,
-  partsToLegacyContent,
   partsToLlmText,
   stripRuntimePartFields,
   upsertGeneratedImageParts,
@@ -18,21 +16,6 @@ describe("message parts", () => {
     ]);
 
     expect(parts).toEqual([{ type: "text", value: "hello" }]);
-  });
-
-  it("converts legacy content into one text part", () => {
-    expect(legacyContentToParts("你好")).toEqual([{ type: "text", value: "你好" }]);
-    expect(legacyContentToParts("")).toEqual([]);
-  });
-
-  it("keeps only text in the legacy sqlite mirror", () => {
-    expect(partsToLegacyContent([{ type: "text", value: "你好" }])).toBe("你好");
-    expect(
-      partsToLegacyContent([
-        { type: "text", value: "图在这里" },
-        { type: "media", mime: "image/png", url: "https://example.com/pig.png", name: "小猪" }
-      ])
-    ).toBe("图在这里");
   });
 
   it("projects select values to labels for LLM context", () => {

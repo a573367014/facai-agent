@@ -6,7 +6,9 @@ interface AgentTimelineProps {
   events: AgentStreamEvent[];
 }
 
-function getEventTitle(event: AgentStreamEvent): string {
+type TimelineEvent = AgentStreamEvent;
+
+function getEventTitle(event: TimelineEvent): string {
   switch (event.type) {
     case "iteration_start":
       return `第 ${event.iteration + 1} 轮开始`;
@@ -16,16 +18,24 @@ function getEventTitle(event: AgentStreamEvent): string {
       return event.label;
     case "llm_start":
       return "请求模型";
+    case "session.message.created":
+      return "会话消息已创建";
+    case "session.message.updated":
+      return "会话消息已更新";
     case "message.part.created":
       return "消息片段已创建";
     case "message.part.delta":
       return "消息片段增量";
     case "message.part.updated":
       return "消息片段已更新";
+    case "summary_start":
+      return "开始压缩上下文";
+    case "summary_completed":
+      return "上下文压缩完成";
+    case "summary_failed":
+      return "上下文压缩失败";
     case "answer_delta":
       return "答案片段";
-    case "answer_chunk":
-      return "答案合并片段";
     case "llm_response":
       return "模型响应";
     case "tool_call_ready":
@@ -40,6 +50,8 @@ function getEventTitle(event: AgentStreamEvent): string {
       return `工具错误：${event.toolName}`;
     case "final_answer":
       return "最终答案";
+    case "run_completed":
+      return "运行收尾完成";
     case "cancelled":
       return "运行已中断";
     case "error":
@@ -47,17 +59,24 @@ function getEventTitle(event: AgentStreamEvent): string {
   }
 }
 
-function getEventSummary(event: AgentStreamEvent): string {
+function getEventSummary(event: TimelineEvent): string {
   switch (event.type) {
     case "answer_delta":
       return event.delta;
-    case "answer_chunk":
-      return event.text;
     case "message.part.created":
     case "message.part.updated":
       return `${event.part.type} #${event.partIndex + 1}`;
     case "message.part.delta":
       return event.delta;
+    case "session.message.created":
+    case "session.message.updated":
+      return `${event.message.role} · ${event.message.status}`;
+    case "summary_start":
+      return `待整理 ${event.uncoveredMessageCount} 条，压缩 ${event.summarizedMessageCount} 条`;
+    case "summary_completed":
+      return `覆盖到 ${event.coveredMessageId} · 耗时 ${event.durationMs}ms`;
+    case "summary_failed":
+      return `${event.error.code}: ${event.error.message}`;
     case "llm_response":
       return event.toolCalls?.length ? `返回 ${event.toolCalls.length} 个工具调用` : "返回自然语言内容";
     case "tool_call_ready":
@@ -77,6 +96,8 @@ function getEventSummary(event: AgentStreamEvent): string {
         .join(" · ");
     case "final_answer":
       return event.answer;
+    case "run_completed":
+      return event.messageId;
     case "cancelled":
       return event.reason ?? "";
     case "error":
@@ -86,18 +107,20 @@ function getEventSummary(event: AgentStreamEvent): string {
   }
 }
 
-function getEventIteration(event: AgentStreamEvent): number | null {
+function getEventIteration(event: TimelineEvent): number | null {
   return "iteration" in event ? event.iteration : null;
 }
 
 export function AgentTimeline({ events }: AgentTimelineProps) {
-  if (events.length === 0) {
+  const visibleEvents = events;
+
+  if (visibleEvents.length === 0) {
     return <p className="muted">流式运行后会在这里展示实时 trace。</p>;
   }
 
   return (
     <ol className="timeline">
-      {events.map((event, index) => (
+      {visibleEvents.map((event, index) => (
         <Box component="li" className={`timeline-item event-${event.type}`} key={`${event.type}-${index}`}>
           <Box className="timeline-marker" aria-hidden="true" />
           <Box className="timeline-body">

@@ -110,7 +110,9 @@ function toMediaTrace(part: MediaPart, index: number): ToolTrace {
           ? "success"
           : "running",
     arguments: {
-      prompt: part.extra?.generation?.prompt
+      prompt: part.extra?.generation?.prompt,
+      width: part.width,
+      height: part.height
     },
     result: part.url ? { imageUrls: [part.url], prompt: part.extra?.generation?.prompt } : undefined,
     error: part.extra?.lifecycle?.error

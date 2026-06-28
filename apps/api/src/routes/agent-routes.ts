@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { AgentMessageCoordinator } from "../agent/agent-message-coordinator.js";
 import type { StoredAgentEvent } from "../agent/agent-store.js";
 import {
-  legacyContentToParts,
+  createTextPart,
   partsToLlmText,
   stripRuntimePartFields,
   type MessagePart
@@ -45,11 +45,18 @@ const sessionRequestSchema = z.object({
 const messageParamsSchema = z.object({
   messageId: z.string().min(1)
 });
+const runParamsSchema = z.object({
+  runId: z.string().min(1)
+});
 const sessionParamsSchema = z.object({
   sessionId: z.string().min(1)
 });
 const eventsQuerySchema = z.object({
   after: z.coerce.number().int().min(0).optional()
+});
+const sessionMessagesQuerySchema = z.object({
+  before: z.string().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional()
 });
 
 function parseMessageRequest(body: unknown) {
@@ -83,7 +90,7 @@ function parseMessageStartRequest(body: unknown) {
 function normalizeMessageRequest(input: z.infer<typeof messageStartRequestSchema>) {
   const parts = input.parts?.length
     ? stripRuntimePartFields(input.parts as Array<MessagePart & Record<string, unknown>>)
-    : legacyContentToParts(input.input ?? "");
+    : [createTextPart(input.input ?? "")];
   const projectedInput = partsToLlmText(parts) || input.input?.trim() || "";
 
   return {
@@ -114,6 +121,16 @@ function parseMessageParams(params: unknown) {
   return parsed.data;
 }
 
+function parseRunParams(params: unknown) {
+  const parsed = runParamsSchema.safeParse(params);
+
+  if (!parsed.success) {
+    throw new AppError("VALIDATION_ERROR", "runId 必须是非空字符串", 400);
+  }
+
+  return parsed.data;
+}
+
 function parseSessionParams(params: unknown) {
   const parsed = sessionParamsSchema.safeParse(params);
 
@@ -134,12 +151,22 @@ function parseEventsQuery(query: unknown) {
   return parsed.data;
 }
 
+function parseSessionMessagesQuery(query: unknown) {
+  const parsed = sessionMessagesQuerySchema.safeParse(query);
+
+  if (!parsed.success) {
+    throw new AppError("VALIDATION_ERROR", "before 必须是非空字符串，limit 必须是 1 到 100 之间的整数", 400);
+  }
+
+  return parsed.data;
+}
+
 function formatStoredSseEvent(event: StoredAgentEvent): string {
   return `id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`;
 }
 
 function isTerminalStoredEvent(event: StoredAgentEvent): boolean {
-  return event.event.type === "final_answer" || event.event.type === "error" || event.event.type === "cancelled";
+  return event.event.type === "run_completed" || event.event.type === "error" || event.event.type === "cancelled";
 }
 
 function buildSseHeaders(headers: Record<string, number | string | string[] | undefined>): OutgoingHttpHeaders {
@@ -170,18 +197,36 @@ export async function registerAgentRoutes(app: FastifyInstance, coordinator: Age
 
   app.get("/agents/sessions/:sessionId", async (request) => {
     const { sessionId } = parseSessionParams(request.params);
-    return coordinator.getSession(sessionId);
+    const { limit } = parseSessionMessagesQuery(request.query);
+    return coordinator.getSession(sessionId, { messageLimit: limit });
+  });
+
+  app.get("/agents/sessions/:sessionId/messages", async (request) => {
+    const { sessionId } = parseSessionParams(request.params);
+    const { before, limit } = parseSessionMessagesQuery(request.query);
+    return coordinator.getSessionMessages(sessionId, { before, messageLimit: limit });
   });
 
   app.post("/agents/messages", async (request, reply) => {
     const input = parseMessageStartRequest(request.body);
-    reply.status(202).send(coordinator.startMessage(input));
+    reply.status(202).send(await coordinator.startMessage(input));
+  });
+
+  app.post("/agents/runs", async (request, reply) => {
+    const input = parseMessageStartRequest(request.body);
+    reply.status(202).send(await coordinator.startRun(input));
   });
 
   app.post("/agents/sessions/:sessionId/messages", async (request, reply) => {
     const { sessionId } = parseSessionParams(request.params);
     const input = parseMessageRequest(request.body);
-    reply.status(202).send(coordinator.startMessage({ ...input, sessionId }));
+    reply.status(202).send(await coordinator.startMessage({ ...input, sessionId }));
+  });
+
+  app.post("/agents/sessions/:sessionId/runs", async (request, reply) => {
+    const { sessionId } = parseSessionParams(request.params);
+    const input = parseMessageRequest(request.body);
+    reply.status(202).send(await coordinator.startRun({ ...input, sessionId }));
   });
 
   app.get("/agents/messages/:messageId", async (request) => {
@@ -189,9 +234,19 @@ export async function registerAgentRoutes(app: FastifyInstance, coordinator: Age
     return coordinator.getMessage(messageId);
   });
 
+  app.get("/agents/runs/:runId", async (request) => {
+    const { runId } = parseRunParams(request.params);
+    return coordinator.getRun(runId);
+  });
+
   app.post("/agents/messages/:messageId/cancel", async (request) => {
     const { messageId } = parseMessageParams(request.params);
     return coordinator.cancelMessage(messageId);
+  });
+
+  app.post("/agents/runs/:runId/cancel", async (request) => {
+    const { runId } = parseRunParams(request.params);
+    return coordinator.cancelRun(runId);
   });
 
   app.get("/agents/messages/:messageId/events", async (request, reply) => {
@@ -239,6 +294,55 @@ export async function registerAgentRoutes(app: FastifyInstance, coordinator: Age
     }
 
     if (message.status !== "running") {
+      finish();
+    }
+  });
+
+  app.get("/agents/runs/:runId/events", async (request, reply) => {
+    const { runId } = parseRunParams(request.params);
+    const { after = 0 } = parseEventsQuery(request.query);
+    const { run } = coordinator.getRun(runId);
+
+    reply.raw.writeHead(200, buildSseHeaders(reply.getHeaders()));
+
+    const sentEventSeqs = new Set<number>();
+    let ended = false;
+    let unsubscribe = () => {};
+    const finish = () => {
+      if (ended) {
+        return;
+      }
+
+      ended = true;
+      unsubscribe();
+      reply.raw.end();
+    };
+    const writeStoredEvent = (event: StoredAgentEvent) => {
+      if (ended || event.seq <= after || sentEventSeqs.has(event.seq)) {
+        return;
+      }
+
+      sentEventSeqs.add(event.seq);
+      reply.raw.write(formatStoredSseEvent(event));
+
+      if (isTerminalStoredEvent(event)) {
+        finish();
+      }
+    };
+
+    unsubscribe = coordinator.subscribeRun(runId, writeStoredEvent);
+    request.raw.on("close", () => {
+      if (!ended) {
+        ended = true;
+        unsubscribe();
+      }
+    });
+
+    for (const event of coordinator.getRunEvents(runId, after)) {
+      writeStoredEvent(event);
+    }
+
+    if (run.status !== "running") {
       finish();
     }
   });

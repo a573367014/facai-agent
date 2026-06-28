@@ -1,25 +1,68 @@
 import { describe, expect, it } from "vitest";
 import { AgentContextBuilder } from "../../src/agent/context-builder.js";
 import type { AgentMessageRecord } from "../../src/agent/agent-store.js";
-import { legacyContentToParts } from "../../src/agent/message-parts.js";
+import { createTextPart, type MessagePart } from "../../src/agent/message-parts.js";
 
-function createMessage(overrides: Partial<AgentMessageRecord>): AgentMessageRecord {
+function createMessage(
+  overrides: Partial<Omit<AgentMessageRecord, "parts">> & { content?: string; parts?: MessagePart[] }
+): AgentMessageRecord {
   const content = overrides.content ?? "默认消息";
+  const { content: _content, ...recordOverrides } = overrides;
 
   return {
     id: "msg_test",
     sessionId: "session_test",
     role: "user",
     status: "completed",
-    content,
-    parts: legacyContentToParts(content),
+    parts: overrides.parts ?? (content ? [createTextPart(content)] : []),
     createdAt: "2026-06-25T00:00:00.000Z",
     updatedAt: "2026-06-25T00:00:00.000Z",
-    ...overrides
+    ...recordOverrides
   };
 }
 
 describe("AgentContextBuilder", () => {
+  it("带会话摘要时先注入结构化摘要，并只保留摘要之后的最近消息", () => {
+    const builder = new AgentContextBuilder({ maxHistoryMessages: 10 });
+    const history = builder.buildConversationHistory(
+      [
+        createMessage({ id: "msg_1", role: "user", content: "第一轮问题", createdAt: "2026-06-25T00:00:01.000Z" }),
+        createMessage({ id: "msg_2", role: "assistant", content: "第一轮回答", createdAt: "2026-06-25T00:00:02.000Z" }),
+        createMessage({ id: "msg_3", role: "user", content: "第二轮问题", createdAt: "2026-06-25T00:00:03.000Z" }),
+        createMessage({ id: "msg_4", role: "assistant", content: "第二轮回答", createdAt: "2026-06-25T00:00:04.000Z" })
+      ],
+      {
+        sessionId: "session_test",
+        coveredMessageId: "msg_2",
+        schemaVersion: 1,
+        summary: {
+          userGoal: "理解并实现 Agent 项目",
+          currentTask: "实现阶段 2 的结构化会话摘要",
+          decisions: ["上下文采用摘要加最近原文"],
+          preferences: ["用户希望中文解释"],
+          constraints: [],
+          importantFacts: ["项目后端使用 Fastify"],
+          openQuestions: [],
+          recentProgress: ["已完成第一轮讨论"]
+        },
+        createdAt: "2026-06-25T00:00:02.000Z",
+        updatedAt: "2026-06-25T00:00:02.000Z"
+      }
+    );
+
+    expect(history).toEqual([
+      {
+        role: "system",
+        content: expect.stringContaining("以下是此前对话的结构化摘要")
+      },
+      { role: "user", content: "第二轮问题" },
+      { role: "assistant", content: "第二轮回答" }
+    ]);
+    expect(history[0]?.content).toContain("用户目标：理解并实现 Agent 项目");
+    expect(history[0]?.content).toContain("已确认决策：");
+    expect(history[0]?.content).toContain("- 上下文采用摘要加最近原文");
+  });
+
   it("把已完成、失败和中断的消息转成历史上下文，并保持时间顺序", () => {
     const builder = new AgentContextBuilder();
     const history = builder.buildConversationHistory([
@@ -122,7 +165,7 @@ describe("AgentContextBuilder", () => {
     expect(history).toEqual([]);
   });
 
-  it("从 message parts 投影结构化输入，而不是直接读取 legacy content", () => {
+  it("从 message parts 投影结构化输入", () => {
     const builder = new AgentContextBuilder();
     const history = builder.buildConversationHistory([
       createMessage({

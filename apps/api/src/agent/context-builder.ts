@@ -1,4 +1,4 @@
-import type { AgentMessageRecord } from "./agent-store.js";
+import type { AgentMessageRecord, AgentSessionSummary, AgentSessionSummaryRecord } from "./agent-store.js";
 import { partsToLlmText } from "./message-parts.js";
 import type { AgentMessage } from "./types.js";
 
@@ -20,21 +20,30 @@ export class AgentContextBuilder {
     this.maxHistoryCharacters = options.maxHistoryCharacters ?? DEFAULT_MAX_HISTORY_CHARACTERS;
   }
 
-  buildConversationHistory(messages: AgentMessageRecord[]): AgentMessage[] {
+  getHistoryMessageLimit(): number {
+    return this.maxHistoryMessages;
+  }
+
+  buildConversationHistory(messages: AgentMessageRecord[], summary?: AgentSessionSummaryRecord): AgentMessage[] {
+    const summaryMessage = summary ? renderSummaryMessage(summary.summary) : undefined;
+
     if (this.maxHistoryMessages === 0) {
-      return [];
+      return summaryMessage ? [summaryMessage] : [];
     }
 
-    const contextMessages = messages
+    const sourceMessages = summary ? sliceMessagesAfterCoveredMessage(messages, summary.coveredMessageId) : messages;
+    const contextMessages = sourceMessages
       .filter((message) => toContextMessage(message) !== undefined)
       .sort((leftMessage, rightMessage) => leftMessage.createdAt.localeCompare(rightMessage.createdAt))
       .slice(-this.maxHistoryMessages);
     const selectedMessages = this.selectMessagesWithinBudget(contextMessages);
 
-    return selectedMessages.flatMap((message) => {
+    const historyMessages = selectedMessages.flatMap((message) => {
       const contextMessage = toContextMessage(message);
       return contextMessage ? [contextMessage] : [];
     });
+
+    return summaryMessage ? [summaryMessage, ...historyMessages] : historyMessages;
   }
 
   private selectMessagesWithinBudget(messages: AgentMessageRecord[]): AgentMessageRecord[] {
@@ -56,25 +65,74 @@ export class AgentContextBuilder {
   }
 }
 
+function sliceMessagesAfterCoveredMessage(messages: AgentMessageRecord[], coveredMessageId: string): AgentMessageRecord[] {
+  const sortedMessages = [...messages].sort((leftMessage, rightMessage) =>
+    leftMessage.createdAt.localeCompare(rightMessage.createdAt)
+  );
+  const coveredMessageIndex = sortedMessages.findIndex((message) => message.id === coveredMessageId);
+
+  if (coveredMessageIndex === -1) {
+    return sortedMessages;
+  }
+
+  return sortedMessages.slice(coveredMessageIndex + 1);
+}
+
+function renderSummaryMessage(summary: AgentSessionSummary): AgentMessage | undefined {
+  const sections = [
+    renderSingleLineSection("用户目标", summary.userGoal),
+    renderSingleLineSection("当前任务", summary.currentTask),
+    renderListSection("已确认决策", summary.decisions),
+    renderListSection("用户偏好", summary.preferences),
+    renderListSection("约束条件", summary.constraints),
+    renderListSection("重要事实", summary.importantFacts),
+    renderListSection("未解决问题", summary.openQuestions),
+    renderListSection("近期进展", summary.recentProgress)
+  ].filter(Boolean);
+
+  if (!sections.length) {
+    return undefined;
+  }
+
+  return {
+    role: "system",
+    content: ["以下是此前对话的结构化摘要，请把它当作会话记忆使用，但以用户最新消息为准。", ...sections].join("\n\n")
+  };
+}
+
+function renderSingleLineSection(label: string, value?: string): string {
+  const normalizedValue = value?.trim();
+  return normalizedValue ? `${label}：${normalizedValue}` : "";
+}
+
+function renderListSection(label: string, values: string[]): string {
+  const normalizedValues = values.map((value) => value.trim()).filter(Boolean);
+
+  if (!normalizedValues.length) {
+    return "";
+  }
+
+  return `${label}：\n${normalizedValues.map((value) => `- ${value}`).join("\n")}`;
+}
+
 function countMessageCharacters(message: AgentMessageRecord): number {
   const contextMessage = toContextMessage(message);
   return contextMessage?.content?.length ?? 0;
 }
 
 function toContextMessage(message: AgentMessageRecord): AgentMessage | undefined {
-  const projectedContent = partsToLlmText(message.parts);
-  const fallbackContent = projectedContent || message.content;
+  const content = partsToLlmText(message.parts);
 
-  if (message.role === "user" && fallbackContent) {
-    return { role: "user", content: fallbackContent };
+  if (message.role === "user" && content) {
+    return { role: "user", content };
   }
 
   if (message.role !== "assistant") {
     return undefined;
   }
 
-  if (message.status === "completed" && fallbackContent) {
-    return { role: "assistant", content: fallbackContent };
+  if (message.status === "completed" && content) {
+    return { role: "assistant", content };
   }
 
   if (message.status === "failed") {

@@ -15,6 +15,9 @@
 - `OPENAI_MODEL`
 - `AGENT_CONTEXT_MAX_MESSAGES`：新消息最多携带多少条历史上下文，默认 `12`
 - `AGENT_CONTEXT_MAX_HISTORY_CHARS`：历史上下文的近似字符预算，默认 `12000`
+- `AGENT_SUMMARY_TRIGGER_MESSAGES`：会话可投影消息超过该数量后触发结构化摘要，默认 `16`；设为 `0` 可关闭摘要更新
+- `AGENT_SUMMARY_KEEP_RECENT_MESSAGES`：生成摘要后仍保留的最近原文消息数，默认 `8`
+- `AGENT_SUMMARY_TRIGGER_CHARS`：待压缩旧消息的有效文本量达到该字符数才真正压缩，默认 `2000`；设为 `0` 表示只按消息条数判断
 - `AGENT_TOOL_TIMEOUT_MS`：工具调用超时时间，默认 `10000`
 - `AGENT_ALLOWED_TOOLS`：允许暴露和执行的工具名，逗号分隔；留空表示允许全部已注册工具
 - `TAVILY_API_KEY`：Tavily Search API Key；配置后会启用 `web_search` 工具
@@ -146,7 +149,8 @@ Seedream 通用3.0 生图流程：
 - [x] 增加近似字符预算，先用轻量方式控制上下文膨胀。
 - [x] 失败 message 保留用户输入和简短失败摘要，避免“再试一次”这类补充指令丢失上下文。
 - [x] 中断 message 保留用户输入和“被用户中断”摘要，方便后续继续或改写。
-- [ ] 最近 N 轮保留原文，更早内容改成摘要。
+- [x] 最近 N 轮保留原文，更早内容改成结构化摘要。
+- [x] 前端 session 消息分页加载，避免长会话一次性返回全量 messages。
 - [ ] 增加 token 预算，避免上下文无限增长。
 - [ ] 支持重要事实记忆，保存用户偏好、项目背景等长期信息。
 - [ ] 对工具结果做摘要，避免大结果反复进入上下文。
@@ -155,8 +159,10 @@ Seedream 通用3.0 生图流程：
 
 当前实现背景：
 
-- `AgentMessageCoordinator` 只决定“新 message 需要同 session 历史”，不再直接拼历史消息。
-- `AgentContextBuilder` 负责筛选可进入上下文的 message、按时间排序、按最近条数和字符预算裁剪。
+- `AgentMessageCoordinator` 只决定“新 message 需要同 session 历史”，并按摘要 cursor 只读取需要进入上下文的最近消息。
+- `AgentContextBuilder` 负责筛选可进入上下文的 message、按时间排序、按最近条数和字符预算裁剪，并把结构化摘要渲染成 system message。
+- `AgentSummaryService` 在 assistant message 完成后按阈值刷新结构化摘要；未超过阈值时只做 count，不读取全量 messages。
+- `GET /agents/sessions/:sessionId` 默认只返回最近一页消息和 `pageInfo`；`GET /agents/sessions/:sessionId/messages?before=...&limit=...` 用于向前分页加载历史消息。
 - completed message 会进入上下文为原始消息内容；failed message 会进入上下文为简短失败摘要；cancelled message 会进入上下文为被用户中断摘要。
 - running message 不进入上下文，避免把尚未完成的并发状态喂给新 message。
 - 最近一轮历史即使超过字符预算也会保留，避免用户刚问过的关键上下文突然消失。

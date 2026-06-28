@@ -77,18 +77,6 @@ export function stripRuntimePartFields(parts: Array<MessagePart & Record<string,
   });
 }
 
-export function legacyContentToParts(content: string): MessagePart[] {
-  return content ? [createTextPart(content)] : [];
-}
-
-export function partsToLegacyContent(parts: MessagePart[]): string {
-  return parts
-    .filter((part): part is TextPart => part.type === "text")
-    .map((part) => projectTextPart(part))
-    .filter((line) => line.trim().length > 0)
-    .join("\n");
-}
-
 export function partsToLlmText(parts: MessagePart[]): string {
   return projectParts(parts, { includePendingMedia: false }).join("\n");
 }

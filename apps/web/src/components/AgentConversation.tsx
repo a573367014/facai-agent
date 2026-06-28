@@ -1,16 +1,15 @@
 import { Alert, Box, Chip, CircularProgress, Paper, Typography } from "@mui/material";
-import { Bot, CircleAlert, CircleStop, UserRound } from "lucide-react";
-import { useEffect, useRef } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import type { AgentAssetRecord, AgentState, AgentStep, AgentStreamEvent, MessagePart } from "../api/agent-client";
-import { buildToolTraces, type ToolTrace } from "../utils/tool-traces";
+import { CircleAlert, CircleStop } from "lucide-react";
 import {
-  asImageResult,
-  ImageLoadingPreview,
-  ImagePreview,
-  type ToolImageActionPayload
-} from "./ToolResultPreview";
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  type PointerEvent as ReactPointerEvent,
+  type UIEvent,
+  type WheelEvent
+} from "react";
+import type { AgentState, AgentStreamEvent, MessagePart } from "../api/agent-client";
+import type { ToolImageActionPayload } from "./ToolResultPreview";
 import { ToolTraceList } from "./ToolTraceList";
 import { MessagePartRenderer } from "./MessagePartRenderer";
 
@@ -18,13 +17,10 @@ export type ChatMessageStatus = "running" | "completed" | "failed" | "cancelled"
 
 export interface ChatMessage {
   id: string;
-  role: "user" | "assistant";
-  content: string;
-  parts?: MessagePart[];
+  role: "user" | "assistant" | "system";
+  parts: MessagePart[];
   status?: ChatMessageStatus;
-  steps?: AgentStep[];
   events?: AgentStreamEvent[];
-  assets?: AgentAssetRecord[];
   error?: string;
 }
 
@@ -32,8 +28,18 @@ interface AgentConversationProps {
   messages: ChatMessage[];
   isActive: boolean;
   error?: string | null;
+  hasMoreMessages?: boolean;
+  isLoadingOlderMessages?: boolean;
   onImageAction?: (payload: ToolImageActionPayload) => void;
+  onLoadOlderMessages?: () => void;
   onSuggestionSelect?: (suggestion: string) => void;
+}
+
+interface ScrollSnapshot {
+  firstId?: string;
+  lastId?: string;
+  scrollHeight: number;
+  scrollTop: number;
 }
 
 const stateText: Record<AgentState, string> = {
@@ -52,6 +58,9 @@ const emptySuggestions = [
   "JavaScript 的哪些新特性可以提升前端开发效率？",
   "解释一下这个 Agent 项目的工具调用流程"
 ];
+
+const LOAD_OLDER_SCROLL_THRESHOLD = 120;
+const USER_SCROLL_INTENT_TTL_MS = 800;
 
 function getLatestState(events: AgentStreamEvent[] = []) {
   return [...events].reverse().find((event) => event.type === "agent_state");
@@ -72,7 +81,7 @@ function AssistantStatus({ message, isActive }: { message: ChatMessage; isActive
     );
   }
 
-  if (message.status === "running" || (isActive && !message.content)) {
+  if (message.status === "running" || (isActive && !hasTextContent(message.parts))) {
     return (
       <Chip
         className="chat-status running"
@@ -88,282 +97,262 @@ function AssistantStatus({ message, isActive }: { message: ChatMessage; isActive
   return null;
 }
 
-function escapeRegExp(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function hasTextContent(parts: MessagePart[]) {
+  return parts.some((part) => part.type === "text" && part.value.trim().length > 0);
 }
 
-function getImageResourceUrls(message: ChatMessage) {
-  if (message.role !== "assistant") {
-    return [];
-  }
-
-  return [
-    ...(message.parts ?? []).flatMap((part) => (part.type === "media" && part.url ? [part.url] : [])),
-    ...(message.assets ?? []).map((asset) => asset.url),
-    ...getImageTraces(message.events, message.steps).flatMap((trace) => asImageResult(trace.result)?.imageUrls ?? [])
-  ];
+function getTextContent(parts: MessagePart[]) {
+  return parts
+    .filter((part): part is Extract<MessagePart, { type: "text" }> => part.type === "text")
+    .map((part) => part.value.trim())
+    .filter(Boolean)
+    .join("\n");
 }
 
-function stripImageResourceReferences(content: string, imageUrls: string[]) {
-  if (imageUrls.length === 0) {
-    return content;
-  }
-
-  const imageUrlPatterns = imageUrls.map((url) => new RegExp(escapeRegExp(url)));
-
-  return content
-    .split("\n")
-    .filter((line) => !imageUrlPatterns.some((pattern) => pattern.test(line)))
-    .join("\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-function MessageContent({ message, showCursor }: { message: ChatMessage; showCursor: boolean }) {
-  if (message.role === "assistant") {
-    const content = stripImageResourceReferences(message.content, getImageResourceUrls(message));
-
-    return (
-      <div className="markdown-body">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
-        {showCursor ? <span className="typing-cursor" aria-hidden="true" /> : null}
-      </div>
-    );
-  }
+function SystemStatusMessage({ message }: { message: ChatMessage }) {
+  const text = getTextContent(message.parts) || message.error || "系统状态已更新";
+  const isRunning = message.status === "running";
 
   return (
-    <p className="chat-text">
-      {message.content}
-      {showCursor ? <span className="typing-cursor" aria-hidden="true" /> : null}
-    </p>
+    <Box component="article" className={`chat-system-row ${message.status ?? "completed"}`} key={message.id}>
+      <span className="chat-system-rule" aria-hidden="true" />
+      <span className="chat-system-pill" role="status">
+        {isRunning ? <CircularProgress color="inherit" size={13} /> : null}
+        <span>{text}</span>
+      </span>
+      <span className="chat-system-rule" aria-hidden="true" />
+    </Box>
   );
 }
 
-function MessageImageAssets({
-  assets = [],
-  events = [],
-  steps = [],
-  onImageAction
-}: {
-  assets?: AgentAssetRecord[];
-  events?: AgentStreamEvent[];
-  steps?: AgentStep[];
-  onImageAction?: (payload: ToolImageActionPayload) => void;
-}) {
-  if (assets.length > 0) {
-    const trace = buildImageTraceFromAssets(assets);
-    const imageResult = asImageResult(trace.result);
-
-    return (
-      <div className="message-image-assets">
-        {imageResult ? <ImagePreview trace={trace} result={imageResult} onImageAction={onImageAction} /> : null}
-      </div>
-    );
-  }
-
-  const imageTraces = getImageTraces(events, steps);
-
-  if (imageTraces.length === 0) {
-    return null;
-  }
-
-  return (
-    <div className="message-image-assets">
-      {imageTraces.map((trace) => {
-        const imageResult = asImageResult(trace.result);
-
-        if (imageResult) {
-          return <ImagePreview key={trace.id} trace={trace} result={imageResult} onImageAction={onImageAction} />;
-        }
-
-        if (trace.status === "pending" || trace.status === "running") {
-          return <ImageLoadingPreview key={trace.id} trace={trace} />;
-        }
-
-        return null;
-      })}
-    </div>
-  );
-}
-
-function buildImageTraceFromAssets(assets: AgentAssetRecord[]): ToolTrace {
-  const sortedAssets = [...assets].sort((leftAsset, rightAsset) => (leftAsset.index ?? 0) - (rightAsset.index ?? 0));
-  const firstAsset = sortedAssets[0];
-  const hasMultipleAssets = sortedAssets.length > 1;
-
-  return {
-    id: `assets:${firstAsset?.messageId ?? firstAsset?.id ?? "image"}`,
-    iteration: 0,
-    toolName: "generate_image",
-    status: "success",
-    arguments: {
-      prompt: firstAsset?.prompt
-    },
-    result: {
-      prompt: !hasMultipleAssets ? firstAsset?.prompt : undefined,
-      imageUrls: sortedAssets.map((asset) => asset.url),
-      total: hasMultipleAssets ? sortedAssets.length : undefined,
-      succeeded: hasMultipleAssets ? sortedAssets.length : undefined,
-      failed: hasMultipleAssets ? 0 : undefined,
-      items: hasMultipleAssets
-        ? sortedAssets.map((asset) => ({
-            index: asset.index,
-            status: "success",
-            prompt: asset.prompt,
-            width: asset.width,
-            height: asset.height,
-            imageUrls: [asset.url]
-          }))
-        : undefined
-    }
-  };
-}
-
-function buildImageTracesFromSteps(steps: AgentStep[] = []): ToolTrace[] {
-  return steps.flatMap((step, index) => {
-    if (step.toolName !== "generate_image") {
-      return [];
-    }
-
-    return [
-      {
-        id: `step:${index}:${step.toolName}`,
-        iteration: index,
-        toolName: step.toolName,
-        status: "success",
-        arguments: step.arguments,
-        result: step.result
-      } satisfies ToolTrace
-    ];
-  });
-}
-
-function getImageTraces(events: AgentStreamEvent[] = [], steps: AgentStep[] = []) {
-  const eventImageTraces = buildToolTraces(events).filter((trace) => trace.toolName === "generate_image" && !trace.error);
-
-  if (eventImageTraces.length > 0) {
-    return eventImageTraces;
-  }
-
-  return buildImageTracesFromSteps(steps);
-}
-
-function hasActiveImageTrace(events: AgentStreamEvent[] = []) {
-  return buildToolTraces(events).some(
-    (trace) => trace.toolName === "generate_image" && !trace.error && (trace.status === "pending" || trace.status === "running")
-  );
-}
-
-function hasMediaParts(message: ChatMessage) {
-  return Boolean(message.parts?.some((part) => part.type === "media"));
-}
-
-function getAssistantLiveText(message: ChatMessage) {
-  if (hasActiveImageTrace(message.events)) {
-    return "我正在为你生成图片";
-  }
-
-  return "正在思考";
-}
-
-export function AgentConversation({ messages, isActive, error, onImageAction, onSuggestionSelect }: AgentConversationProps) {
+export function AgentConversation({
+  messages,
+  isActive,
+  error,
+  hasMoreMessages = false,
+  isLoadingOlderMessages = false,
+  onImageAction,
+  onLoadOlderMessages,
+  onSuggestionSelect
+}: AgentConversationProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const previousScrollSnapshotRef = useRef<ScrollSnapshot>();
+  const pendingPrependScrollSnapshotRef = useRef<ScrollSnapshot>();
+  const loadOlderRequestLockedRef = useRef(false);
+  const userScrollIntentRef = useRef(false);
+  const userScrollIntentTimerRef = useRef<number>();
   const isEmpty = messages.length === 0;
 
+  function clearUserScrollIntentTimer() {
+    if (userScrollIntentTimerRef.current) {
+      window.clearTimeout(userScrollIntentTimerRef.current);
+      userScrollIntentTimerRef.current = undefined;
+    }
+  }
+
+  function markUserScrollIntent() {
+    userScrollIntentRef.current = true;
+    clearUserScrollIntentTimer();
+    userScrollIntentTimerRef.current = window.setTimeout(() => {
+      userScrollIntentRef.current = false;
+      userScrollIntentTimerRef.current = undefined;
+    }, USER_SCROLL_INTENT_TTL_MS);
+  }
+
+  function createScrollSnapshot(): ScrollSnapshot | undefined {
+    const scrollElement = scrollRef.current;
+
+    if (!scrollElement) {
+      return undefined;
+    }
+
+    return {
+      firstId: messages[0]?.id,
+      lastId: messages.at(-1)?.id,
+      scrollHeight: scrollElement.scrollHeight,
+      scrollTop: scrollElement.scrollTop
+    };
+  }
+
+  function requestLoadOlderMessages() {
+    if (
+      !userScrollIntentRef.current ||
+      !hasMoreMessages ||
+      isLoadingOlderMessages ||
+      loadOlderRequestLockedRef.current ||
+      !onLoadOlderMessages
+    ) {
+      return;
+    }
+
+    pendingPrependScrollSnapshotRef.current = createScrollSnapshot();
+    loadOlderRequestLockedRef.current = true;
+    userScrollIntentRef.current = false;
+    clearUserScrollIntentTimer();
+    onLoadOlderMessages();
+  }
+
+  function handleWheel(event: WheelEvent<HTMLDivElement>) {
+    if (event.deltaY < 0) {
+      markUserScrollIntent();
+    }
+  }
+
+  function handlePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.target === event.currentTarget) {
+      markUserScrollIntent();
+    }
+  }
+
+  function handleScroll(event: UIEvent<HTMLDivElement>) {
+    if (event.currentTarget.scrollTop <= LOAD_OLDER_SCROLL_THRESHOLD) {
+      requestLoadOlderMessages();
+    }
+  }
+
   useEffect(() => {
-    if (!scrollRef.current) {
+    if (!isLoadingOlderMessages) {
+      loadOlderRequestLockedRef.current = false;
+    }
+  }, [isLoadingOlderMessages]);
+
+  useEffect(() => {
+    return () => {
+      clearUserScrollIntentTimer();
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    const scrollElement = scrollRef.current;
+
+    if (!scrollElement) {
       return;
     }
 
-    if (typeof scrollRef.current.scrollTo === "function") {
-      scrollRef.current.scrollTo({
-        top: scrollRef.current.scrollHeight,
-        behavior: "smooth"
-      });
+    const firstId = messages[0]?.id;
+    const lastId = messages.at(-1)?.id;
+    const previousSnapshot = pendingPrependScrollSnapshotRef.current ?? previousScrollSnapshotRef.current;
+    const isPrepending = previousSnapshot && previousSnapshot.lastId === lastId && previousSnapshot.firstId !== firstId;
+
+    if (isPrepending) {
+      scrollElement.scrollTop = previousSnapshot.scrollTop + scrollElement.scrollHeight - previousSnapshot.scrollHeight;
+      pendingPrependScrollSnapshotRef.current = undefined;
+      previousScrollSnapshotRef.current = {
+        firstId,
+        lastId,
+        scrollHeight: scrollElement.scrollHeight,
+        scrollTop: scrollElement.scrollTop
+      };
+
       return;
     }
 
-    scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    pendingPrependScrollSnapshotRef.current = undefined;
+
+    scrollElement.scrollTop = scrollElement.scrollHeight;
+    previousScrollSnapshotRef.current = {
+      firstId,
+      lastId,
+      scrollHeight: scrollElement.scrollHeight,
+      scrollTop: scrollElement.scrollTop
+    };
   }, [messages]);
 
   return (
     <Paper component="section" className="panel chat-panel" elevation={0}>
-      <div className={isEmpty ? "chat-scroll chat-scroll-empty" : "chat-scroll"} ref={scrollRef}>
-        {error ? (
-          <Alert className="error-box chat-global-error" severity="error">
-            {error}
-          </Alert>
-        ) : null}
-        {messages.length === 0 ? (
-          <Box className="empty-state chat-empty">
-            <Typography component="h2">有什么我能帮你的吗？</Typography>
-            <p>输入一个任务，Agent 会按需调用工具并把过程展示在右侧。</p>
-            <Box className="empty-suggestions">
-              {emptySuggestions.map((suggestion) => (
-                <Chip
-                  className="empty-suggestion-chip"
-                  key={suggestion}
-                  label={suggestion}
-                  clickable={Boolean(onSuggestionSelect)}
-                  onClick={onSuggestionSelect ? () => onSuggestionSelect(suggestion) : undefined}
-                />
-              ))}
-            </Box>
-          </Box>
-        ) : (
-          messages.map((message) => {
-            const showCursor = message.role === "assistant" && message.status === "running";
-
-            return (
-              <Box component="article" className={`chat-row ${message.role}`} key={message.id}>
-                <Box className="chat-avatar" aria-hidden="true">
-                  {message.role === "user" ? <UserRound size={18} /> : <Bot size={18} />}
-                </Box>
-                <div className={`chat-content ${message.role}`}>
-                  <div className={`chat-bubble ${message.role}`}>
-                    <div className="chat-meta">
-                      <strong>{message.role === "user" ? "你" : "Agent"}</strong>
-                      {message.role === "assistant" ? <AssistantStatus message={message} isActive={isActive} /> : null}
-                    </div>
-
-                    {message.error ? (
-                      <Alert className="error-box inline-error" severity="error">
-                        {message.error}
-                      </Alert>
-                    ) : null}
-
-                    {message.parts?.length ? (
-                      <MessagePartRenderer
-                        role={message.role}
-                        parts={message.parts}
-                        showCursor={showCursor}
-                        onImageAction={onImageAction}
-                      />
-                    ) : message.content ? (
-                      <MessageContent message={message} showCursor={showCursor} />
-                    ) : message.role === "assistant" && message.status === "running" ? (
-                      <p className="chat-text muted-live">
-                        {getAssistantLiveText(message)}
-                        <span className="typing-cursor" aria-hidden="true" />
-                      </p>
-                    ) : null}
-
-                    {message.role === "assistant" && !hasMediaParts(message) ? (
-                      <MessageImageAssets
-                        assets={message.assets}
-                        events={message.events}
-                        steps={message.steps}
-                        onImageAction={onImageAction}
-                      />
-                    ) : null}
-
-                    {message.role === "assistant" ? <ToolTraceList events={message.events} onImageAction={onImageAction} /> : null}
-                  </div>
-                </div>
+      <div
+        className={isEmpty ? "chat-scroll chat-scroll-empty" : "chat-scroll"}
+        ref={scrollRef}
+        onPointerDown={handlePointerDown}
+        onScroll={handleScroll}
+        onTouchMove={markUserScrollIntent}
+        onWheel={handleWheel}
+      >
+        <div className={isEmpty ? "chat-scroll-content chat-scroll-content-empty" : "chat-scroll-content"}>
+          {error ? (
+            <Alert className="error-box chat-global-error" severity="error">
+              {error}
+            </Alert>
+          ) : null}
+          {messages.length === 0 ? (
+            <Box className="empty-state chat-empty">
+              <Typography component="h2">有什么我能帮你的吗？</Typography>
+              <p>输入一个任务，Agent 会按需调用工具并把过程展示在右侧。</p>
+              <Box className="empty-suggestions">
+                {emptySuggestions.map((suggestion) => (
+                  <Chip
+                    className="empty-suggestion-chip"
+                    key={suggestion}
+                    label={suggestion}
+                    clickable={Boolean(onSuggestionSelect)}
+                    onClick={onSuggestionSelect ? () => onSuggestionSelect(suggestion) : undefined}
+                  />
+                ))}
               </Box>
-            );
-          })
-        )}
+            </Box>
+          ) : (
+            <>
+              {hasMoreMessages ? (
+                <Box className="load-older-row" role="status" aria-live="polite">
+                  <span className="load-older-hint">
+                    {isLoadingOlderMessages ? (
+                      <>
+                        <CircularProgress color="inherit" size={13} />
+                        <span>加载更早消息中...</span>
+                      </>
+                    ) : (
+                      "上滑加载更早消息"
+                    )}
+                  </span>
+                </Box>
+              ) : null}
+              {messages.map((message) => {
+                if (message.role === "system" && (message.status === "cancelled" || message.status === "failed")) {
+                  return null;
+                }
+
+                if (message.role === "system") {
+                  return <SystemStatusMessage message={message} key={message.id} />;
+                }
+
+                const showCursor = message.role === "assistant" && message.status === "running";
+                const messageBodyClassName = message.role === "assistant" ? "chat-answer assistant" : "chat-bubble user";
+
+                return (
+                  <Box component="article" className={`chat-row ${message.role}`} key={message.id}>
+                    <div className={`chat-content ${message.role}`}>
+                      <div className={messageBodyClassName}>
+                        {message.role === "assistant" ? <AssistantStatus message={message} isActive={isActive} /> : null}
+
+                        {message.error ? (
+                          <Alert className="error-box inline-error" severity="error">
+                            {message.error}
+                          </Alert>
+                        ) : null}
+
+                        {message.parts.length ? (
+                          <MessagePartRenderer
+                            role={message.role}
+                            parts={message.parts}
+                            showCursor={showCursor}
+                            onImageAction={onImageAction}
+                          />
+                        ) : message.role === "assistant" && message.status === "running" ? (
+                          <p className="chat-text muted-live">
+                            正在思考
+                            <span className="typing-cursor" aria-hidden="true" />
+                          </p>
+                        ) : null}
+
+                        {message.role === "assistant" ? <ToolTraceList events={message.events} onImageAction={onImageAction} /> : null}
+                      </div>
+                    </div>
+                  </Box>
+                );
+              })}
+            </>
+          )}
+        </div>
       </div>
     </Paper>
   );

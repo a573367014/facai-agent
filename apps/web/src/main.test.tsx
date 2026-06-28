@@ -16,6 +16,7 @@ function createStoredSseResponse(messageId: string): Response {
   const storedEvent = {
     id: "event_1",
     seq: 1,
+    runId: messageId,
     messageId,
     event: { type: "answer_delta", iteration: 0, delta: "恢复中" },
     createdAt: "2026-06-22T00:00:00.000Z"
@@ -44,7 +45,7 @@ afterEach(() => {
 describe("main", () => {
   it("入口初始化时只恢复一次事件流订阅", async () => {
     document.body.innerHTML = '<div id="root"></div>';
-    localStorage.setItem("agent.activeMessageId", "msg_1");
+    localStorage.setItem("agent.activeRunId", "msg_1");
 
     globalThis.fetch = vi.fn().mockImplementation((url: string) => {
       if (url.endsWith("/health")) {
@@ -57,17 +58,17 @@ describe("main", () => {
         return Promise.resolve(jsonResponse({ sessions: [] }));
       }
 
-      if (url.endsWith("/agents/messages/msg_1")) {
+      if (url.endsWith("/agents/runs/msg_1")) {
         return Promise.resolve({
           ok: true,
           json: async () => ({
-            message: {
+            run: {
               id: "msg_1",
               sessionId: "session_1",
-              role: "assistant",
               status: "running",
-              content: "",
-              assets: [],
+              phase: "answering",
+              userMessageId: "msg_user_1",
+              assistantMessageId: "msg_1",
               createdAt: "2026-06-22T00:00:00.000Z",
               updatedAt: "2026-06-22T00:00:00.000Z"
             },
@@ -75,6 +76,7 @@ describe("main", () => {
               {
                 id: "event_1",
                 seq: 1,
+                runId: "msg_1",
                 messageId: "msg_1",
                 event: { type: "answer_delta", iteration: 0, delta: "恢复中" },
                 createdAt: "2026-06-22T00:00:00.000Z"
@@ -99,8 +101,7 @@ describe("main", () => {
                 sessionId: "session_1",
                 role: "user",
                 status: "completed",
-                content: "恢复中的任务",
-                assets: [],
+                parts: [{ type: "text", value: "恢复中的任务" }],
                 createdAt: timestamp,
                 updatedAt: timestamp
               },
@@ -109,8 +110,7 @@ describe("main", () => {
                 sessionId: "session_1",
                 role: "assistant",
                 status: "running",
-                content: "",
-                assets: [],
+                parts: [{ type: "text", value: "" }],
                 createdAt: timestamp,
                 updatedAt: timestamp
               }
@@ -127,7 +127,7 @@ describe("main", () => {
     await waitFor(() => {
       const eventCalls = vi
         .mocked(globalThis.fetch)
-        .mock.calls.filter(([url]) => String(url).includes("/agents/messages/msg_1/events?after=1"));
+        .mock.calls.filter(([url]) => String(url).includes("/agents/runs/msg_1/events?after=1"));
       expect(eventCalls.length).toBeGreaterThan(0);
     });
 
@@ -135,7 +135,7 @@ describe("main", () => {
 
     const eventCalls = vi
       .mocked(globalThis.fetch)
-      .mock.calls.filter(([url]) => String(url).includes("/agents/messages/msg_1/events?after=1"));
+      .mock.calls.filter(([url]) => String(url).includes("/agents/runs/msg_1/events?after=1"));
     expect(eventCalls).toHaveLength(1);
   });
 });

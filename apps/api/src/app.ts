@@ -2,6 +2,7 @@ import cors from "@fastify/cors";
 import Fastify from "fastify";
 import { AgentService } from "./agent/agent-service.js";
 import { AgentMessageCoordinator } from "./agent/agent-message-coordinator.js";
+import { AgentSummaryService } from "./agent/agent-summary-service.js";
 import { AgentContextBuilder } from "./agent/context-builder.js";
 import { SqliteAgentStore } from "./agent/sqlite-agent-store.js";
 import { loadEnv } from "./config/env.js";
@@ -68,14 +69,15 @@ export async function buildApp(options: BuildAppOptions = {}) {
   // 当前先用 allow-list 做最小权限控制。未配置时 demo 仍开放所有默认工具；
   // 配了 AGENT_ALLOWED_TOOLS 后，LLM 只能看到这些工具，执行层也只允许这些工具。
   const toolAccessPolicy = new ToolAccessPolicy({ allowedToolNames: env.AGENT_ALLOWED_TOOLS });
+  const defaultProvider = new OpenAiCompatibleProvider({
+    apiKey: env.OPENAI_API_KEY ?? "",
+    baseUrl: env.OPENAI_BASE_URL,
+    model: env.OPENAI_MODEL ?? ""
+  });
   const agentService =
     options.agentService ??
     new AgentService({
-      provider: new OpenAiCompatibleProvider({
-        apiKey: env.OPENAI_API_KEY ?? "",
-        baseUrl: env.OPENAI_BASE_URL,
-        model: env.OPENAI_MODEL ?? ""
-      }),
+      provider: defaultProvider,
       toolRegistry,
       toolAccessPolicy,
       // 工具超时放在 executor，而不是每个工具自己处理，保证所有工具都有统一兜底。
@@ -101,7 +103,15 @@ export async function buildApp(options: BuildAppOptions = {}) {
       new AgentContextBuilder({
         maxHistoryMessages: env.AGENT_CONTEXT_MAX_MESSAGES,
         maxHistoryCharacters: env.AGENT_CONTEXT_MAX_HISTORY_CHARS
-      })
+      }),
+      options.agentService
+        ? undefined
+        : new AgentSummaryService({
+            provider: defaultProvider,
+            triggerMessageCount: env.AGENT_SUMMARY_TRIGGER_MESSAGES,
+            keepRecentMessages: env.AGENT_SUMMARY_KEEP_RECENT_MESSAGES,
+            triggerCharacterCount: env.AGENT_SUMMARY_TRIGGER_CHARS
+          })
     );
   }
 

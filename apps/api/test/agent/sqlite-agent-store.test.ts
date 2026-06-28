@@ -39,6 +39,80 @@ function createTestAgentService(): AgentService {
 }
 
 describe("SqliteAgentStore", () => {
+  it("支持按消息游标读取最近消息、历史消息和新增消息", async () => {
+    const databasePath = createTempDatabasePath();
+    const store = await SqliteAgentStore.create({ databasePath });
+    const session = store.createSession("分页会话");
+    const messages = Array.from({ length: 6 }, (_, index) =>
+      store.createMessage({
+        sessionId: session.id,
+        role: index % 2 === 0 ? "user" : "assistant",
+        status: "completed",
+        parts: [{ type: "text", value: `消息 ${index + 1}` }]
+      })
+    );
+
+    expect(store.getRecentMessagesBySession(session.id, 3).map((message) => message.id)).toEqual(
+      messages.slice(3).map((message) => message.id)
+    );
+    expect(store.getMessagesBefore(session.id, messages[3].id, 2).map((message) => message.id)).toEqual([
+      messages[1].id,
+      messages[2].id
+    ]);
+    expect(store.countMessagesAfter(session.id, messages[1].id)).toBe(4);
+    expect(store.getMessagesAfter(session.id, messages[1].id, 2).map((message) => message.id)).toEqual([
+      messages[2].id,
+      messages[3].id
+    ]);
+    expect(store.getRecentMessagesAfter(session.id, messages[1].id, 2).map((message) => message.id)).toEqual([
+      messages[4].id,
+      messages[5].id
+    ]);
+    store.close();
+  });
+
+  it("重新创建 store 后仍能读回结构化会话摘要", async () => {
+    const databasePath = createTempDatabasePath();
+    const firstStore = await SqliteAgentStore.create({ databasePath });
+    const session = firstStore.createSession("摘要会话");
+    const userMessage = firstStore.createMessage({
+      sessionId: session.id,
+      role: "user",
+      status: "completed",
+      parts: [{ type: "text", value: "第一轮问题" }]
+    });
+
+    firstStore.upsertSessionSummary({
+      sessionId: session.id,
+      coveredMessageId: userMessage.id,
+      summary: {
+        userGoal: "理解 Agent 架构",
+        currentTask: "实现结构化摘要",
+        decisions: ["采用滚动摘要"],
+        preferences: ["使用中文解释"],
+        constraints: [],
+        importantFacts: ["项目使用 SQLite"],
+        openQuestions: [],
+        recentProgress: ["已完成摘要表设计"]
+      }
+    });
+    firstStore.close();
+
+    const secondStore = await SqliteAgentStore.create({ databasePath });
+
+    expect(secondStore.getSessionSummary(session.id)).toMatchObject({
+      sessionId: session.id,
+      coveredMessageId: userMessage.id,
+      schemaVersion: 1,
+      summary: {
+        userGoal: "理解 Agent 架构",
+        currentTask: "实现结构化摘要",
+        decisions: ["采用滚动摘要"]
+      }
+    });
+    secondStore.close();
+  });
+
   it("重新创建 store 后仍能读回 message parts", async () => {
     const databasePath = createTempDatabasePath();
     const firstStore = await SqliteAgentStore.create({ databasePath });
@@ -76,45 +150,39 @@ describe("SqliteAgentStore", () => {
     store.close();
   });
 
-  it("重新创建 store 后仍能读回 session、messages、assets 和 events", async () => {
+  it("重新创建 store 后仍能读回 session、messages 和 events", async () => {
     const databasePath = createTempDatabasePath();
-    const firstStore = await SqliteAgentStore.create({ databasePath, answerChunkCharLimit: 4 });
+    const firstStore = await SqliteAgentStore.create({ databasePath });
     const session = firstStore.createSession("图片会话");
     const userMessage = firstStore.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
-      content: "生成图片"
+      parts: [{ type: "text", value: "生成图片" }]
     });
     const assistantMessage = firstStore.createMessage({
       sessionId: session.id,
       role: "assistant",
-      status: "running"
+      status: "running",
+      parts: [{ type: "text", value: "" }]
     });
 
     firstStore.appendEvent(assistantMessage.id, { type: "iteration_start", iteration: 0 });
-    firstStore.appendEvent(assistantMessage.id, { type: "answer_delta", iteration: 0, delta: "你好" });
-    firstStore.appendEvent(assistantMessage.id, { type: "answer_delta", iteration: 0, delta: "世界" });
-    firstStore.appendEvent(assistantMessage.id, { type: "final_answer", answer: "你好世界", steps: [] });
+    firstStore.appendEvent(assistantMessage.id, {
+      type: "message.part.delta",
+      messageId: assistantMessage.id,
+      partIndex: 0,
+      delta: "你好世界"
+    });
+    firstStore.appendEvent(assistantMessage.id, { type: "final_answer", answer: "你好世界" });
     firstStore.updateMessage(assistantMessage.id, {
       status: "completed",
-      content: "你好世界",
-      steps: [],
+      parts: [{ type: "text", value: "你好世界" }],
       completedAt: "2026-06-25T00:00:01.000Z"
-    });
-    firstStore.createAsset({
-      sessionId: session.id,
-      messageId: assistantMessage.id,
-      toolCallId: "call_image",
-      type: "image",
-      url: "https://example.com/pig.png",
-      prompt: "温馨田园小猪",
-      index: 0,
-      metadata: { provider: "test_image" }
     });
     firstStore.close();
 
-    const secondStore = await SqliteAgentStore.create({ databasePath, answerChunkCharLimit: 4 });
+    const secondStore = await SqliteAgentStore.create({ databasePath });
     const storedEvents = secondStore.getEvents(assistantMessage.id);
 
     expect(secondStore.getSession(session.id)).toMatchObject({
@@ -126,25 +194,13 @@ describe("SqliteAgentStore", () => {
         id: userMessage.id,
         role: "user",
         status: "completed",
-        content: "生成图片"
+        parts: [{ type: "text", value: "生成图片" }]
       }),
       expect.objectContaining({
         id: assistantMessage.id,
         role: "assistant",
         status: "completed",
-        content: "你好世界",
-        steps: []
-      })
-    ]);
-    expect(secondStore.getAssetsBySession(session.id)).toEqual([
-      expect.objectContaining({
-        messageId: assistantMessage.id,
-        toolCallId: "call_image",
-        type: "image",
-        url: "https://example.com/pig.png",
-        prompt: "温馨田园小猪",
-        index: 0,
-        metadata: { provider: "test_image" }
+        parts: [{ type: "text", value: "你好世界" }]
       })
     ]);
     expect(storedEvents.map((event) => event.seq)).toEqual([1, 2, 3]);
@@ -155,8 +211,8 @@ describe("SqliteAgentStore", () => {
     ]);
     expect(storedEvents.map((event) => event.event)).toEqual([
       { type: "iteration_start", iteration: 0 },
-      { type: "answer_chunk", iteration: 0, text: "你好世界" },
-      { type: "final_answer", answer: "你好世界", steps: [] }
+      { type: "message.part.delta", messageId: assistantMessage.id, partIndex: 0, delta: "你好世界" },
+      { type: "final_answer", answer: "你好世界" }
     ]);
     secondStore.close();
   });
@@ -170,7 +226,7 @@ describe("SqliteAgentStore", () => {
       sessionId: firstSession.id,
       role: "user",
       status: "completed",
-      content: "更新旧会话"
+      parts: [{ type: "text", value: "更新旧会话" }]
     });
     firstStore.close();
 

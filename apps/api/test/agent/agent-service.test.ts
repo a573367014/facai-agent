@@ -54,14 +54,6 @@ describe("AgentService", () => {
 
     await expect(service.run({ input: "计算 12 * 9" })).resolves.toEqual({
       answer: "结果是 108。",
-      steps: [
-        {
-          type: "tool_call",
-          toolName: "calculator",
-          arguments: { expression: "12 * 9" },
-          result: { value: 108 }
-        }
-      ]
     });
   });
 
@@ -104,17 +96,6 @@ describe("AgentService", () => {
 
     await expect(service.run({ input: "搜索资料" })).resolves.toEqual({
       answer: "已根据搜索摘要回答。",
-      steps: [
-        {
-          type: "tool_call",
-          toolName: "search",
-          arguments: {},
-          result: {
-            provider: "test",
-            results: [{ title: "完整结果", url: "https://example.com", snippet: "很长的原始内容" }]
-          }
-        }
-      ]
     });
     expect(observedToolContents).toEqual(["搜索摘要：完整结果 https://example.com"]);
   });
@@ -146,8 +127,7 @@ describe("AgentService", () => {
     );
 
     await expect(service.run({ input: "有哪些工具" })).resolves.toEqual({
-      answer: "calculator",
-      steps: []
+      answer: "calculator"
     });
   });
 
@@ -229,8 +209,7 @@ describe("AgentService", () => {
         }
       })
     ).resolves.toEqual({
-      answer: "工具参数不合法，请补充 text 后再试。",
-      steps: []
+      answer: "工具参数不合法，请补充 text 后再试。"
     });
     expect(JSON.parse(observedToolContents[0])).toEqual({
       ok: false,
