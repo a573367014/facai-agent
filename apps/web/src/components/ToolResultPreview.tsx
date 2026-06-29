@@ -56,6 +56,10 @@ interface ToolResultPreviewProps {
   onImageAction?: (payload: ToolImageActionPayload) => void;
 }
 
+function isImageToolName(toolName: string) {
+  return toolName === "generate_image" || toolName === "edit_image";
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -340,6 +344,7 @@ export function ImagePreview({
                               anchorEl={actionMenu?.anchorEl ?? null}
                               open={actionMenu?.url === url}
                               onClose={() => setActionMenu(null)}
+                              disableRestoreFocus
                               slotProps={{
                                 list: {
                                   "aria-label": `图片 ${flatIndex + 1} 操作菜单`
@@ -428,6 +433,7 @@ export function ImagePreview({
                   anchorEl={actionMenu?.anchorEl ?? null}
                   open={actionMenu?.url === url}
                   onClose={() => setActionMenu(null)}
+                  disableRestoreFocus
                   slotProps={{
                     list: {
                       "aria-label": `图片 ${index + 1} 操作菜单`
@@ -520,12 +526,12 @@ export function ToolResultPreview({ trace, onImageAction }: ToolResultPreviewPro
     return <WebSearchPreview trace={trace} result={searchResult} />;
   }
 
-  if (trace.toolName === "generate_image" && (trace.status === "pending" || trace.status === "running")) {
+  if (isImageToolName(trace.toolName) && (trace.status === "pending" || trace.status === "running")) {
     return <ImageTraceSummary trace={trace} />;
   }
 
   const imageResult = asImageResult(trace.result);
-  if (trace.toolName === "generate_image" && imageResult) {
+  if (isImageToolName(trace.toolName) && imageResult) {
     return <ImageTraceSummary trace={trace} />;
   }
 

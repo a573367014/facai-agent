@@ -1,5 +1,8 @@
 import type { OutgoingHttpHeaders } from "node:http";
-import type { FastifyInstance } from "fastify";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { AgentMessageCoordinator } from "../agent/agent-message-coordinator.js";
 import type { StoredAgentEvent } from "../agent/agent-store.js";
@@ -22,8 +25,8 @@ const textPartSchema = z
 const mediaPartSchema = z
   .object({
     type: z.literal("media"),
-    mime: z.string().min(1),
-    url: z.string(),
+    mime: z.string().min(1).optional(),
+    url: z.string().optional(),
     name: z.string().optional(),
     width: z.number().optional(),
     height: z.number().optional(),
@@ -58,6 +61,14 @@ const sessionMessagesQuerySchema = z.object({
   before: z.string().min(1).optional(),
   limit: z.coerce.number().int().min(1).max(100).optional()
 });
+const imageMimeExtensions: Record<string, string> = {
+  "image/jpeg": ".jpg",
+  "image/png": ".png",
+  "image/gif": ".gif",
+  "image/webp": ".webp",
+  "image/avif": ".avif",
+  "image/svg+xml": ".svg"
+};
 
 function parseMessageRequest(body: unknown) {
   const parsed = messageRequestSchema.safeParse(body);
@@ -162,7 +173,8 @@ function parseSessionMessagesQuery(query: unknown) {
 }
 
 function formatStoredSseEvent(event: StoredAgentEvent): string {
-  return `id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`;
+  const eventId = event.seq > 0 ? event.seq : event.id;
+  return `id: ${eventId}\ndata: ${JSON.stringify(event)}\n\n`;
 }
 
 function isTerminalStoredEvent(event: StoredAgentEvent): boolean {
@@ -185,7 +197,51 @@ function buildSseHeaders(headers: Record<string, number | string | string[] | un
   return sseHeaders;
 }
 
-export async function registerAgentRoutes(app: FastifyInstance, coordinator: AgentMessageCoordinator): Promise<void> {
+function createLiveSseEvent(input: {
+  messageId?: string;
+  runId?: string;
+  event: StoredAgentEvent["event"];
+}): StoredAgentEvent {
+  return {
+    id: `event_live_${randomUUID()}`,
+    seq: 0,
+    messageId: input.messageId,
+    runId: input.runId,
+    event: input.event,
+    createdAt: new Date().toISOString(),
+    transient: true
+  };
+}
+
+function getImageExtension(mime: string, fileName: string) {
+  const mimeExtension = imageMimeExtensions[mime.toLowerCase()];
+
+  if (mimeExtension) {
+    return mimeExtension;
+  }
+
+  const extension = basename(fileName).match(/\.[a-zA-Z0-9]+$/)?.[0];
+  return extension ? extension.toLowerCase() : ".img";
+}
+
+function isFileExistsError(error: unknown) {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    (error as NodeJS.ErrnoException).code === "EEXIST"
+  );
+}
+
+function getRequestOrigin(request: FastifyRequest) {
+  const host = typeof request.headers.host === "string" ? request.headers.host : "localhost";
+  return `http://${host}`;
+}
+
+export async function registerAgentRoutes(
+  app: FastifyInstance,
+  coordinator: AgentMessageCoordinator,
+  options: { uploadDirectory: string }
+): Promise<void> {
   app.post("/agents/sessions", async (request, reply) => {
     const { title } = parseSessionRequest(request.body);
     reply.status(201).send({ session: coordinator.createSession(title) });
@@ -217,6 +273,48 @@ export async function registerAgentRoutes(app: FastifyInstance, coordinator: Age
     reply.status(202).send(await coordinator.startRun(input));
   });
 
+  app.post("/agents/uploads/images", async (request, reply) => {
+    const file = await request.file();
+
+    if (!file) {
+      throw new AppError("VALIDATION_ERROR", "请选择要上传的图片", 400);
+    }
+
+    if (!file.mimetype.startsWith("image/")) {
+      throw new AppError("VALIDATION_ERROR", "当前只支持上传图片", 400);
+    }
+
+    const buffer = await file.toBuffer();
+
+    if (buffer.length === 0) {
+      throw new AppError("VALIDATION_ERROR", "图片内容不能为空", 400);
+    }
+
+    const extension = getImageExtension(file.mimetype, file.filename);
+    const contentHash = createHash("md5").update(buffer).digest("hex");
+    const storedFileName = `${contentHash}${extension}`;
+    const relativePath = `images/${storedFileName}`;
+
+    await mkdir(join(options.uploadDirectory, "images"), { recursive: true });
+    try {
+      await writeFile(join(options.uploadDirectory, relativePath), buffer, { flag: "wx" });
+    } catch (error) {
+      if (!isFileExistsError(error)) {
+        throw error;
+      }
+    }
+
+    reply.status(201).send({
+      file: {
+        type: "media",
+        mime: file.mimetype,
+        url: `${getRequestOrigin(request)}/uploads/${relativePath}`,
+        name: basename(file.filename),
+        size: buffer.length
+      }
+    });
+  });
+
   app.post("/agents/sessions/:sessionId/messages", async (request, reply) => {
     const { sessionId } = parseSessionParams(request.params);
     const input = parseMessageRequest(request.body);
@@ -231,7 +329,12 @@ export async function registerAgentRoutes(app: FastifyInstance, coordinator: Age
 
   app.get("/agents/messages/:messageId", async (request) => {
     const { messageId } = parseMessageParams(request.params);
-    return coordinator.getMessage(messageId);
+    return coordinator.getMessageSnapshot(messageId);
+  });
+
+  app.get("/agents/messages/:messageId/debug/events", async (request) => {
+    const { messageId } = parseMessageParams(request.params);
+    return coordinator.getMessageDebugEvents(messageId);
   });
 
   app.get("/agents/runs/:runId", async (request) => {
@@ -249,10 +352,15 @@ export async function registerAgentRoutes(app: FastifyInstance, coordinator: Age
     return coordinator.cancelRun(runId);
   });
 
+  app.post("/agents/messages/:messageId/regenerate", async (request, reply) => {
+    const { messageId } = parseMessageParams(request.params);
+    reply.status(202).send(await coordinator.regenerateMessage(messageId));
+  });
+
   app.get("/agents/messages/:messageId/events", async (request, reply) => {
     const { messageId } = parseMessageParams(request.params);
-    const { after = 0 } = parseEventsQuery(request.query);
-    const { message } = coordinator.getMessage(messageId);
+    parseEventsQuery(request.query);
+    await coordinator.getMessageSnapshot(messageId);
 
     reply.raw.writeHead(200, buildSseHeaders(reply.getHeaders()));
 
@@ -269,11 +377,18 @@ export async function registerAgentRoutes(app: FastifyInstance, coordinator: Age
       reply.raw.end();
     };
     const writeStoredEvent = (event: StoredAgentEvent) => {
-      if (ended || event.seq <= after || sentEventSeqs.has(event.seq)) {
+      if (ended) {
         return;
       }
 
-      sentEventSeqs.add(event.seq);
+      if (event.seq > 0 && sentEventSeqs.has(event.seq)) {
+        return;
+      }
+
+      if (event.seq > 0) {
+        sentEventSeqs.add(event.seq);
+      }
+
       reply.raw.write(formatStoredSseEvent(event));
 
       if (isTerminalStoredEvent(event)) {
@@ -289,9 +404,13 @@ export async function registerAgentRoutes(app: FastifyInstance, coordinator: Age
       }
     });
 
-    for (const event of coordinator.getEvents(messageId, after)) {
-      writeStoredEvent(event);
-    }
+    const { message, resources, version } = await coordinator.getMessageSnapshot(messageId);
+    writeStoredEvent(
+      createLiveSseEvent({
+        messageId,
+        event: { type: "message.snapshot", message, resources, version }
+      })
+    );
 
     if (message.status !== "running") {
       finish();
@@ -300,8 +419,8 @@ export async function registerAgentRoutes(app: FastifyInstance, coordinator: Age
 
   app.get("/agents/runs/:runId/events", async (request, reply) => {
     const { runId } = parseRunParams(request.params);
-    const { after = 0 } = parseEventsQuery(request.query);
-    const { run } = coordinator.getRun(runId);
+    parseEventsQuery(request.query);
+    coordinator.getRun(runId);
 
     reply.raw.writeHead(200, buildSseHeaders(reply.getHeaders()));
 
@@ -318,11 +437,18 @@ export async function registerAgentRoutes(app: FastifyInstance, coordinator: Age
       reply.raw.end();
     };
     const writeStoredEvent = (event: StoredAgentEvent) => {
-      if (ended || event.seq <= after || sentEventSeqs.has(event.seq)) {
+      if (ended) {
         return;
       }
 
-      sentEventSeqs.add(event.seq);
+      if (event.seq > 0 && sentEventSeqs.has(event.seq)) {
+        return;
+      }
+
+      if (event.seq > 0) {
+        sentEventSeqs.add(event.seq);
+      }
+
       reply.raw.write(formatStoredSseEvent(event));
 
       if (isTerminalStoredEvent(event)) {
@@ -338,8 +464,16 @@ export async function registerAgentRoutes(app: FastifyInstance, coordinator: Age
       }
     });
 
-    for (const event of coordinator.getRunEvents(runId, after)) {
-      writeStoredEvent(event);
+    const { run } = coordinator.getRun(runId);
+    if (run.assistantMessageId) {
+      const { message, resources, version } = await coordinator.getMessageSnapshot(run.assistantMessageId);
+      writeStoredEvent(
+        createLiveSseEvent({
+          runId,
+          messageId: message.id,
+          event: { type: "message.snapshot", message, resources, version }
+        })
+      );
     }
 
     if (run.status !== "running") {

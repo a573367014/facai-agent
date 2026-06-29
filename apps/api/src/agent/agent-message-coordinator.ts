@@ -3,18 +3,32 @@ import type { AgentSummaryService } from "./agent-summary-service.js";
 import type { AgentService } from "./agent-service.js";
 import { AgentContextBuilder } from "./context-builder.js";
 import {
-  appendTextDelta,
   createTextPart,
   partsToLlmText,
   upsertGeneratedImageParts,
   type GeneratedImagePartInput,
   type MessagePart
 } from "./message-parts.js";
+import {
+  InMemoryRunningMessageStateStore,
+  type RunningMessageState,
+  type RunningMessageStateStore
+} from "./running-message-state-store.js";
 import type { AgentErrorDetail, AgentMessage, AgentExecutionInput, AgentStreamEvent, JsonObject } from "./types.js";
-import type { AgentEventListener, AgentMessagePage, AgentMessageRecord, AgentRunRecord, AgentStore } from "./agent-store.js";
+import type {
+  AgentEventListener,
+  AgentMessagePage,
+  AgentMessageRecord,
+  AgentResourceRecord,
+  AgentRunRecord,
+  AgentStore,
+  AgentToolCallRecord,
+  StoredAgentEvent
+} from "./agent-store.js";
 
 const DEFAULT_SESSION_MESSAGE_LIMIT = 30;
 const MAX_SESSION_MESSAGE_LIMIT = 100;
+const IMAGE_OUTPUT_TOOL_NAMES = new Set(["generate_image", "edit_image"]);
 
 interface ExtractedImageResult {
   url: string;
@@ -24,6 +38,38 @@ interface ExtractedImageResult {
   prompt?: string;
   index: number;
   metadata: JsonObject;
+}
+
+interface FailedImageResult {
+  width?: number;
+  height?: number;
+  prompt?: string;
+  index: number;
+  error?: string;
+  metadata: JsonObject;
+}
+
+interface ImageRequestSlot {
+  outputIndex: number;
+  prompt?: string;
+  width?: number;
+  height?: number;
+  sourceImageUrl?: string;
+  isBatch: boolean;
+}
+
+type AgentMessagePageWithResources = AgentMessagePage & {
+  resources: AgentResourceRecord[];
+};
+
+interface RunningDraftSnapshot {
+  message: AgentMessageRecord;
+  version?: number;
+}
+
+interface DraftPartsUpdate {
+  parts: MessagePart[];
+  version?: number;
 }
 
 function toErrorDetail(error: unknown): AgentErrorDetail {
@@ -53,7 +99,8 @@ export class AgentMessageCoordinator {
     private readonly agentService: AgentService,
     private readonly store: AgentStore,
     private readonly contextBuilder = new AgentContextBuilder(),
-    private readonly summaryService?: AgentSummaryService
+    private readonly summaryService?: AgentSummaryService,
+    private readonly runningStateStore: RunningMessageStateStore = new InMemoryRunningMessageStateStore()
   ) {}
 
   createSession(title?: string) {
@@ -78,12 +125,13 @@ export class AgentMessageCoordinator {
     return {
       session,
       messages: messagePage.messages,
+      resources: this.getResourcesForMessages(messagePage.messages),
       pageInfo: messagePage.pageInfo,
       summary: this.store.getSessionSummary(sessionId)
     };
   }
 
-  getSessionMessages(sessionId: string, options: { before?: string; messageLimit?: number } = {}): AgentMessagePage {
+  getSessionMessages(sessionId: string, options: { before?: string; messageLimit?: number } = {}): AgentMessagePageWithResources {
     const session = this.store.getSession(sessionId);
 
     if (!session) {
@@ -91,16 +139,18 @@ export class AgentMessageCoordinator {
     }
 
     if (!options.before) {
-      return this.getRecentMessagePage(sessionId, options.messageLimit);
+      return this.withResources(this.getRecentMessagePage(sessionId, options.messageLimit));
     }
 
-    return this.trimOldestOverflow(
-      this.store.getMessagesBefore(sessionId, options.before, this.normalizeMessageLimit(options.messageLimit) + 1),
-      this.normalizeMessageLimit(options.messageLimit)
+    return this.withResources(
+      this.trimOldestOverflow(
+        this.store.getMessagesBefore(sessionId, options.before, this.normalizeMessageLimit(options.messageLimit) + 1),
+        this.normalizeMessageLimit(options.messageLimit)
+      )
     );
   }
 
-  startMessage(input: AgentExecutionInput & { sessionId?: string }) {
+  async startMessage(input: AgentExecutionInput & { sessionId?: string }) {
     const userParts = input.parts?.length ? input.parts : [createTextPart(input.input)];
     const userText = partsToLlmText(userParts);
     const session = input.sessionId ? this.getSession(input.sessionId).session : this.store.createSession(userText.slice(0, 32));
@@ -120,6 +170,7 @@ export class AgentMessageCoordinator {
     });
     const controller = new AbortController();
 
+    await this.initRunningMessageState(assistantMessage);
     this.runningMessages.set(assistantMessage.id, controller);
     void this.executeMessage(assistantMessage.id, {
       ...input,
@@ -171,7 +222,54 @@ export class AgentMessageCoordinator {
     };
   }
 
-  cancelRun(runId: string) {
+  async regenerateMessage(messageId: string) {
+    const sourceAssistantMessage = this.ensureAssistantMessage(messageId);
+
+    if (sourceAssistantMessage.status === "running") {
+      throw new AppError("VALIDATION_ERROR", "运行中的回答不能重新生成，请先停止当前生成", 400);
+    }
+
+    const userMessage = this.findInputUserMessageForAssistant(sourceAssistantMessage);
+
+    if (!userMessage) {
+      throw new AppError("VALIDATION_ERROR", "未找到这条回答对应的用户输入，无法重新生成", 404);
+    }
+
+    const session = this.getSession(sourceAssistantMessage.sessionId).session;
+    const userText = partsToLlmText(userMessage.parts);
+    const run = this.store.createRun({
+      sessionId: session.id,
+      userMessageId: userMessage.id,
+      status: "running",
+      phase: "answering"
+    });
+    const controller = new AbortController();
+    const history = this.buildConversationHistoryBefore(session.id, userMessage.id);
+
+    this.runningRuns.set(run.id, controller);
+    void this.executeRun(
+      run.id,
+      {
+        input: userText,
+        parts: userMessage.parts,
+        maxIterations: sourceAssistantMessage.maxIterations,
+        sessionId: session.id,
+        signal: controller.signal
+      },
+      {
+        history,
+        skipSummaryRefresh: true
+      }
+    );
+
+    return {
+      run,
+      session,
+      userMessage
+    };
+  }
+
+  async cancelRun(runId: string) {
     const run = this.ensureRun(runId);
 
     if (run.status !== "running") {
@@ -199,6 +297,7 @@ export class AgentMessageCoordinator {
       const assistantMessage = this.store.getMessage(run.assistantMessageId);
 
       if (assistantMessage?.status === "running") {
+        const draftMessage = await this.withRunningDraft(assistantMessage);
         this.store.appendRunEvent(runId, {
           type: "agent_state",
           iteration: 0,
@@ -208,7 +307,7 @@ export class AgentMessageCoordinator {
         const cancelledAssistantMessage =
           this.store.updateMessage(assistantMessage.id, {
             status: "cancelled",
-            parts: assistantMessage.parts,
+            parts: draftMessage.parts,
             completedAt: timestamp
           }) ?? assistantMessage;
         this.store.appendRunEvent(
@@ -216,6 +315,7 @@ export class AgentMessageCoordinator {
           { type: "session.message.updated", message: cancelledAssistantMessage },
           cancelledAssistantMessage.id
         );
+        await this.runningStateStore.remove(assistantMessage.id);
       }
     }
 
@@ -240,6 +340,21 @@ export class AgentMessageCoordinator {
     };
   }
 
+  getMessageDebugEvents(messageId: string) {
+    const message = this.ensureMessage(messageId);
+    const messageEvents = this.store.getEvents(messageId);
+    const runs = this.store.getRunsByMessageId(messageId);
+    const runEvents = runs.flatMap((run) => this.store.getRunEvents(run.id));
+
+    return {
+      message,
+      runs,
+      messageEvents,
+      runEvents,
+      events: sortStoredEvents([...messageEvents, ...runEvents])
+    };
+  }
+
   getRunEvents(runId: string, after = 0) {
     this.ensureRun(runId);
     return this.store.getRunEvents(runId, after);
@@ -250,7 +365,7 @@ export class AgentMessageCoordinator {
     return this.store.subscribeRun(runId, listener);
   }
 
-  cancelMessage(messageId: string) {
+  async cancelMessage(messageId: string) {
     const message = this.ensureAssistantMessage(messageId);
 
     if (message.status !== "running") {
@@ -268,13 +383,15 @@ export class AgentMessageCoordinator {
       type: "cancelled",
       reason: "用户中断"
     });
+    const draftMessage = await this.withRunningDraft(message);
     const cancelledMessage =
       this.store.updateMessage(messageId, {
         status: "cancelled",
-        parts: message.parts,
+        parts: draftMessage.parts,
         completedAt: now()
       }) ?? message;
     this.runningMessages.delete(messageId);
+    await this.runningStateStore.remove(messageId);
 
     return { message: cancelledMessage };
   }
@@ -284,7 +401,19 @@ export class AgentMessageCoordinator {
 
     return {
       message,
+      resources: this.getResourcesForMessages([message]),
       events: this.store.getEvents(messageId)
+    };
+  }
+
+  async getMessageSnapshot(messageId: string) {
+    const { message, version } = await this.getRunningDraftSnapshot(this.ensureAssistantMessage(messageId));
+
+    return {
+      message,
+      resources: this.getResourcesForMessages([message]),
+      events: this.store.getEvents(messageId),
+      version
     };
   }
 
@@ -298,7 +427,11 @@ export class AgentMessageCoordinator {
     return this.store.subscribe(messageId, listener);
   }
 
-  private async executeRun(runId: string, input: AgentExecutionInput) {
+  private async executeRun(
+    runId: string,
+    input: AgentExecutionInput,
+    options: { history?: AgentMessage[]; skipSummaryRefresh?: boolean } = {}
+  ) {
     let assistantMessage: AgentMessageRecord | undefined;
     let finalAnswerEvent: Extract<AgentStreamEvent, { type: "final_answer" }> | undefined;
 
@@ -310,13 +443,15 @@ export class AgentMessageCoordinator {
       const run = this.ensureRun(runId);
       const userMessageId = run.userMessageId;
 
-      await this.refreshSessionSummaryBeforeAnswer(runId, input.sessionId, userMessageId, input.signal);
+      if (!options.skipSummaryRefresh) {
+        await this.refreshSessionSummaryBeforeAnswer(runId, input.sessionId, userMessageId, input.signal);
+      }
 
       if (input.signal.aborted || this.store.getRun(runId)?.status !== "running") {
         return;
       }
 
-      const history = this.buildConversationHistoryBefore(input.sessionId, userMessageId);
+      const history = options.history ?? this.buildConversationHistoryBefore(input.sessionId, userMessageId);
 
       assistantMessage = this.store.createMessage({
         sessionId: input.sessionId,
@@ -325,6 +460,7 @@ export class AgentMessageCoordinator {
         parts: [createTextPart("")],
         maxIterations: input.maxIterations
       });
+      await this.initRunningMessageState(assistantMessage, runId);
       this.store.updateRun(runId, {
         phase: "answering",
         assistantMessageId: assistantMessage.id
@@ -338,13 +474,13 @@ export class AgentMessageCoordinator {
         messageId: assistantMessage.id,
         sessionId: input.sessionId,
         signal: input.signal,
-        onEvent: (event) => {
+        onEvent: async (event) => {
           if (event.type === "final_answer") {
             finalAnswerEvent = event;
             return;
           }
 
-          this.handleExecutionEvent(assistantMessage!.id, event, runId);
+          await this.handleExecutionEvent(assistantMessage!.id, event, runId);
         }
       });
 
@@ -352,12 +488,12 @@ export class AgentMessageCoordinator {
         return;
       }
 
-      this.setAssistantTextAndEmitUpdate(assistantMessage.id, result.answer, runId);
+      const finalParts = await this.setAssistantTextAndEmitUpdate(assistantMessage.id, result.answer, runId);
       this.store.appendRunEvent(runId, finalAnswerEvent ?? { type: "final_answer", answer: result.answer }, assistantMessage.id);
       const completedAssistantMessage =
         this.store.updateMessage(assistantMessage.id, {
           status: "completed",
-          parts: this.withAssistantText(assistantMessage.id, result.answer),
+          parts: finalParts,
           completedAt: now()
         }) ?? assistantMessage;
       this.store.appendRunEvent(
@@ -393,7 +529,7 @@ export class AgentMessageCoordinator {
         const failedMessage =
           this.store.updateMessage(messageId, {
             status: "failed",
-            parts: this.withAssistantText(messageId, "本轮运行失败。"),
+            parts: await this.withAssistantText(messageId, "本轮运行失败。"),
             error: detail,
             completedAt: now()
           }) ?? this.store.getMessage(messageId);
@@ -411,7 +547,90 @@ export class AgentMessageCoordinator {
       });
     } finally {
       this.runningRuns.delete(runId);
+      if (assistantMessage) {
+        await this.runningStateStore.remove(assistantMessage.id);
+      }
     }
+  }
+
+  private async initRunningMessageState(message: AgentMessageRecord, runId?: string): Promise<RunningMessageState> {
+    return this.runningStateStore.init({
+      messageId: message.id,
+      sessionId: message.sessionId,
+      runId,
+      parts: message.parts
+    });
+  }
+
+  private async withRunningDraft(message: AgentMessageRecord): Promise<AgentMessageRecord> {
+    return (await this.getRunningDraftSnapshot(message)).message;
+  }
+
+  private async getRunningDraftSnapshot(message: AgentMessageRecord): Promise<RunningDraftSnapshot> {
+    if (message.status !== "running") {
+      return { message };
+    }
+
+    const state = await this.runningStateStore.get(message.id);
+
+    if (!state) {
+      return { message };
+    }
+
+    return {
+      message: {
+        ...message,
+        parts: state.parts,
+        updatedAt: state.updatedAt
+      },
+      version: state.version
+    };
+  }
+
+  private async ensureRunningState(message: AgentMessageRecord, runId?: string): Promise<RunningMessageState | undefined> {
+    if (message.status !== "running") {
+      return undefined;
+    }
+
+    const state = await this.runningStateStore.get(message.id);
+
+    if (state) {
+      return state;
+    }
+
+    return this.initRunningMessageState(message, runId);
+  }
+
+  private async getDraftParts(messageId: string, runId?: string): Promise<MessagePart[]> {
+    const message = this.store.getMessage(messageId);
+
+    if (!message) {
+      return [];
+    }
+
+    const state = await this.ensureRunningState(message, runId);
+    return state?.parts ?? message.parts;
+  }
+
+  private async setDraftParts(messageId: string, parts: MessagePart[], runId?: string): Promise<DraftPartsUpdate> {
+    const message = this.store.getMessage(messageId);
+
+    if (!message) {
+      return { parts };
+    }
+
+    if (message.status === "running") {
+      await this.ensureRunningState(message, runId);
+      const state = await this.runningStateStore.setParts(messageId, parts);
+      return {
+        parts: state?.parts ?? parts,
+        version: state?.version
+      };
+    }
+
+    return {
+      parts: this.store.updateMessageParts(messageId, parts)?.parts ?? parts
+    };
   }
 
   private async executeMessage(messageId: string, input: AgentExecutionInput) {
@@ -425,13 +644,13 @@ export class AgentMessageCoordinator {
         messageId: input.messageId,
         sessionId: input.sessionId,
         signal: input.signal,
-        onEvent: (event) => {
+        onEvent: async (event) => {
           if (event.type === "final_answer") {
             finalAnswerEvent = event;
             return;
           }
 
-          this.handleExecutionEvent(messageId, event);
+          await this.handleExecutionEvent(messageId, event);
         }
       });
 
@@ -439,11 +658,11 @@ export class AgentMessageCoordinator {
         return;
       }
 
-      this.setAssistantTextAndEmitUpdate(messageId, result.answer);
+      const finalParts = await this.setAssistantTextAndEmitUpdate(messageId, result.answer);
       this.store.appendEvent(messageId, finalAnswerEvent ?? { type: "final_answer", answer: result.answer });
       this.store.updateMessage(messageId, {
         status: "completed",
-        parts: this.withAssistantText(messageId, result.answer),
+        parts: finalParts,
         completedAt: now()
       });
       await this.refreshSessionSummary(input.sessionId);
@@ -461,20 +680,42 @@ export class AgentMessageCoordinator {
       });
       this.store.updateMessage(messageId, {
         status: "failed",
-        parts: this.withAssistantText(messageId, "本轮运行失败。"),
+        parts: await this.withAssistantText(messageId, "本轮运行失败。"),
         error: detail,
         completedAt: now()
       });
     } finally {
       this.runningMessages.delete(messageId);
+      await this.runningStateStore.remove(messageId);
     }
   }
 
   private ensureAssistantMessage(messageId: string) {
+    const message = this.ensureMessage(messageId);
+
+    if (message.role !== "assistant") {
+      throw new AppError("VALIDATION_ERROR", `未找到助手消息：${messageId}`, 404);
+    }
+
+    return message;
+  }
+
+  private findInputUserMessageForAssistant(assistantMessage: AgentMessageRecord): AgentMessageRecord | undefined {
+    const sessionMessages = this.store.getMessagesBySession(assistantMessage.sessionId);
+    const assistantIndex = sessionMessages.findIndex((message) => message.id === assistantMessage.id);
+
+    if (assistantIndex <= 0) {
+      return undefined;
+    }
+
+    return [...sessionMessages.slice(0, assistantIndex)].reverse().find((message) => message.role === "user");
+  }
+
+  private ensureMessage(messageId: string) {
     const message = this.store.getMessage(messageId);
 
-    if (!message || message.role !== "assistant") {
-      throw new AppError("VALIDATION_ERROR", `未找到助手消息：${messageId}`, 404);
+    if (!message) {
+      throw new AppError("VALIDATION_ERROR", `未找到消息：${messageId}`, 404);
     }
 
     return message;
@@ -490,32 +731,99 @@ export class AgentMessageCoordinator {
     return run;
   }
 
-  private handleExecutionEvent(messageId: string, event: AgentStreamEvent, runId?: string) {
+  private async handleExecutionEvent(messageId: string, event: AgentStreamEvent, runId?: string) {
     if (event.type === "answer_delta") {
-      this.appendAssistantTextDelta(messageId, event.delta, runId);
+      await this.appendAssistantTextDelta(messageId, event.delta, runId);
       return;
     }
 
-    if (event.type === "tool_start" && event.toolName === "generate_image" && event.toolCallId) {
-      this.upsertImagePart(messageId, {
-        state: "pending",
-        toolName: event.toolName,
+    if (event.type === "tool_call_ready") {
+      this.ensureToolCallRecord(messageId, event, runId, "pending");
+    }
+
+    if (event.type === "tool_start" && isImageOutputToolName(event.toolName) && event.toolCallId) {
+      const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
+      const imageSlots = extractImageRequestSlots(event.arguments);
+
+      for (const slot of imageSlots) {
+        const resource = this.upsertImageResource(messageId, {
+          status: "pending",
+          toolCallId: event.toolCallId,
+          toolCallRowId: toolCall?.id,
+          outputIndex: slot.outputIndex,
+          mime: "image/png",
+          metadata: buildImageMetadata({
+            prompt: slot.prompt,
+            width: slot.width,
+            height: slot.height,
+            sourceImageUrl: slot.sourceImageUrl,
+            outputIndex: slot.outputIndex,
+            includeOutputIndex: slot.isBatch
+          })
+        }, runId);
+
+        await this.upsertImagePart(messageId, {
+          state: "pending",
+          resourceId: resource.id,
+          toolName: event.toolName,
+          toolCallId: event.toolCallId,
+          toolCallRowId: toolCall?.id,
+          outputIndex: slot.outputIndex,
+          mime: "image/png"
+        }, runId);
+      }
+    } else if (event.type === "tool_start" && event.toolCallId) {
+      this.ensureToolCallRecord(messageId, event, runId, "running");
+    }
+
+    if (isImageToolResultWithId(event)) {
+      await this.upsertImageResultParts(messageId, event, runId);
+    } else if (event.type === "tool_result" && event.toolCallId) {
+      const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
+      if (toolCall) {
+        this.store.updateToolCall(toolCall.id, {
+          status: "succeeded",
+          durationMs: event.durationMs,
+          resultSummary: summarizeToolResult(event.result)
+        });
+      }
+    }
+
+    if (event.type === "tool_error" && isImageOutputToolName(event.toolName) && event.toolCallId) {
+      const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
+      const resource = this.upsertImageResource(messageId, {
+        status: "failed",
         toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
         outputIndex: 0,
         mime: "image/png",
-        generation: { prompt: toOptionalString(event.arguments.prompt) }
+        metadata: compactJsonObject({
+          prompt: toOptionalString(toolCall?.arguments.prompt),
+          sourceImageUrl: toOptionalString(toolCall?.arguments.imageUrl),
+          error: {
+            code: event.error.code,
+            message: event.error.message
+          }
+        })
       }, runId);
-    }
 
-    if (isGenerateImageToolResultWithId(event)) {
-      this.upsertImageResultParts(messageId, event, runId);
-    }
+      if (toolCall) {
+        this.store.updateToolCall(toolCall.id, {
+          status: "failed",
+          durationMs: event.durationMs,
+          error: {
+            code: event.error.code,
+            message: event.error.message
+          }
+        });
+      }
 
-    if (event.type === "tool_error" && event.toolName === "generate_image" && event.toolCallId) {
-      this.upsertImagePart(messageId, {
+      await this.upsertImagePart(messageId, {
         state: "failed",
+        resourceId: resource.id,
         toolName: event.toolName,
         toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
         outputIndex: 0,
         mime: "image/png",
         error: {
@@ -523,95 +831,217 @@ export class AgentMessageCoordinator {
           message: event.error.message
         }
       }, runId);
+    } else if (event.type === "tool_error" && event.toolCallId) {
+      const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
+      if (toolCall) {
+        this.store.updateToolCall(toolCall.id, {
+          status: "failed",
+          durationMs: event.durationMs,
+          error: {
+            code: event.error.code,
+            message: event.error.message
+          }
+        });
+      }
     }
 
     this.appendEvent(messageId, event, runId);
   }
 
-  private appendAssistantTextDelta(messageId: string, delta: string, runId?: string) {
+  private ensureToolCallRecord(
+    messageId: string,
+    event: {
+      iteration: number;
+      toolCallId?: string;
+      toolName: string;
+      arguments?: JsonObject;
+    },
+    runId: string | undefined,
+    status: AgentToolCallRecord["status"]
+  ): AgentToolCallRecord | undefined {
+    if (!event.toolCallId) {
+      return undefined;
+    }
+
+    const existingToolCall = this.store.getToolCallByMessageToolCall(messageId, event.toolCallId);
+
+    if (existingToolCall) {
+      return this.store.updateToolCall(existingToolCall.id, { status }) ?? existingToolCall;
+    }
+
+    const message = this.store.getMessage(messageId);
+
+    if (!message) {
+      return undefined;
+    }
+
+    return this.store.createToolCall({
+      sessionId: message.sessionId,
+      runId,
+      messageId,
+      iteration: event.iteration,
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      arguments: event.arguments ?? {},
+      status
+    });
+  }
+
+  private async appendAssistantTextDelta(messageId: string, delta: string, runId?: string) {
     const message = this.store.getMessage(messageId);
 
     if (!message) {
       return;
     }
 
-    const { parts, partIndex } = ensureTextPart(message.parts);
-    const nextParts = appendTextDelta(parts, partIndex, delta);
-    this.store.updateMessageParts(messageId, nextParts);
-    this.appendEvent(messageId, {
+    await this.ensureRunningState(message, runId);
+    const result = await this.runningStateStore.appendTextDelta(messageId, delta);
+
+    if (!result) {
+      return;
+    }
+
+    this.publishTransientEvent(messageId, {
       type: "message.part.delta",
       messageId,
-      partIndex,
-      delta
+      partIndex: result.partIndex,
+      delta,
+      version: result.state.version
     }, runId);
   }
 
-  private withAssistantText(messageId: string, value: string): MessagePart[] {
-    const message = this.store.getMessage(messageId);
-    const { parts, partIndex } = ensureTextPart(message?.parts ?? []);
+  private async withAssistantText(messageId: string, value: string): Promise<MessagePart[]> {
+    const parts = await this.getDraftParts(messageId);
+    const { parts: ensuredParts, partIndex } = ensureTextPart(parts);
 
-    return parts.map((part, index) => (index === partIndex && part.type === "text" ? { ...part, value } : part));
+    return ensuredParts.map((part, index) => (index === partIndex && part.type === "text" ? { ...part, value } : part));
   }
 
-  private setAssistantTextAndEmitUpdate(messageId: string, value: string, runId?: string): MessagePart[] {
-    const message = this.store.getMessage(messageId);
-
-    if (!message) {
-      return [];
-    }
-
-    const { parts, partIndex } = ensureTextPart(message.parts);
+  private async setAssistantTextAndEmitUpdate(messageId: string, value: string, runId?: string): Promise<MessagePart[]> {
+    const { parts, partIndex } = ensureTextPart(await this.getDraftParts(messageId, runId));
     const nextParts = parts.map((part, index) => (index === partIndex && part.type === "text" ? { ...part, value } : part));
-    const updatedMessage = this.store.updateMessageParts(messageId, nextParts);
-    const part = updatedMessage?.parts[partIndex] ?? nextParts[partIndex];
+    const { parts: updatedParts, version } = await this.setDraftParts(messageId, nextParts, runId);
+    const part = updatedParts[partIndex] ?? nextParts[partIndex];
 
     if (part) {
       this.appendEvent(messageId, {
         type: "message.part.updated",
         messageId,
         partIndex,
-        part
+        part,
+        version
       }, runId);
     }
 
-    return nextParts;
+    return updatedParts;
   }
 
-  private upsertImageResultParts(
+  private async upsertImageResultParts(
     messageId: string,
-    event: Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: "generate_image"; toolCallId: string },
+    event: Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: string; toolCallId: string },
     runId?: string
   ) {
-    for (const asset of extractImageAssets(event.result, 0)) {
-      this.upsertImagePart(messageId, {
-        state: "succeeded",
+    const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
+    const assets = extractImageAssets(event.result, 0);
+    const failedAssets = extractFailedImageAssets(event.result, 0);
+
+    if (toolCall) {
+      this.store.updateToolCall(toolCall.id, {
+        status: "succeeded",
+        durationMs: event.durationMs,
+        resultSummary: compactJsonObject({
+          outputCount: assets.length,
+          provider: isRecord(event.result) ? event.result.provider : undefined
+        })
+      });
+    }
+
+    for (const asset of failedAssets) {
+      const resource = this.upsertImageResource(messageId, {
+        status: "failed",
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: asset.index,
+        mime: "image/png",
+        width: asset.width,
+        height: asset.height,
+        metadata: buildImageMetadata({
+          prompt: asset.prompt,
+          width: asset.width,
+          height: asset.height,
+          sourceImageUrl: toOptionalString(asset.metadata.sourceImageUrl),
+          outputIndex: asset.index,
+          includeOutputIndex: asset.index > 0,
+          provider: asset.metadata.provider,
+          error: asset.error
+        })
+      }, runId);
+
+      await this.upsertImagePart(messageId, {
+        state: "failed",
+        resourceId: resource.id,
         toolName: event.toolName,
         toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: asset.index,
+        mime: "image/png",
+        width: asset.width,
+        height: asset.height,
+        error: asset.error
+          ? {
+              code: "IMAGE_GENERATION_FAILED",
+              message: asset.error
+            }
+          : undefined
+      }, runId);
+    }
+
+    for (const asset of assets) {
+      const resource = this.upsertImageResource(messageId, {
+        status: "succeeded",
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
         outputIndex: asset.index ?? 0,
         mime: asset.mimeType ?? "image/png",
         url: asset.url,
         width: asset.width,
         height: asset.height,
-        generation: {
+        metadata: buildImageMetadata({
           prompt: asset.prompt,
-          provider: toOptionalString(asset.metadata?.provider)
-        }
+          width: asset.width,
+          height: asset.height,
+          sourceImageUrl: toOptionalString(asset.metadata.sourceImageUrl),
+          outputIndex: asset.index ?? 0,
+          includeOutputIndex: (asset.index ?? 0) > 0,
+          provider: asset.metadata.provider
+        })
+      }, runId);
+
+      await this.upsertImagePart(messageId, {
+        state: "succeeded",
+        resourceId: resource.id,
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: asset.index ?? 0,
+        mime: asset.mimeType ?? "image/png"
       }, runId);
     }
   }
 
-  private upsertImagePart(messageId: string, input: GeneratedImagePartInput, runId?: string) {
+  private async upsertImagePart(messageId: string, input: GeneratedImagePartInput, runId?: string) {
     const message = this.store.getMessage(messageId);
 
     if (!message) {
       return;
     }
 
-    const existingIndex = findToolPartIndex(message.parts, input.toolCallId, input.outputIndex);
-    const nextParts = upsertGeneratedImageParts(message.parts, input);
-    const partIndex = findToolPartIndex(nextParts, input.toolCallId, input.outputIndex);
-    const updatedMessage = this.store.updateMessageParts(messageId, nextParts);
-    const part = updatedMessage?.parts[partIndex] ?? nextParts[partIndex];
+    const currentParts = await this.getDraftParts(messageId, runId);
+    const existingIndex = findGeneratedImagePartIndex(currentParts, input);
+    const nextParts = upsertGeneratedImageParts(currentParts, input);
+    const partIndex = findGeneratedImagePartIndex(nextParts, input);
+    const { parts: updatedParts, version } = await this.setDraftParts(messageId, nextParts, runId);
+    const part = updatedParts[partIndex] ?? nextParts[partIndex];
 
     if (!part || partIndex < 0) {
       return;
@@ -621,8 +1051,126 @@ export class AgentMessageCoordinator {
       type: existingIndex === -1 ? "message.part.created" : "message.part.updated",
       messageId,
       partIndex,
-      part
+      part,
+      version
     }, runId);
+  }
+
+  private upsertImageResource(
+    messageId: string,
+    input: {
+      status: AgentResourceRecord["status"];
+      toolCallId: string;
+      toolCallRowId?: string;
+      outputIndex: number;
+      mime?: string;
+      url?: string;
+      name?: string;
+      width?: number;
+      height?: number;
+      metadata?: JsonObject;
+    },
+    runId?: string
+  ): AgentResourceRecord {
+    const message = this.store.getMessage(messageId);
+
+    if (!message) {
+      throw new AppError("VALIDATION_ERROR", `未找到助手消息：${messageId}`, 404);
+    }
+
+    const existingResource = this.findImageResource(messageId, input.toolCallId, input.outputIndex);
+
+    if (existingResource) {
+      const resource =
+        this.store.updateResource(existingResource.id, {
+          toolCallId: input.toolCallId,
+          toolCallRowId: input.toolCallRowId,
+          mime: input.mime,
+          url: input.url,
+          name: input.name,
+          status: input.status,
+          width: input.width,
+          height: input.height,
+          metadata: input.metadata ?? existingResource.metadata
+        }) ?? existingResource;
+      this.appendEvent(messageId, { type: "resource.updated", resource }, runId);
+      return resource;
+    }
+
+    const reusableFailedResource = this.findReusableFailedImageResource(messageId, input.metadata);
+
+    if (reusableFailedResource) {
+      const resource =
+        this.store.updateResource(reusableFailedResource.id, {
+          toolCallId: input.toolCallId,
+          toolCallRowId: input.toolCallRowId,
+          mime: input.mime,
+          url: input.url,
+          name: input.name,
+          status: input.status,
+          width: input.width,
+          height: input.height,
+          metadata: input.metadata ?? reusableFailedResource.metadata
+        }) ?? reusableFailedResource;
+      this.appendEvent(messageId, { type: "resource.updated", resource }, runId);
+      return resource;
+    }
+
+    const resource = this.store.createResource({
+      sessionId: message.sessionId,
+      messageId,
+      toolCallId: input.toolCallId,
+      toolCallRowId: input.toolCallRowId,
+      type: "image",
+      mime: input.mime,
+      url: input.url,
+      name: input.name,
+      status: input.status,
+      width: input.width,
+      height: input.height,
+      metadata: input.metadata
+    });
+    this.appendEvent(messageId, { type: "resource.created", resource }, runId);
+    return resource;
+  }
+
+  private findImageResource(messageId: string, toolCallId: string, outputIndex: number): AgentResourceRecord | undefined {
+    const resources = this.store
+      .getResourcesByMessages([messageId])
+      .filter((resource) => resource.type === "image" && resource.toolCallId === toolCallId);
+    const resourceWithOutputIndex = resources.find(
+      (resource) => toOptionalNumber(resource.metadata?.outputIndex) === outputIndex
+    );
+
+    if (resourceWithOutputIndex) {
+      return resourceWithOutputIndex;
+    }
+
+    if (outputIndex === 0) {
+      return resources.find((resource) => toOptionalNumber(resource.metadata?.outputIndex) === undefined);
+    }
+
+    return undefined;
+  }
+
+  private findReusableFailedImageResource(messageId: string, metadata?: JsonObject): AgentResourceRecord | undefined {
+    const prompt = toOptionalString(metadata?.prompt);
+    const sourceImageUrl = toOptionalString(metadata?.sourceImageUrl);
+
+    if (!prompt) {
+      return undefined;
+    }
+
+    return this.store
+      .getResourcesByMessages([messageId])
+      .find(
+        (resource) =>
+          resource.type === "image" &&
+          resource.status === "failed" &&
+          !resource.url &&
+          toOptionalString(resource.metadata?.prompt) === prompt &&
+          (!sourceImageUrl || toOptionalString(resource.metadata?.sourceImageUrl) === sourceImageUrl)
+      );
   }
 
   private appendEvent(messageId: string, event: AgentStreamEvent, runId?: string) {
@@ -632,6 +1180,15 @@ export class AgentMessageCoordinator {
     }
 
     this.store.appendEvent(messageId, event);
+  }
+
+  private publishTransientEvent(messageId: string, event: AgentStreamEvent, runId?: string) {
+    if (runId) {
+      this.store.publishTransientRunEvent(runId, event, messageId);
+      return;
+    }
+
+    this.store.publishTransientEvent(messageId, event);
   }
 
   private buildConversationHistory(sessionId: string): AgentMessage[] {
@@ -648,7 +1205,7 @@ export class AgentMessageCoordinator {
   }
 
   private buildConversationHistoryBefore(sessionId: string, beforeMessageId: string): AgentMessage[] {
-    const summary = this.store.getSessionSummary(sessionId);
+    const summary = this.store.getSessionSummaryBeforeMessage(sessionId, beforeMessageId);
     const messageLimit = this.contextBuilder.getHistoryMessageLimit();
     const messages =
       messageLimit === 0
@@ -849,6 +1406,17 @@ export class AgentMessageCoordinator {
     return this.trimOldestOverflow(this.store.getRecentMessagesBySession(sessionId, limit + 1), limit);
   }
 
+  private withResources(messagePage: AgentMessagePage): AgentMessagePageWithResources {
+    return {
+      ...messagePage,
+      resources: this.getResourcesForMessages(messagePage.messages)
+    };
+  }
+
+  private getResourcesForMessages(messages: AgentMessageRecord[]): AgentResourceRecord[] {
+    return this.store.getResourcesByMessages(messages.map((message) => message.id));
+  }
+
   private trimOldestOverflow(messages: AgentMessageRecord[], limit: number): AgentMessagePage {
     const hasMore = messages.length > limit;
     const pageMessages = hasMore ? messages.slice(1) : messages;
@@ -892,10 +1460,29 @@ function compactJsonObject(value: Record<string, unknown>): JsonObject {
   return Object.fromEntries(Object.entries(value).filter(([, entryValue]) => entryValue !== undefined)) as JsonObject;
 }
 
-function isGenerateImageToolResultWithId(
+function summarizeToolResult(result: unknown): JsonObject {
+  if (!isRecord(result)) {
+    return { type: typeof result };
+  }
+
+  const imageUrls = toStringArray(result.imageUrls);
+  const items = Array.isArray(result.items) ? result.items : undefined;
+
+  return compactJsonObject({
+    outputCount: imageUrls.length || items?.length,
+    provider: result.provider,
+    resultType: result.type
+  });
+}
+
+function isImageOutputToolName(toolName: string): boolean {
+  return IMAGE_OUTPUT_TOOL_NAMES.has(toolName);
+}
+
+function isImageToolResultWithId(
   event: AgentStreamEvent
-): event is Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: "generate_image"; toolCallId: string } {
-  return event.type === "tool_result" && event.toolName === "generate_image" && typeof event.toolCallId === "string";
+): event is Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: string; toolCallId: string } {
+  return event.type === "tool_result" && isImageOutputToolName(event.toolName) && typeof event.toolCallId === "string";
 }
 
 function ensureTextPart(parts: MessagePart[]): { parts: MessagePart[]; partIndex: number } {
@@ -908,13 +1495,115 @@ function ensureTextPart(parts: MessagePart[]): { parts: MessagePart[]; partIndex
   return { parts: [createTextPart(""), ...parts], partIndex: 0 };
 }
 
-function findToolPartIndex(parts: MessagePart[], toolCallId: string, outputIndex?: number) {
+function sortStoredEvents(events: StoredAgentEvent[]): StoredAgentEvent[] {
+  return [...events].sort((leftEvent, rightEvent) => {
+    const createdAtOrder = leftEvent.createdAt.localeCompare(rightEvent.createdAt);
+
+    if (createdAtOrder !== 0) {
+      return createdAtOrder;
+    }
+
+    return leftEvent.seq - rightEvent.seq;
+  });
+}
+
+function extractImageRequestSlots(argumentsJson: JsonObject): ImageRequestSlot[] {
+  const items = Array.isArray(argumentsJson.items) ? argumentsJson.items.filter(isRecord) : [];
+
+  if (items.length > 0) {
+    return items.map((item, index) => ({
+      outputIndex: toOptionalNumber(item.index) ?? index,
+      prompt: toOptionalString(item.prompt),
+      width: toOptionalNumber(item.width),
+      height: toOptionalNumber(item.height),
+      sourceImageUrl: toOptionalString(item.imageUrl),
+      isBatch: true
+    }));
+  }
+
+  return [
+    {
+      outputIndex: 0,
+      prompt: toOptionalString(argumentsJson.prompt),
+      width: toOptionalNumber(argumentsJson.width),
+      height: toOptionalNumber(argumentsJson.height),
+      sourceImageUrl: toOptionalString(argumentsJson.imageUrl),
+      isBatch: false
+    }
+  ];
+}
+
+function buildImageMetadata(input: {
+  prompt?: string;
+  width?: number;
+  height?: number;
+  sourceImageUrl?: string;
+  outputIndex: number;
+  includeOutputIndex: boolean;
+  provider?: unknown;
+  error?: string;
+}): JsonObject {
+  return compactJsonObject({
+    prompt: input.prompt,
+    width: input.width,
+    height: input.height,
+    sourceImageUrl: input.sourceImageUrl,
+    outputIndex: input.includeOutputIndex ? input.outputIndex : undefined,
+    provider: input.provider,
+    error: input.error
+  });
+}
+
+function findGeneratedImagePartIndex(parts: MessagePart[], input: GeneratedImagePartInput) {
   return parts.findIndex(
     (part) =>
       part.type === "media" &&
-      part.extra?.tool?.toolCallId === toolCallId &&
-      part.extra.tool.outputIndex === outputIndex
+      (part.extra?.resource?.id === input.resourceId ||
+        (part.extra?.tool?.toolCallId === input.toolCallId && part.extra.tool.outputIndex === input.outputIndex))
   );
+}
+
+function extractFailedImageAssets(result: unknown, startIndex: number): FailedImageResult[] {
+  if (!isRecord(result)) {
+    return [];
+  }
+
+  const resultPrompt = toOptionalString(result.prompt);
+  const resultSourceImageUrl = toOptionalString(result.imageUrl);
+  const batchItems = Array.isArray(result.items) ? result.items.filter(isRecord) : [];
+  let nextIndex = startIndex;
+
+  return batchItems.flatMap((item) => {
+    const itemPrompt = toOptionalString(item.prompt) ?? resultPrompt;
+    const itemStatus = toOptionalString(item.status);
+    const itemError = toOptionalString(item.error);
+    const itemIndex = toOptionalNumber(item.index) ?? nextIndex;
+
+    nextIndex = Math.max(nextIndex + 1, itemIndex + 1);
+
+    if (itemStatus !== "failed" && !itemError) {
+      return [];
+    }
+
+    return [
+      {
+        width: toOptionalNumber(item.width),
+        height: toOptionalNumber(item.height),
+        prompt: itemPrompt,
+        index: itemIndex,
+        error: itemError,
+        metadata: compactJsonObject({
+          provider: result.provider,
+          sourceImageUrl: toOptionalString(item.imageUrl) ?? resultSourceImageUrl,
+          size: result.size,
+          itemIndex: item.index,
+          itemStatus: item.status,
+          seed: item.seed,
+          taskId: item.taskId
+        })
+      }
+    ];
+  });
 }
 
 function extractImageAssets(result: unknown, startIndex: number): ExtractedImageResult[] {
@@ -923,6 +1612,7 @@ function extractImageAssets(result: unknown, startIndex: number): ExtractedImage
   }
 
   const resultPrompt = toOptionalString(result.prompt);
+  const resultSourceImageUrl = toOptionalString(result.imageUrl);
   const batchItems = Array.isArray(result.items) ? result.items.filter(isRecord) : [];
   let nextIndex = startIndex;
 
@@ -930,10 +1620,11 @@ function extractImageAssets(result: unknown, startIndex: number): ExtractedImage
     return batchItems.flatMap((item) => {
       const itemPrompt = toOptionalString(item.prompt) ?? resultPrompt;
       const itemUrls = toStringArray(item.imageUrls);
+      const itemIndex = toOptionalNumber(item.index);
 
       return itemUrls.map((url) => {
-        const index = nextIndex;
-        nextIndex += 1;
+        const index = itemIndex ?? nextIndex;
+        nextIndex = Math.max(nextIndex + 1, index + 1);
 
         return {
           url,
@@ -943,6 +1634,7 @@ function extractImageAssets(result: unknown, startIndex: number): ExtractedImage
           index,
           metadata: compactJsonObject({
             provider: result.provider,
+            sourceImageUrl: toOptionalString(item.imageUrl) ?? resultSourceImageUrl,
             size: result.size,
             itemIndex: item.index,
             itemStatus: item.status,
@@ -964,6 +1656,7 @@ function extractImageAssets(result: unknown, startIndex: number): ExtractedImage
       index,
       metadata: compactJsonObject({
         provider: result.provider,
+        sourceImageUrl: resultSourceImageUrl,
         size: result.size,
         revisedPrompts: result.revisedPrompts
       })

@@ -12,4 +12,9 @@ describe("SYSTEM_INSTRUCTIONS", () => {
     expect(SYSTEM_INSTRUCTIONS).toContain("最多 5 项");
     expect(SYSTEM_INSTRUCTIONS).toContain("不要拆成多个 generate_image 调用");
   });
+
+  it("要求基于已有图片修改时调用 edit_image", () => {
+    expect(SYSTEM_INSTRUCTIONS).toContain("调用 edit_image");
+    expect(SYSTEM_INSTRUCTIONS).toContain("源图 imageUrl");
+  });
 });

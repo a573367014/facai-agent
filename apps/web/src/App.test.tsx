@@ -141,6 +141,50 @@ function createStoredSseResponse(messageId: string, events: Array<Record<string,
   } as Response;
 }
 
+function createStoredRunSseResponse(runId: string, messageId: string, events: Array<Record<string, unknown>>): Response {
+  const encoder = new TextEncoder();
+  return {
+    ok: true,
+    body: new ReadableStream({
+      start(controller) {
+        const hasAssistantCreated = events.some(
+          (event) =>
+            event.type === "session.message.created" &&
+            typeof event.message === "object" &&
+            event.message !== null &&
+            "id" in event.message &&
+            event.message.id === messageId
+        );
+        const eventsWithAssistant = hasAssistantCreated
+          ? events
+          : [
+              {
+                type: "session.message.created",
+                message: createAssistantMessage("session_1", "", { id: messageId, status: "running" })
+              },
+              ...events
+            ];
+        const blocks = eventsWithAssistant
+          .map((event, index) => {
+            const seq = index + 1;
+            const storedEvent = {
+              id: `event_${seq}`,
+              seq,
+              runId,
+              messageId,
+              event,
+              createdAt: "2026-06-22T00:00:00.000Z"
+            };
+            return `id: ${seq}\ndata: ${JSON.stringify(storedEvent)}\n\n`;
+          })
+          .join("");
+        controller.enqueue(encoder.encode(blocks));
+        controller.close();
+      }
+    })
+  } as Response;
+}
+
 function createControlledStoredSseResponse(messageId: string) {
   const encoder = new TextEncoder();
   let seq = 0;
@@ -388,6 +432,98 @@ describe("App", () => {
     expect(window.location.search).toBe("?sessionId=session_a");
   });
 
+  it("重新生成旧回答时保留原回答并追加新的流式回答", async () => {
+    window.history.replaceState(null, "", "/?sessionId=session_1");
+    const session = {
+      id: "session_1",
+      title: "重新生成会话",
+      createdAt: "2026-06-22T00:00:00.000Z",
+      updatedAt: "2026-06-22T00:00:03.000Z"
+    };
+
+    mockAppFetch((url, init) => {
+      if (url.endsWith("/agents/sessions/session_1")) {
+        return jsonResponse({
+          session,
+          messages: [
+            createUserMessage("session_1", "解释工具调用", {
+              id: "msg_user_1",
+              createdAt: "2026-06-22T00:00:01.000Z"
+            }),
+            createAssistantMessage("session_1", "旧回答", {
+              id: "msg_assistant_old",
+              createdAt: "2026-06-22T00:00:02.000Z",
+              completedAt: "2026-06-22T00:00:02.000Z"
+            })
+          ]
+        });
+      }
+
+      if (url.endsWith("/agents/messages/msg_assistant_old/regenerate") && init?.method === "POST") {
+        return jsonResponse(
+          {
+            run: {
+              id: "run_regen_1",
+              sessionId: "session_1",
+              status: "running",
+              phase: "answering",
+              userMessageId: "msg_user_1",
+              createdAt: "2026-06-22T00:00:03.000Z",
+              updatedAt: "2026-06-22T00:00:03.000Z"
+            },
+            session,
+            userMessage: createUserMessage("session_1", "解释工具调用", {
+              id: "msg_user_1",
+              createdAt: "2026-06-22T00:00:01.000Z"
+            })
+          },
+          true
+        );
+      }
+
+      if (url.endsWith("/agents/runs/run_regen_1/events?after=0")) {
+        return createStoredRunSseResponse("run_regen_1", "msg_assistant_regen", [
+          {
+            type: "session.message.created",
+            message: createAssistantMessage("session_1", "", {
+              id: "msg_assistant_regen",
+              status: "running",
+              createdAt: "2026-06-22T00:00:03.000Z"
+            })
+          },
+          { type: "message.part.delta", messageId: "msg_assistant_regen", partIndex: 0, delta: "重新生成的回答" },
+          { type: "final_answer", answer: "重新生成的回答" },
+          { type: "run_completed", messageId: "msg_assistant_regen" }
+        ]);
+      }
+
+      if (url.endsWith("/agents/sessions")) {
+        return jsonResponse({ sessions: [session] });
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("旧回答")).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: "重新生成" }));
+
+    await waitFor(() => expect(screen.getAllByText("重新生成的回答").length).toBeGreaterThan(0));
+    expect(screen.getByText("旧回答")).toBeInTheDocument();
+    expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/messages/msg_assistant_old/regenerate", {
+      method: "POST"
+    });
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      "http://localhost:4001/agents/runs/run_regen_1/events?after=0",
+      expect.objectContaining({
+        headers: {
+          accept: "text/event-stream"
+        }
+      })
+    );
+  });
+
   it("打开长会话时只展示最近消息页，并可按游标加载更早消息", async () => {
     mockAppFetch((url) => {
       if (url.endsWith("/agents/sessions/session_paged")) {
@@ -533,7 +669,7 @@ describe("App", () => {
   it("聊天工作台细节保持统一、舒适且没有突兀 outline", () => {
     const styles = readFileSync(stylesPath, "utf8");
 
-    expect(styles).toMatch(/\.chat-scroll\s*{[^}]*overflow:\s*auto;[^}]*padding:\s*28px 24px 18px;/s);
+    expect(styles).toMatch(/\.chat-scroll\s*{[^}]*overflow:\s*auto;[^}]*padding:\s*28px 24px 48px;/s);
     expect(styles).toMatch(/\.chat-scroll-content\s*{[^}]*width:\s*min\(100%,\s*800px\);[^}]*margin:\s*0 auto;/s);
     expect(styles).toMatch(/\.chat-scroll-content-empty\s*{[^}]*align-content:\s*center;[^}]*justify-items:\s*center;/s);
     expect(styles).toMatch(/\.chat-panel\.chat-panel\.MuiPaper-root\s*{[^}]*background:\s*transparent;/s);
@@ -596,6 +732,41 @@ describe("App", () => {
     expect(screen.getByLabelText("发消息")).toHaveFocus();
   });
 
+  it("点击 user 消息修改会把原文回填到底部输入框", async () => {
+    window.history.replaceState(null, "", "/?sessionId=session_edit_user");
+    mockAppFetch((url) => {
+      if (url.endsWith("/agents/sessions/session_edit_user")) {
+        return jsonResponse({
+          session: {
+            id: "session_edit_user",
+            title: "编辑用户消息",
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:01.000Z"
+          },
+          messages: [
+            createUserMessage("session_edit_user", "原理是啥，怎么拿到这些爆款的", {
+              id: "msg_user_edit"
+            }),
+            createAssistantMessage("session_edit_user", "旧回答", {
+              id: "msg_assistant_edit",
+              completedAt: "2026-06-22T00:00:01.000Z"
+            })
+          ]
+        });
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("旧回答")).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: "修改消息" }));
+
+    expect(screen.getByLabelText("发消息")).toHaveTextContent("原理是啥，怎么拿到这些爆款的");
+    expect(screen.getByLabelText("发消息")).toHaveFocus();
+  });
+
   it("保留护眼主题变量并使用豆包式全屏底色", () => {
     const styles = readFileSync(stylesPath, "utf8");
 
@@ -649,6 +820,98 @@ describe("App", () => {
     expect(screen.getByText("工具过程")).toBeInTheDocument();
     expect(screen.queryByText("工具步骤")).not.toBeInTheDocument();
     expect(screen.getAllByText(/"expression": "12 \* 9"/).length).toBeGreaterThan(0);
+  });
+
+  it("事件流建连后会先应用 message snapshot 再继续追加 delta", async () => {
+    window.history.replaceState(null, "", "/");
+    mockAppFetch((url, init) => {
+      if (url.endsWith("/agents/runs") && init?.method === "POST") {
+        return jsonResponse(createStartMessageResponse({ input: "继续生成", assistantMessageId: "msg_1" }));
+      }
+
+      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+        return createStoredSseResponse("msg_1", [
+          {
+            type: "message.snapshot",
+            message: createAssistantMessage("session_1", "已经生成", { id: "msg_1", status: "running" }),
+            resources: []
+          },
+          { type: "message.part.delta", messageId: "msg_1", partIndex: 0, delta: "后续内容" }
+        ]);
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await userEvent.type(screen.getByLabelText("发消息"), "继续生成");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(screen.getAllByText("已经生成后续内容").length).toBeGreaterThan(0));
+  });
+
+  it("事件流收到旧版本 snapshot 时不会覆盖更新的消息草稿", async () => {
+    window.history.replaceState(null, "", "/");
+    mockAppFetch((url, init) => {
+      if (url.endsWith("/agents/runs") && init?.method === "POST") {
+        return jsonResponse(createStartMessageResponse({ input: "继续生成", assistantMessageId: "msg_1" }));
+      }
+
+      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+        return createStoredSseResponse("msg_1", [
+          {
+            type: "message.snapshot",
+            version: 2,
+            message: createAssistantMessage("session_1", "已经生成", { id: "msg_1", status: "running" }),
+            resources: []
+          },
+          {
+            type: "message.snapshot",
+            version: 1,
+            message: createAssistantMessage("session_1", "旧内容", { id: "msg_1", status: "running" }),
+            resources: []
+          },
+          { type: "message.part.delta", version: 3, messageId: "msg_1", partIndex: 0, delta: "后续内容" }
+        ]);
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await userEvent.type(screen.getByLabelText("发消息"), "继续生成");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(screen.getAllByText("已经生成后续内容").length).toBeGreaterThan(0));
+    expect(screen.queryByText("旧内容后续内容")).not.toBeInTheDocument();
+  });
+
+  it("事件流收到重复版本 delta 时不会重复追加文本", async () => {
+    window.history.replaceState(null, "", "/");
+    mockAppFetch((url, init) => {
+      if (url.endsWith("/agents/runs") && init?.method === "POST") {
+        return jsonResponse(createStartMessageResponse({ input: "继续生成", assistantMessageId: "msg_1" }));
+      }
+
+      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+        return createStoredSseResponse("msg_1", [
+          { type: "message.part.delta", version: 1, messageId: "msg_1", partIndex: 0, delta: "恢复" },
+          { type: "message.part.delta", version: 1, messageId: "msg_1", partIndex: 0, delta: "恢复" }
+        ]);
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await userEvent.type(screen.getByLabelText("发消息"), "继续生成");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(screen.getAllByText("恢复").length).toBeGreaterThan(0));
+    expect(screen.queryByText("恢复恢复")).not.toBeInTheDocument();
   });
 
   it("打开带 sessionId 的地址时优先恢复 URL 里的会话", async () => {
@@ -711,15 +974,33 @@ describe("App", () => {
                 { type: "text", value: "图片已生成。" },
                 {
                   type: "media",
-                  mime: "image/png",
-                  url: "https://example.com/dog.png",
                   extra: {
-                    lifecycle: { state: "succeeded" },
-                    tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 0 },
-                    generation: { prompt: "一只小狗", provider: "test" }
+                    resource: { id: "res_dog" },
+                    tool: {
+                      name: "generate_image",
+                      toolCallId: "call_image",
+                      toolCallRowId: "tool_call_image",
+                      outputIndex: 0
+                    }
                   }
                 }
               ],
+              createdAt: "2026-06-22T00:00:00.000Z",
+              updatedAt: "2026-06-22T00:00:01.000Z"
+            }
+          ],
+          resources: [
+            {
+              id: "res_dog",
+              sessionId: "session_with_image",
+              messageId: "msg_assistant",
+              toolCallId: "call_image",
+              toolCallRowId: "tool_call_image",
+              type: "image",
+              mime: "image/png",
+              status: "succeeded",
+              url: "https://example.com/dog.png",
+              metadata: { prompt: "一只小狗", provider: "test" },
               createdAt: "2026-06-22T00:00:00.000Z",
               updatedAt: "2026-06-22T00:00:01.000Z"
             }
@@ -835,6 +1116,86 @@ describe("App", () => {
     expect(screen.getByText("调用工具：calculator")).toBeInTheDocument();
     expect(screen.getByText("工具结果：calculator")).toBeInTheDocument();
     expect(screen.getAllByText(/耗时 7ms/).length).toBeGreaterThan(0);
+  });
+
+  it("流式资源事件会把正文图片占位更新成预览", async () => {
+    const baseResource = {
+      id: "res_pig",
+      sessionId: "session_1",
+      messageId: "msg_1",
+      toolCallId: "call_image",
+      toolCallRowId: "tool_call_image",
+      type: "image",
+      mime: "image/png",
+      metadata: { prompt: "粉色小猪", provider: "test" },
+      createdAt: "2026-06-22T00:00:00.000Z",
+      updatedAt: "2026-06-22T00:00:00.000Z"
+    };
+
+    mockAppFetch((url, init) => {
+      if (url.endsWith("/agents/runs") && init?.method === "POST") {
+        return jsonResponse(createStartMessageResponse({ input: "生成粉色小猪", assistantMessageId: "msg_1" }));
+      }
+
+      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+        return createStoredSseResponse("msg_1", [
+          {
+            type: "resource.created",
+            resource: {
+              ...baseResource,
+              status: "pending"
+            }
+          },
+          {
+            type: "message.part.created",
+            messageId: "msg_1",
+            partIndex: 1,
+            part: {
+              type: "media",
+              extra: {
+                placeholder: { type: "image", label: "图片生成中" },
+                resource: { id: "res_pig" },
+                tool: {
+                  name: "generate_image",
+                  toolCallId: "call_image",
+                  toolCallRowId: "tool_call_image",
+                  outputIndex: 0
+                }
+              }
+            }
+          },
+          {
+            type: "resource.updated",
+            resource: {
+              ...baseResource,
+              status: "succeeded",
+              url: "https://example.com/pig.png",
+              width: 1024,
+              height: 1024,
+              updatedAt: "2026-06-22T00:00:01.000Z"
+            }
+          },
+          {
+            type: "message.part.updated",
+            messageId: "msg_1",
+            partIndex: 0,
+            part: { type: "text", value: "图片已生成。" }
+          },
+          { type: "final_answer", answer: "图片已生成。" },
+          { type: "run_completed", messageId: "msg_1" }
+        ]);
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await userEvent.type(screen.getByLabelText("发消息"), "生成粉色小猪");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(screen.getByRole("img", { name: "粉色小猪" })).toHaveAttribute("src", "https://example.com/pig.png"));
+    expect(screen.getByRole("link", { name: "下载图片 1" })).toHaveAttribute("href", "https://example.com/pig.png");
   });
 
   it("摘要过程会在主消息区和时间线展示", async () => {

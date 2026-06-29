@@ -94,6 +94,11 @@ export const appTheme = createTheme({
         }
       }
     },
+    MuiTooltip: {
+      defaultProps: {
+        disableInteractive: true
+      }
+    },
     MuiAccordion: {
       defaultProps: {
         disableGutters: true,

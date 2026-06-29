@@ -2,15 +2,19 @@ import { Box, Chip, IconButton, Paper, Typography } from "@mui/material";
 import { ChevronsLeft, ChevronsRight } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import {
+  apiBaseUrl,
   cancelAgentRun,
   getAgentRun,
   getAgentSession,
   getAgentSessionMessages,
   listAgentSessions,
+  regenerateAgentMessage,
   startAgentRun,
   streamAgentRunEvents,
+  uploadAgentImage,
   type AgentMessagePageInfo,
   type AgentMessageRecord,
+  type AgentResourceRecord,
   type AgentRunRecord,
   type MessagePart,
   type AgentSessionRecord,
@@ -29,6 +33,8 @@ const activeEventSeqKey = "agent.activeEventSeq";
 const sessionIdQueryKey = "sessionId";
 const defaultMessagePageLimit = 30;
 
+type ResourceMap = Record<string, AgentResourceRecord>;
+
 function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === "AbortError";
 }
@@ -37,7 +43,7 @@ function toChatMessageStatus(status: AgentMessageRecord["status"]): ChatMessage[
   return status;
 }
 
-function createMessageFromRecord(message: AgentMessageRecord): ChatMessage {
+function createMessageFromRecord(message: AgentMessageRecord, options: { version?: number } = {}): ChatMessage {
   const error = message.error ? `${message.error.code}: ${message.error.message}` : undefined;
 
   return {
@@ -45,8 +51,12 @@ function createMessageFromRecord(message: AgentMessageRecord): ChatMessage {
     role: message.role,
     parts: normalizeMessagePartsForDisplay(message),
     status: toChatMessageStatus(message.status),
+    version: options.version,
     events: [],
-    error
+    error,
+    createdAt: message.createdAt,
+    updatedAt: message.updatedAt,
+    completedAt: message.completedAt
   };
 }
 
@@ -127,6 +137,21 @@ function normalizeMessagePageInfo(pageInfo?: AgentMessagePageInfo): AgentMessage
   return pageInfo ?? createDefaultMessagePageInfo();
 }
 
+function resourcesToMap(resources: AgentResourceRecord[] = []): ResourceMap {
+  return Object.fromEntries(resources.map((resource) => [resource.id, resource]));
+}
+
+function mergeResources(currentResources: ResourceMap, resources: AgentResourceRecord[] = []): ResourceMap {
+  if (resources.length === 0) {
+    return currentResources;
+  }
+
+  return {
+    ...currentResources,
+    ...resourcesToMap(resources)
+  };
+}
+
 function prependMessagesFromRecords(currentMessages: ChatMessage[], olderMessages: AgentMessageRecord[]): ChatMessage[] {
   const prependedMessages = buildMessagesFromRecords(olderMessages);
   const prependedIds = new Set(prependedMessages.map((message) => message.id));
@@ -146,10 +171,39 @@ function replaceMessage(currentMessages: ChatMessage[], nextMessage: ChatMessage
   return currentMessages.map((message) => (message.id === nextMessage.id ? nextMessage : message));
 }
 
-function upsertMessageRecord(currentMessages: ChatMessage[], message: AgentMessageRecord): ChatMessage[] {
-  return normalizeVisibleMessages(replaceMessage(currentMessages, createMessageFromRecord(message)), {
+function upsertMessageRecord(currentMessages: ChatMessage[], message: AgentMessageRecord, options: { version?: number } = {}): ChatMessage[] {
+  const existingMessage = currentMessages.find((currentMessage) => currentMessage.id === message.id);
+  const version = options.version ?? existingMessage?.version;
+
+  return normalizeVisibleMessages(replaceMessage(currentMessages, createMessageFromRecord(message, { version })), {
     showRunningSummary: true
   });
+}
+
+function upsertMessageSnapshot(currentMessages: ChatMessage[], event: Extract<AgentStreamEvent, { type: "message.snapshot" }>): ChatMessage[] {
+  const existingMessage = currentMessages.find((message) => message.id === event.message.id);
+
+  if (isOlderSnapshotVersion(existingMessage, event.version)) {
+    return currentMessages;
+  }
+
+  return upsertMessageRecord(currentMessages, event.message, { version: event.version });
+}
+
+function isOlderSnapshotVersion(message: ChatMessage | undefined, eventVersion: number | undefined) {
+  return typeof eventVersion === "number" && typeof message?.version === "number" && eventVersion < message.version;
+}
+
+function isDuplicateOrOlderPartVersion(message: ChatMessage, event: AgentStreamEvent) {
+  if (
+    event.type !== "message.part.created" &&
+    event.type !== "message.part.delta" &&
+    event.type !== "message.part.updated"
+  ) {
+    return false;
+  }
+
+  return typeof event.version === "number" && typeof message.version === "number" && event.version <= message.version;
 }
 
 function markRunMessagesCancelled(currentMessages: ChatMessage[], run: AgentRunRecord): ChatMessage[] {
@@ -191,12 +245,13 @@ function applyPartEventToMessage(message: ChatMessage, event: AgentStreamEvent):
   if (event.type === "message.part.created") {
     const parts = [...(message.parts ?? [])];
     parts.splice(event.partIndex, 0, event.part);
-    return { ...message, parts };
+    return { ...message, parts, version: event.version ?? message.version };
   }
 
   if (event.type === "message.part.delta") {
     return {
       ...message,
+      version: event.version ?? message.version,
       parts: (message.parts ?? []).map((part, index) =>
         index === event.partIndex && part.type === "text" ? { ...part, value: part.value + event.delta } : part
       )
@@ -206,6 +261,7 @@ function applyPartEventToMessage(message: ChatMessage, event: AgentStreamEvent):
   if (event.type === "message.part.updated") {
     return {
       ...message,
+      version: event.version ?? message.version,
       parts: (message.parts ?? []).map((part, index) => (index === event.partIndex ? event.part : part))
     };
   }
@@ -267,9 +323,9 @@ function buildHistoryItems(sessions: AgentSessionRecord[]): SessionHistoryItem[]
 export default function App() {
   const [composerParts, setComposerParts] = useState<RuntimePart[]>([{ type: "text", value: "" }]);
   const [composerFocusToken, setComposerFocusToken] = useState(0);
-  const [maxIterations, setMaxIterations] = useState(4);
   const [isStreaming, setIsStreaming] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [resourcesById, setResourcesById] = useState<ResourceMap>({});
   const [messagePageInfo, setMessagePageInfo] = useState<AgentMessagePageInfo>(() => createDefaultMessagePageInfo());
   const [isLoadingOlderMessages, setIsLoadingOlderMessages] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -286,7 +342,7 @@ export default function App() {
   useEffect(() => {
     const controller = new AbortController();
 
-    fetch(`${import.meta.env.VITE_API_BASE_URL ?? "http://localhost:4001"}/health`, {
+    fetch(`${apiBaseUrl}/health`, {
       signal: controller.signal
     })
       .then((response) => setHealth(response.ok ? "正常" : "异常"))
@@ -334,10 +390,11 @@ export default function App() {
     let cancelled = false;
 
     getAgentSession(sessionId)
-      .then(({ session, messages, pageInfo }) => {
+      .then(({ session, messages, resources, pageInfo }) => {
         if (!cancelled) {
           upsertSession(session);
           setMessages(buildMessagesFromRecords(messages));
+          setResourcesById(resourcesToMap(resources));
           setMessagePageInfo(normalizeMessagePageInfo(pageInfo));
         }
       })
@@ -387,6 +444,7 @@ export default function App() {
         }
 
         setMessages(buildMessagesFromRecords(sessionSnapshot.messages));
+        setResourcesById(resourcesToMap(sessionSnapshot.resources));
         setMessagePageInfo(normalizeMessagePageInfo(sessionSnapshot.pageInfo));
         setEvents([]);
 
@@ -483,14 +541,31 @@ export default function App() {
   }
 
   function applyAgentEvent(event: AgentStreamEvent, messageId?: string, runId?: string) {
+    if (event.type === "message.snapshot") {
+      setMessages((currentMessages) => upsertMessageSnapshot(currentMessages, event));
+      setResourcesById((currentResources) => mergeResources(currentResources, event.resources));
+      return;
+    }
+
     setEvents((currentEvents) => [...currentEvents, event]);
 
     if (event.type === "session.message.created" || event.type === "session.message.updated") {
       setMessages((currentMessages) => upsertMessageRecord(currentMessages, event.message));
     }
 
+    if (event.type === "resource.created" || event.type === "resource.updated") {
+      setResourcesById((currentResources) => ({
+        ...currentResources,
+        [event.resource.id]: event.resource
+      }));
+    }
+
     if (messageId) {
       updateAssistantMessage(messageId, (message) => {
+        if (isDuplicateOrOlderPartVersion(message, event)) {
+          return message;
+        }
+
         const nextEvents = [...(message.events ?? []), event];
 
         if (
@@ -555,7 +630,9 @@ export default function App() {
   }
 
   function applyStoredEvent(storedEvent: StoredAgentEvent) {
-    localStorage.setItem(activeEventSeqKey, String(storedEvent.seq));
+    if (storedEvent.seq > 0) {
+      localStorage.setItem(activeEventSeqKey, String(storedEvent.seq));
+    }
     applyAgentEvent(storedEvent.event, storedEvent.messageId, storedEvent.runId);
   }
 
@@ -563,12 +640,12 @@ export default function App() {
     const sessionId = activeSessionId ?? readSessionIdFromUrl();
 
     try {
-      return await startAgentRun(submittedParts, maxIterations, sessionId);
+      return await startAgentRun(submittedParts, sessionId);
     } catch (error) {
       if (sessionId) {
         clearSessionIdFromUrl(sessionId);
         setActiveSessionId(undefined);
-        return startAgentRun(submittedParts, maxIterations);
+        return startAgentRun(submittedParts);
       }
 
       throw error;
@@ -609,6 +686,7 @@ export default function App() {
       if (sessionId) {
         const sessionSnapshot = await getAgentSession(sessionId);
         setMessages(buildMessagesFromRecords(sessionSnapshot.messages));
+        setResourcesById(resourcesToMap(sessionSnapshot.resources));
         setMessagePageInfo(normalizeMessagePageInfo(sessionSnapshot.pageInfo));
       }
 
@@ -664,6 +742,44 @@ export default function App() {
     }
   }
 
+  async function handleRegenerateMessage(messageId: string) {
+    if (activeRunId) {
+      await cancelActiveRun({ refreshAfterCancel: false, settleStreaming: false });
+    }
+
+    setIsStreaming(true);
+    setError(null);
+    setEvents([]);
+    clearActiveRun();
+    const controller = new AbortController();
+    let streamControllerAttached = false;
+
+    try {
+      const { run, session } = await regenerateAgentMessage(messageId);
+      rememberSession(session.id);
+      upsertSession(session);
+      setActiveRun(run.id);
+      activeStreamControllerRef.current = controller;
+      streamControllerAttached = true;
+      localStorage.setItem(activeRunIdKey, run.id);
+      localStorage.setItem(activeEventSeqKey, "0");
+      await streamAgentRunEvents(run.id, 0, applyStoredEvent, controller.signal);
+      await refreshSessions();
+    } catch (streamError) {
+      if (!isAbortError(streamError) && (!streamControllerAttached || activeStreamControllerRef.current === controller)) {
+        setError(streamError instanceof Error ? streamError.message : "重新生成失败");
+      }
+    } finally {
+      if (!streamControllerAttached || activeStreamControllerRef.current === controller) {
+        setIsStreaming(false);
+      }
+
+      if (activeStreamControllerRef.current === controller) {
+        activeStreamControllerRef.current = null;
+      }
+    }
+  }
+
   async function handleCancelMessage() {
     await cancelActiveRun();
   }
@@ -674,6 +790,7 @@ export default function App() {
     setActiveSessionId(undefined);
     setComposerParts([{ type: "text", value: "" }]);
     setMessages([]);
+    setResourcesById({});
     setMessagePageInfo(createDefaultMessagePageInfo());
     setIsLoadingOlderMessages(false);
     setEvents([]);
@@ -695,10 +812,11 @@ export default function App() {
     setEvents([]);
 
     try {
-      const { session, messages, pageInfo } = await getAgentSession(sessionId);
+      const { session, messages, resources, pageInfo } = await getAgentSession(sessionId);
       upsertSession(session);
       rememberSession(session.id);
       setMessages(buildMessagesFromRecords(messages));
+      setResourcesById(resourcesToMap(resources));
       setMessagePageInfo(normalizeMessagePageInfo(pageInfo));
     } catch (sessionError) {
       setError(sessionError instanceof Error ? sessionError.message : "会话恢复失败");
@@ -723,6 +841,7 @@ export default function App() {
       });
 
       setMessages((currentMessages) => prependMessagesFromRecords(currentMessages, response.messages));
+      setResourcesById((currentResources) => mergeResources(currentResources, response.resources));
       setMessagePageInfo(response.pageInfo);
     } catch (sessionError) {
       setError(sessionError instanceof Error ? sessionError.message : "加载历史消息失败");
@@ -794,23 +913,25 @@ export default function App() {
 
           <AgentConversation
             messages={messages}
+            resourcesById={resourcesById}
             isActive={isStreaming}
             error={error}
             hasMoreMessages={messagePageInfo.hasMore}
             isLoadingOlderMessages={isLoadingOlderMessages}
             onLoadOlderMessages={handleLoadOlderMessages}
+            onEditUserMessage={handleSuggestionSelect}
+            onRegenerateMessage={handleRegenerateMessage}
             onSuggestionSelect={handleSuggestionSelect}
           />
 
           <AgentComposer
             parts={composerParts}
-            maxIterations={maxIterations}
             isStreaming={isStreaming}
             focusToken={composerFocusToken}
             onPartsChange={setComposerParts}
-            onMaxIterationsChange={setMaxIterations}
             onSubmit={handleSubmitMessage}
             onCancel={handleCancelMessage}
+            onUploadImage={uploadAgentImage}
           />
         </Box>
 

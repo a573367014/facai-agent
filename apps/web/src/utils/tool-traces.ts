@@ -58,6 +58,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isImageToolName(toolName: string) {
+  return toolName === "generate_image" || toolName === "edit_image";
+}
+
 function toStringArray(value: unknown) {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
@@ -145,7 +149,7 @@ export function buildToolTraces(events: AgentStreamEvent[]): ToolTrace[] {
       case "tool_progress":
         trace.status = trace.status === "success" || trace.status === "failed" ? trace.status : "running";
         trace.progressEvents = [...(trace.progressEvents ?? []), event.progress];
-        if (trace.toolName === "generate_image") {
+        if (isImageToolName(trace.toolName)) {
           trace.result = mergeImageBatchProgress(trace.result, event.progress);
         }
         break;

@@ -2,7 +2,7 @@ import type { Node as ProseMirrorNode } from "prosemirror-model";
 import type { MessagePart } from "../api/agent-client";
 import { partSchema } from "./part-schema";
 
-export type RuntimePart = MessagePart & Record<`$${string}`, unknown>;
+export type RuntimePart = MessagePart | (MessagePart & Record<`$${string}`, unknown>);
 
 export function stripRuntimeFields(parts: RuntimePart[]): MessagePart[] {
   return parts.map((part) => Object.fromEntries(Object.entries(part).filter(([key]) => !key.startsWith("$"))) as MessagePart);
@@ -18,7 +18,8 @@ export function partsToDoc(parts: RuntimePart[]): ProseMirrorNode {
       partSchema.nodes.media_part.create({
         mime: part.mime,
         url: part.url,
-        name: part.name ?? ""
+        name: part.name ?? "",
+        size: part.size ?? null
       })
     ];
   });
@@ -54,7 +55,8 @@ export function docToParts(doc: ProseMirrorNode): MessagePart[] {
         type: "media",
         mime: String(node.attrs.mime ?? ""),
         url: String(node.attrs.url ?? ""),
-        ...(node.attrs.name ? { name: String(node.attrs.name) } : {})
+        ...(node.attrs.name ? { name: String(node.attrs.name) } : {}),
+        ...(typeof node.attrs.size === "number" ? { size: node.attrs.size } : {})
       });
       return false;
     }

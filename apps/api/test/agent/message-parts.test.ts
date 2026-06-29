@@ -52,6 +52,22 @@ describe("message parts", () => {
     expect(partsToLlmText(parts)).toBe("正在生成图片");
   });
 
+  it("projects media URL into LLM context so image editing tools can reference it", () => {
+    const parts: MessagePart[] = [
+      { type: "text", value: "把这张图改成水彩风格" },
+      {
+        type: "media",
+        mime: "image/png",
+        name: "小猪原图",
+        url: "http://127.0.0.1:4001/uploads/images/source-pig.png"
+      }
+    ];
+
+    expect(partsToLlmText(parts)).toBe(
+      "把这张图改成水彩风格\n小猪原图：http://127.0.0.1:4001/uploads/images/source-pig.png"
+    );
+  });
+
   it("appends text delta to the addressed text part", () => {
     expect(appendTextDelta([createTextPart("")], 0, "你好")).toEqual([{ type: "text", value: "你好" }]);
   });
@@ -59,8 +75,10 @@ describe("message parts", () => {
   it("creates and updates generated image parts by tool call id and output index", () => {
     const pending = upsertGeneratedImageParts([], {
       state: "pending",
+      resourceId: "res_1",
       toolName: "generate_image",
       toolCallId: "call_1",
+      toolCallRowId: "tool_call_1",
       outputIndex: 0,
       mime: "image/png"
     });
@@ -68,38 +86,29 @@ describe("message parts", () => {
     expect(pending).toEqual([
       {
         type: "media",
-        mime: "image/png",
-        url: "",
         extra: {
           placeholder: { type: "image", label: "图片生成中" },
-          lifecycle: { state: "pending" },
-          tool: { name: "generate_image", toolCallId: "call_1", outputIndex: 0 }
+          resource: { id: "res_1" },
+          tool: { name: "generate_image", toolCallId: "call_1", toolCallRowId: "tool_call_1", outputIndex: 0 }
         }
       }
     ]);
 
     const completed = upsertGeneratedImageParts(pending, {
       state: "succeeded",
+      resourceId: "res_1",
       toolName: "generate_image",
       toolCallId: "call_1",
+      toolCallRowId: "tool_call_1",
       outputIndex: 0,
-      mime: "image/png",
-      url: "https://example.com/pig.png",
-      width: 1024,
-      height: 1024,
-      generation: { prompt: "小猪", provider: "volcengine", model: "seedream" }
+      mime: "image/png"
     });
 
     expect(completed[0]).toMatchObject({
       type: "media",
-      mime: "image/png",
-      url: "https://example.com/pig.png",
-      width: 1024,
-      height: 1024,
       extra: {
-        lifecycle: { state: "succeeded" },
-        tool: { name: "generate_image", toolCallId: "call_1", outputIndex: 0 },
-        generation: { prompt: "小猪", provider: "volcengine", model: "seedream" }
+        resource: { id: "res_1" },
+        tool: { name: "generate_image", toolCallId: "call_1", toolCallRowId: "tool_call_1", outputIndex: 0 }
       }
     });
   });

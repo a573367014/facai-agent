@@ -1,7 +1,8 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import type { FastifyInstance } from "fastify";
 import { AgentContextBuilder } from "../../src/agent/context-builder.js";
@@ -32,7 +33,29 @@ async function buildTestApp(options: Parameters<typeof buildApp>[0]) {
   return app;
 }
 
+function createMultipartPayload(input: { fieldName: string; fileName: string; contentType: string; content: string | Buffer }) {
+  const boundary = `----agent-test-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const content = Buffer.isBuffer(input.content) ? input.content : Buffer.from(input.content);
+  const payload = Buffer.concat([
+    Buffer.from(
+      `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="${input.fieldName}"; filename="${input.fileName}"\r\n` +
+        `Content-Type: ${input.contentType}\r\n\r\n`
+    ),
+    content,
+    Buffer.from(`\r\n--${boundary}--\r\n`)
+  ]);
+
+  return {
+    payload,
+    headers: {
+      "content-type": `multipart/form-data; boundary=${boundary}`
+    }
+  };
+}
+
 afterEach(async () => {
+  vi.useRealTimers();
   for (const app of apps.splice(0)) {
     await app.close();
   }
@@ -58,6 +81,17 @@ function createTestAgentService(): AgentService {
     complete: async () => ({ content: "测试回答" })
   };
   return createAgentService(provider, registry);
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+
+  return { promise, resolve, reject };
 }
 
 async function waitForMessage(app: FastifyInstance, messageId: string) {
@@ -90,13 +124,202 @@ async function waitForRun(app: FastifyInstance, runId: string) {
   throw new Error("run did not finish in time");
 }
 
+function parseSseEvents(body: string) {
+  return body
+    .trim()
+    .split("\n\n")
+    .filter(Boolean)
+    .map((block) => {
+      const dataLine = block.split("\n").find((line) => line.startsWith("data: "));
+
+      if (!dataLine) {
+        throw new Error(`SSE block missing data line: ${block}`);
+      }
+
+      return JSON.parse(dataLine.slice("data: ".length)) as {
+        id: string;
+        seq: number;
+        messageId?: string;
+        runId?: string;
+        event: {
+          type: string;
+          version?: number;
+          message?: { id: string; parts: unknown[]; status: string };
+          resources?: unknown[];
+          answer?: string;
+        };
+      };
+    });
+}
+
 describe("agent routes", () => {
+  it("启动后不会立即清理事件，会在配置的凌晨窗口清理过期事件", async () => {
+    vi.useFakeTimers();
+    const databasePath = createTempDatabasePath();
+    const store = await SqliteAgentStore.create({ databasePath, eventRetentionDays: 3 });
+
+    vi.setSystemTime(new Date(2026, 5, 20, 0, 0, 0, 0));
+    const session = store.createSession("事件清理");
+    const assistantMessage = store.createMessage({
+      sessionId: session.id,
+      role: "assistant",
+      status: "completed",
+      parts: [{ type: "text", value: "已有回答" }],
+      completedAt: "2026-06-22T00:00:01.000Z"
+    });
+    store.appendEvent(assistantMessage.id, { type: "final_answer", answer: "已有回答" });
+    store.close();
+
+    vi.setSystemTime(new Date(2026, 5, 24, 2, 30, 0, 0));
+    const app = await buildApp({
+      agentService: createTestAgentService(),
+      databasePath,
+      eventCleanupHour: 3,
+      eventCleanupBatchSize: 10,
+      eventCleanupMaxBatches: 2
+    });
+    apps.push(app);
+
+    const beforeResponse = await app.inject({
+      method: "GET",
+      url: `/agents/messages/${assistantMessage.id}`
+    });
+
+    expect(beforeResponse.json()).toMatchObject({
+      events: [expect.objectContaining({ event: { type: "final_answer", answer: "已有回答" } })]
+    });
+
+    await vi.advanceTimersByTimeAsync(29 * 60 * 1000);
+
+    const stillBeforeCleanupResponse = await app.inject({
+      method: "GET",
+      url: `/agents/messages/${assistantMessage.id}`
+    });
+
+    expect(stillBeforeCleanupResponse.json()).toMatchObject({
+      events: [expect.objectContaining({ event: { type: "final_answer", answer: "已有回答" } })]
+    });
+
+    await vi.advanceTimersByTimeAsync(60 * 1000);
+
+    const afterResponse = await app.inject({
+      method: "GET",
+      url: `/agents/messages/${assistantMessage.id}`
+    });
+
+    expect(afterResponse.json()).toMatchObject({ events: [] });
+  });
+
   it("GET /health 返回 ok", async () => {
     const app = await buildTestApp({ agentService: createTestAgentService() });
     const response = await app.inject({ method: "GET", url: "/health" });
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ status: "ok" });
+  });
+
+  it("POST /agents/uploads/images 保存图片并返回可访问 URL", async () => {
+    const uploadDirectory = mkdtempSync(join(tmpdir(), "agent-upload-images-"));
+    tempDirs.push(uploadDirectory);
+    const app = await buildTestApp({ agentService: createTestAgentService(), uploadDirectory });
+    const multipart = createMultipartPayload({
+      fieldName: "image",
+      fileName: "hello.png",
+      contentType: "image/png",
+      content: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    });
+
+    const uploadResponse = await app.inject({
+      method: "POST",
+      url: "/agents/uploads/images",
+      headers: {
+        host: "127.0.0.1:4001",
+        ...multipart.headers
+      },
+      payload: multipart.payload
+    });
+    const payload = uploadResponse.json() as { file: { type: string; mime: string; name: string; url: string; size: number } };
+
+    expect(uploadResponse.statusCode).toBe(201);
+    expect(payload.file).toMatchObject({
+      type: "media",
+      mime: "image/png",
+      name: "hello.png",
+      size: 8
+    });
+    expect(payload.file.url).toMatch(/^http:\/\/127\.0\.0\.1:4001\/uploads\/images\/.+\.png$/);
+
+    const uploadedPath = new URL(payload.file.url).pathname;
+    const fileResponse = await app.inject({ method: "GET", url: uploadedPath });
+
+    expect(fileResponse.statusCode).toBe(200);
+    expect(fileResponse.headers["content-type"]).toContain("image/png");
+  });
+
+  it("POST /agents/uploads/images 相同图片内容复用同一个存储文件", async () => {
+    const uploadDirectory = mkdtempSync(join(tmpdir(), "agent-upload-images-"));
+    tempDirs.push(uploadDirectory);
+    const app = await buildTestApp({ agentService: createTestAgentService(), uploadDirectory });
+    const imageContent = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+    async function upload(fileName: string) {
+      const multipart = createMultipartPayload({
+        fieldName: "image",
+        fileName,
+        contentType: "image/png",
+        content: imageContent
+      });
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/agents/uploads/images",
+        headers: {
+          host: "127.0.0.1:4001",
+          ...multipart.headers
+        },
+        payload: multipart.payload
+      });
+
+      expect(response.statusCode).toBe(201);
+      return response.json() as { file: { name: string; url: string } };
+    }
+
+    const first = await upload("first.png");
+    const second = await upload("second.png");
+    const expectedFileName = `${createHash("md5").update(imageContent).digest("hex")}.png`;
+
+    expect(first.file.url).toBe(`http://127.0.0.1:4001/uploads/images/${expectedFileName}`);
+    expect(second.file.url).toBe(first.file.url);
+    expect(first.file.name).toBe("first.png");
+    expect(second.file.name).toBe("second.png");
+    expect(readdirSync(join(uploadDirectory, "images"))).toEqual([expectedFileName]);
+  });
+
+  it("POST /agents/uploads/images 拒绝非图片文件", async () => {
+    const uploadDirectory = mkdtempSync(join(tmpdir(), "agent-upload-images-"));
+    tempDirs.push(uploadDirectory);
+    const app = await buildTestApp({ agentService: createTestAgentService(), uploadDirectory });
+    const multipart = createMultipartPayload({
+      fieldName: "image",
+      fileName: "note.txt",
+      contentType: "text/plain",
+      content: "hello"
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/agents/uploads/images",
+      headers: multipart.headers,
+      payload: multipart.payload
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      error: {
+        code: "VALIDATION_ERROR",
+        message: "当前只支持上传图片"
+      }
+    });
   });
 
   it("允许 127.0.0.1 前端访问 API", async () => {
@@ -111,6 +334,51 @@ describe("agent routes", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.headers["access-control-allow-origin"]).toBe("http://127.0.0.1:4000");
+  });
+
+  it("允许局域网 IP 前端访问 API", async () => {
+    const app = await buildTestApp({ agentService: createTestAgentService() });
+    const response = await app.inject({
+      method: "GET",
+      url: "/health",
+      headers: {
+        origin: "http://10.1.65.46:4000"
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["access-control-allow-origin"]).toBe("http://10.1.65.46:4000");
+  });
+
+  it("允许局域网 IP 前端发起 CORS 预检请求", async () => {
+    const app = await buildTestApp({ agentService: createTestAgentService() });
+    const response = await app.inject({
+      method: "OPTIONS",
+      url: "/agents/messages",
+      headers: {
+        origin: "http://10.1.65.46:4000",
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "content-type"
+      }
+    });
+
+    expect(response.statusCode).toBe(204);
+    expect(response.headers["access-control-allow-origin"]).toBe("http://10.1.65.46:4000");
+    expect(response.headers["access-control-allow-methods"]).toContain("POST");
+  });
+
+  it("默认不允许公网域名前端访问 API", async () => {
+    const app = await buildTestApp({ agentService: createTestAgentService() });
+    const response = await app.inject({
+      method: "GET",
+      url: "/health",
+      headers: {
+        origin: "https://evil.example.com"
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["access-control-allow-origin"]).toBeUndefined();
   });
 
   it("POST /agents/messages 创建 session、user message 和后台 assistant message", async () => {
@@ -246,7 +514,7 @@ describe("agent routes", () => {
     });
   });
 
-  it("GET /agents/runs/:runId/events 回放 run 级事件", async () => {
+  it("GET /agents/runs/:runId/events 返回当前 assistant message snapshot", async () => {
     const app = await buildTestApp({ agentService: createTestAgentService() });
     const createResponse = await app.inject({
       method: "POST",
@@ -264,12 +532,60 @@ describe("agent routes", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.headers["content-type"]).toContain("text/event-stream");
-    expect(response.body).toContain("id: 1");
-    expect(response.body).toContain("\"id\":\"event_");
+    const events = parseSseEvents(response.body);
+
+    expect(events).toEqual([
+      expect.objectContaining({
+        seq: 0,
+        runId: run.id,
+        event: expect.objectContaining({
+          type: "message.snapshot",
+          message: expect.objectContaining({
+            status: "completed",
+            parts: [{ type: "text", value: "测试回答" }]
+          }),
+          resources: []
+        })
+      })
+    ]);
     expect(response.body).toContain(`"runId":"${run.id}"`);
-    expect(response.body).toContain("\"type\":\"session.message.created\"");
-    expect(response.body).toContain("\"type\":\"final_answer\"");
-    expect(response.body).toContain("\"answer\":\"测试回答\"");
+  });
+
+  it("GET /agents/messages/:messageId/debug/events 根据 assistant messageId 反查 run events", async () => {
+    const app = await buildTestApp({ agentService: createTestAgentService() });
+    const createResponse = await app.inject({
+      method: "POST",
+      url: "/agents/runs",
+      payload: { input: "你好" }
+    });
+    const { run } = createResponse.json() as { run: { id: string } };
+    const completed = await waitForRun(app, run.id);
+    const assistantMessageId = completed.run.assistantMessageId as string;
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/agents/messages/${assistantMessageId}/debug/events`
+    });
+    const payload = response.json() as {
+      message: { id: string };
+      runs: Array<{ id: string; assistantMessageId?: string }>;
+      messageEvents: Array<{ event: { type: string } }>;
+      runEvents: Array<{ runId?: string; messageId?: string; event: { type: string } }>;
+      events: Array<{ runId?: string; messageId?: string; event: { type: string } }>;
+    };
+
+    expect(response.statusCode).toBe(200);
+    expect(payload.message.id).toBe(assistantMessageId);
+    expect(payload.runs).toEqual([
+      expect.objectContaining({
+        id: run.id,
+        assistantMessageId
+      })
+    ]);
+    expect(payload.messageEvents).toEqual([]);
+    expect(payload.runEvents.map((event) => event.event.type)).toContain("run_completed");
+    expect(payload.runEvents.every((event) => event.runId === run.id)).toBe(true);
+    expect(payload.events.map((event) => event.event.type)).toEqual(payload.runEvents.map((event) => event.event.type));
   });
 
   it("POST /agents/sessions/:sessionId/messages 不返回压缩 prelude，摘要在 message 完成后静默刷新", async () => {
@@ -391,7 +707,7 @@ describe("agent routes", () => {
     expect(payload.sessions.map((session) => session.id)).toEqual([firstSession.session.id, secondSession.session.id]);
   });
 
-  it("GET /agents/messages/:messageId/events 回放 assistant message 的历史事件", async () => {
+  it("GET /agents/messages/:messageId/events 建连时先返回 message snapshot", async () => {
     const app = await buildTestApp({ agentService: createTestAgentService() });
     const createResponse = await app.inject({
       method: "POST",
@@ -409,15 +725,133 @@ describe("agent routes", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.headers["content-type"]).toContain("text/event-stream");
-    expect(response.body).toContain("id: 1");
-    expect(response.body).toContain("\"id\":\"event_");
-    expect(response.body).toContain("\"seq\":");
-    expect(response.body).toContain(`"messageId":"${assistantMessage.id}"`);
-    expect(response.body).toContain("\"type\":\"final_answer\"");
-    expect(response.body).toContain("\"answer\":\"测试回答\"");
+    const events = parseSseEvents(response.body);
+
+    expect(events[0]).toMatchObject({
+      seq: 0,
+      messageId: assistantMessage.id,
+      event: {
+        type: "message.snapshot",
+        message: {
+          id: assistantMessage.id,
+          status: "completed",
+          parts: [{ type: "text", value: "测试回答" }]
+        },
+        resources: []
+      }
+    });
+    expect(events.map((event) => event.event.type)).toEqual(["message.snapshot"]);
   });
 
-  it("GET /agents/messages/:messageId/events 只持久化 message part delta 文本事件", async () => {
+  it("GET /agents/messages/:messageId/events 在运行中使用 running draft 返回 snapshot", async () => {
+    const firstDeltaReceived = createDeferred<void>();
+    const allowFinish = createDeferred<void>();
+    const registry = new ToolRegistry();
+    const provider: LlmProvider = {
+      complete: async () => {
+        throw new Error("streaming path should be used");
+      },
+      completeStream: async (_request, onDelta) => {
+        await onDelta("正在生成");
+        firstDeltaReceived.resolve();
+        await allowFinish.promise;
+        await onDelta("完成");
+        return { content: "正在生成完成" };
+      }
+    };
+    const app = await buildTestApp({
+      agentService: createAgentService(provider, registry)
+    });
+    const createResponse = await app.inject({
+      method: "POST",
+      url: "/agents/messages",
+      payload: { input: "写一段话" }
+    });
+    const { assistantMessage } = createResponse.json() as { assistantMessage: { id: string } };
+
+    try {
+      await firstDeltaReceived.promise;
+
+      const eventsResponsePromise = app.inject({
+        method: "GET",
+        url: `/agents/messages/${assistantMessage.id}/events?after=0`
+      });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      allowFinish.resolve();
+
+      const response = await eventsResponsePromise;
+      const events = parseSseEvents(response.body);
+
+      expect(events[0]).toMatchObject({
+        seq: 0,
+        messageId: assistantMessage.id,
+        event: {
+          type: "message.snapshot",
+          version: 1,
+          message: {
+            id: assistantMessage.id,
+            status: "running",
+            parts: [{ type: "text", value: "正在生成" }]
+          }
+        }
+      });
+    } finally {
+      allowFinish.resolve();
+      await waitForMessage(app, assistantMessage.id);
+    }
+  });
+
+  it("POST /agents/messages/:messageId/regenerate 会基于旧 assistant 重新创建 run", async () => {
+    const registry = new ToolRegistry();
+    const provider: LlmProvider = {
+      complete: async () => ({ content: "重新生成的回答" })
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const session = store.createSession("重新生成路由");
+    const userMessage = store.createMessage({
+      sessionId: session.id,
+      role: "user",
+      status: "completed",
+      parts: [{ type: "text", value: "介绍 Agent" }]
+    });
+    const assistantMessage = store.createMessage({
+      sessionId: session.id,
+      role: "assistant",
+      status: "completed",
+      parts: [{ type: "text", value: "旧回答" }]
+    });
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService(provider, registry),
+      store,
+      new AgentContextBuilder({ maxHistoryMessages: 10 })
+    );
+    const app = await buildApp({ coordinator });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/agents/messages/${assistantMessage.id}/regenerate`
+    });
+    const payload = response.json() as {
+      run: { id: string; userMessageId: string; status: string };
+      session: { id: string };
+      userMessage: { id: string };
+    };
+
+    expect(response.statusCode).toBe(202);
+    expect(payload.session.id).toBe(session.id);
+    expect(payload.userMessage.id).toBe(userMessage.id);
+    expect(payload.run).toMatchObject({
+      userMessageId: userMessage.id,
+      status: "running"
+    });
+
+    await waitForRun(app, payload.run.id);
+    expect(store.getMessagesBySession(session.id).filter((message) => message.role === "assistant")).toHaveLength(2);
+    store.close();
+  });
+
+  it("GET /agents/messages/:messageId 只持久化关键事件，不持久化 message part delta", async () => {
     const deltaParts = ["这", "是", "一", "段", "需", "要", "合", "并", "的", "流", "式", "回", "答"];
     const registry = new ToolRegistry();
     const provider: LlmProvider = {
@@ -455,8 +889,8 @@ describe("agent routes", () => {
     const partDeltaEvents = snapshot.events.filter((event) => event.event.type === "message.part.delta");
 
     expect(answerDeltaEvents).toEqual([]);
-    expect(partDeltaEvents).toHaveLength(deltaParts.length);
-    expect(partDeltaEvents.map((event) => event.event.delta).join("")).toBe(deltaParts.join(""));
+    expect(partDeltaEvents).toEqual([]);
+    expect(snapshot.events.map((event) => event.event.type)).toContain("final_answer");
   });
 
   it("POST /agents/messages/:messageId/cancel 会中断运行中的 assistant message", async () => {
@@ -612,17 +1046,17 @@ describe("agent routes", () => {
     });
     const payload = sessionResponse.json() as {
       messages: Array<{
+        id: string;
         role: string;
         status: string;
         parts: Array<{
           type: string;
           value?: string;
-          mime?: string;
           url?: string;
+          mime?: string;
           extra?: {
-            generation?: {
-              prompt?: string;
-              provider?: string;
+            resource?: {
+              id: string;
             };
             tool?: {
               toolCallId?: string;
@@ -631,9 +1065,41 @@ describe("agent routes", () => {
           };
         }>;
       }>;
+      resources: Array<{
+        id: string;
+        messageId: string;
+        type: string;
+        mime?: string;
+        status: string;
+        url?: string;
+        width?: number;
+        height?: number;
+        metadata?: {
+          prompt?: string;
+          provider?: string;
+        };
+      }>;
     };
 
     expect(sessionResponse.statusCode).toBe(200);
+    const assistant = payload.messages.find((message) => message.id === created.assistantMessage.id);
+    const mediaPart = assistant?.parts.find((part) => part.type === "media");
+    const resourceId = mediaPart?.extra?.resource?.id;
+
+    expect(resourceId).toMatch(/^res_/);
+    expect(mediaPart).not.toHaveProperty("url");
+    expect(mediaPart).not.toHaveProperty("mime");
+    expect(payload.resources).toEqual([
+      expect.objectContaining({
+        id: resourceId,
+        messageId: created.assistantMessage.id,
+        type: "image",
+        mime: "image/png",
+        status: "succeeded",
+        url: "https://example.com/pig.png",
+        metadata: { prompt: "温馨田园小猪", provider: "test_image" }
+      })
+    ]);
     expect(payload.messages).toEqual([
       expect.objectContaining({
         role: "user",
@@ -648,11 +1114,14 @@ describe("agent routes", () => {
           { type: "text", value: "图片已经生成好了。" },
           expect.objectContaining({
             type: "media",
-            mime: "image/png",
-            url: "https://example.com/pig.png",
             extra: expect.objectContaining({
-              generation: { prompt: "温馨田园小猪", provider: "test_image" },
-              tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 0 }
+              resource: { id: resourceId },
+              tool: {
+                name: "generate_image",
+                toolCallId: "call_image",
+                toolCallRowId: expect.stringMatching(/^tool_call_/),
+                outputIndex: 0
+              }
             })
           })
         ]

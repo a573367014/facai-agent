@@ -1,14 +1,22 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentConversation, type ChatMessage } from "./AgentConversation";
 
 const stylesPath = join(process.cwd(), "src/styles.css");
+const componentPath = join(process.cwd(), "src/components/AgentConversation.tsx");
+const originalClipboard = navigator.clipboard;
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: originalClipboard
+  });
+  vi.restoreAllMocks();
 });
 
 describe("AgentConversation", () => {
@@ -179,6 +187,98 @@ describe("AgentConversation", () => {
     expect(scrollTop).toBe(1200);
   });
 
+  it("流式输出更新前不在底部时，后续更新不自动滚到底部", () => {
+    const runningMessage: ChatMessage = {
+      id: "msg_assistant_running",
+      role: "assistant",
+      parts: [{ type: "text", value: "第一段" }],
+      status: "running"
+    };
+    const { container, rerender } = render(<AgentConversation messages={[runningMessage]} isActive />);
+    const scrollElement = container.querySelector(".chat-scroll") as HTMLDivElement;
+    let scrollHeight = 900;
+    let scrollTop = 0;
+    let clientHeight = 300;
+
+    Object.defineProperty(scrollElement, "scrollHeight", {
+      configurable: true,
+      get: () => scrollHeight
+    });
+    Object.defineProperty(scrollElement, "clientHeight", {
+      configurable: true,
+      get: () => clientHeight
+    });
+    Object.defineProperty(scrollElement, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value) => {
+        scrollTop = Number(value);
+      }
+    });
+
+    scrollTop = 500;
+    scrollHeight = 1000;
+    fireEvent.scroll(scrollElement);
+
+    scrollHeight = 1500;
+    rerender(
+      <AgentConversation
+        messages={[{ ...runningMessage, parts: [{ type: "text", value: "第一段，第二段" }], version: 2 }]}
+        isActive
+      />
+    );
+
+    expect(scrollTop).toBe(500);
+  });
+
+  it("用户重新回到底部后，流式输出会继续自动滚到底部", () => {
+    const runningMessage: ChatMessage = {
+      id: "msg_assistant_running",
+      role: "assistant",
+      parts: [{ type: "text", value: "第一段" }],
+      status: "running"
+    };
+    const { container, rerender } = render(<AgentConversation messages={[runningMessage]} isActive />);
+    const scrollElement = container.querySelector(".chat-scroll") as HTMLDivElement;
+    let scrollHeight = 1000;
+    let scrollTop = 0;
+    const clientHeight = 300;
+
+    Object.defineProperty(scrollElement, "scrollHeight", {
+      configurable: true,
+      get: () => scrollHeight
+    });
+    Object.defineProperty(scrollElement, "clientHeight", {
+      configurable: true,
+      get: () => clientHeight
+    });
+    Object.defineProperty(scrollElement, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value) => {
+        scrollTop = Number(value);
+      }
+    });
+
+    scrollTop = 520;
+    scrollHeight = 1300;
+    fireEvent.scroll(scrollElement);
+
+    expect(scrollTop).toBe(520);
+
+    scrollTop = 1000;
+    fireEvent.scroll(scrollElement);
+    scrollHeight = 1700;
+    rerender(
+      <AgentConversation
+        messages={[{ ...runningMessage, parts: [{ type: "text", value: "第一段，第二段" }], version: 2 }]}
+        isActive
+      />
+    );
+
+    expect(scrollTop).toBe(1700);
+  });
+
   it("空状态建议项可以点击并回填输入框", async () => {
     const onSuggestionSelect = vi.fn();
 
@@ -235,6 +335,186 @@ describe("AgentConversation", () => {
     expect(screen.queryByText("你")).not.toBeInTheDocument();
   });
 
+  it("按相对日期规则展示消息时间", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-29T11:00:00+08:00"));
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_today",
+        role: "user",
+        parts: [{ type: "text", value: "今天" }],
+        status: "completed",
+        createdAt: "2026-06-29T10:15:00+08:00"
+      },
+      {
+        id: "msg_month",
+        role: "assistant",
+        parts: [{ type: "text", value: "本月" }],
+        status: "completed",
+        createdAt: "2026-06-12T08:05:00+08:00"
+      },
+      {
+        id: "msg_year",
+        role: "user",
+        parts: [{ type: "text", value: "本年" }],
+        status: "completed",
+        createdAt: "2026-05-02T09:06:00+08:00"
+      },
+      {
+        id: "msg_old",
+        role: "assistant",
+        parts: [{ type: "text", value: "跨年" }],
+        status: "completed",
+        createdAt: "2025-12-31T23:59:00+08:00"
+      }
+    ];
+
+    render(<AgentConversation messages={messages} isActive={false} />);
+
+    expect(screen.getByText("10:15")).toBeInTheDocument();
+    expect(screen.getByText("12日 08:05")).toBeInTheDocument();
+    expect(screen.getByText("5月2日 09:06")).toBeInTheDocument();
+    expect(screen.getByText("2025年12月31日 23:59")).toBeInTheDocument();
+  });
+
+  it("消息时间展示在底部 meta 行，和 hover 动作按钮同层", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-29T11:00:00+08:00"));
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_user",
+        role: "user",
+        parts: [{ type: "text", value: "问题" }],
+        status: "completed",
+        createdAt: "2026-06-29T10:15:00+08:00"
+      },
+      {
+        id: "msg_assistant",
+        role: "assistant",
+        parts: [{ type: "text", value: "回答" }],
+        status: "completed",
+        createdAt: "2026-06-29T10:16:00+08:00"
+      }
+    ];
+
+    const { container } = render(<AgentConversation messages={messages} isActive={false} onRegenerateMessage={vi.fn()} />);
+    const userMeta = container.querySelector(".chat-row.user .message-meta-row");
+    const assistantMeta = container.querySelector(".chat-row.assistant .message-meta-row");
+    const styles = readFileSync(stylesPath, "utf8");
+    const componentSource = readFileSync(componentPath, "utf8");
+
+    expect(userMeta?.querySelector(".message-timestamp")).toHaveTextContent("10:15");
+    expect(userMeta?.querySelector(".message-actions.user-actions")).toBeInTheDocument();
+    expect(assistantMeta?.querySelector(".message-timestamp")).toHaveTextContent("10:16");
+    expect(assistantMeta?.querySelector(".message-actions.assistant-actions")).toContainElement(
+      screen.getByRole("button", { name: "重新生成" })
+    );
+    expect(styles).toMatch(/\.message-meta-row\s*{[^}]*top:\s*100%;[^}]*padding-top:\s*6px;[^}]*opacity:\s*0;[^}]*pointer-events:\s*auto;[^}]*transform:\s*translateY\(-4px\);/s);
+    expect(styles).toMatch(/\.message-action-button\.message-action-button\.MuiIconButton-root\s*{[^}]*width:\s*24px;[^}]*height:\s*24px;[^}]*border:\s*0;[^}]*background:\s*transparent;[^}]*box-shadow:\s*none;/s);
+    expect(componentSource).toContain("offset: [0, -8]");
+    expect(componentSource.match(/slotProps={messageActionTooltipSlotProps}/g)).toHaveLength(3);
+    expect(styles).toMatch(/\.chat-row\.assistant:hover\s+\.message-meta-row/s);
+    expect(styles).toMatch(/\.chat-row\.user:hover\s+\.message-meta-row/s);
+  });
+
+  it("user 消息支持复制文本", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText }
+    });
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_user",
+        role: "user",
+        parts: [{ type: "text", value: "原理是啥，怎么拿到这些爆款的" }],
+        status: "completed"
+      }
+    ];
+
+    render(<AgentConversation messages={messages} isActive={false} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "复制消息" }));
+
+    expect(writeText).toHaveBeenCalledWith("原理是啥，怎么拿到这些爆款的");
+  });
+
+  it("user 消息点击修改时把文本交给底部输入框复用", async () => {
+    const onEditUserMessage = vi.fn();
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_user",
+        role: "user",
+        parts: [{ type: "text", value: "原理是啥，怎么拿到这些爆款的" }],
+        status: "completed"
+      }
+    ];
+
+    render(<AgentConversation messages={messages} isActive={false} onEditUserMessage={onEditUserMessage} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "修改消息" }));
+
+    expect(onEditUserMessage).toHaveBeenCalledWith("原理是啥，怎么拿到这些爆款的");
+  });
+
+  it("消息块之间保留足够的垂直间距", () => {
+    const styles = readFileSync(stylesPath, "utf8");
+
+    expect(styles).toMatch(/\.chat-scroll-content\s*{[^}]*gap:\s*65px;/s);
+  });
+
+  it("已结束的 assistant 消息可以触发重新生成", async () => {
+    const onRegenerateMessage = vi.fn();
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_assistant",
+        role: "assistant",
+        parts: [{ type: "text", value: "旧回答" }],
+        status: "completed"
+      }
+    ];
+
+    render(<AgentConversation messages={messages} isActive={false} onRegenerateMessage={onRegenerateMessage} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "重新生成" }));
+
+    expect(onRegenerateMessage).toHaveBeenCalledWith("msg_assistant");
+  });
+
+  it("assistant 重新生成入口沿用消息 hover 动作条并放在底部左下角", () => {
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_assistant",
+        role: "assistant",
+        parts: [{ type: "text", value: "旧回答" }],
+        status: "completed"
+      }
+    ];
+    const styles = readFileSync(stylesPath, "utf8");
+
+    const { container } = render(<AgentConversation messages={messages} isActive={false} onRegenerateMessage={vi.fn()} />);
+    const assistantActions = container.querySelector(".chat-row.assistant .message-actions.assistant-actions");
+
+    expect(assistantActions).toContainElement(screen.getByRole("button", { name: "重新生成" }));
+    expect(styles).toMatch(/\.chat-row\.assistant\s+\.message-meta-row\s*{[^}]*left:\s*0;[^}]*justify-content:\s*flex-start;/s);
+    expect(styles).toMatch(/\.chat-row\.assistant:hover\s+\.message-meta-row/s);
+  });
+
+  it("运行中的 assistant 消息不展示重新生成入口", () => {
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_assistant",
+        role: "assistant",
+        parts: [{ type: "text", value: "" }],
+        status: "running"
+      }
+    ];
+
+    render(<AgentConversation messages={messages} isActive onRegenerateMessage={vi.fn()} />);
+
+    expect(screen.queryByRole("button", { name: "重新生成" })).not.toBeInTheDocument();
+  });
+
   it("renders assistant answers as Markdown", () => {
     const messages: ChatMessage[] = [
       {
@@ -261,14 +541,9 @@ describe("AgentConversation", () => {
           { type: "text", value: "**图片已生成。**" },
           {
             type: "media",
-            mime: "image/png",
-            url: "https://example.com/part-image.png",
-            width: 1024,
-            height: 768,
             extra: {
-              lifecycle: { state: "succeeded" },
-              tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 0 },
-              generation: { prompt: "田园小猪", provider: "test" }
+              resource: { id: "res_image" },
+              tool: { name: "generate_image", toolCallId: "call_image", toolCallRowId: "tool_call_image", outputIndex: 0 }
             }
           }
         ],
@@ -276,7 +551,30 @@ describe("AgentConversation", () => {
       }
     ];
 
-    render(<AgentConversation messages={messages} isActive={false} />);
+    render(
+      <AgentConversation
+        messages={messages}
+        resourcesById={{
+          res_image: {
+            id: "res_image",
+            sessionId: "session_1",
+            messageId: "msg_1:assistant",
+            toolCallId: "call_image",
+            toolCallRowId: "tool_call_image",
+            type: "image",
+            mime: "image/png",
+            status: "succeeded",
+            url: "https://example.com/part-image.png",
+            width: 1024,
+            height: 768,
+            metadata: { prompt: "田园小猪", provider: "test" },
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:01.000Z"
+          }
+        }}
+        isActive={false}
+      />
+    );
 
     expect(screen.getByText("图片已生成。").tagName.toLowerCase()).toBe("strong");
     expect(screen.getByRole("img", { name: "田园小猪" })).toHaveAttribute("src", "https://example.com/part-image.png");
@@ -377,12 +675,46 @@ describe("AgentConversation", () => {
     expect(screen.getByRole("menuitem", { name: "引用图片 1" })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: "打开原图 1" })).toHaveAttribute("href", "https://example.com/generated.png");
 
-    const mainAssetArea = container.querySelector(".message-image-assets");
+    const mainAssetArea = container.querySelector(".message-image-gallery");
     const toolEventArea = container.querySelector(".tool-events");
 
     expect(mainAssetArea).not.toBeNull();
     expect(mainAssetArea?.querySelector('img[alt="赛博茶馆"]')).not.toBeNull();
     expect(toolEventArea?.querySelector('img[alt="赛博茶馆"]')).toBeNull();
+  });
+
+  it("关闭正文图片更多菜单后不会把焦点还给更多按钮", async () => {
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_1:assistant",
+        role: "assistant",
+        parts: [
+          { type: "text", value: "图片已生成。" },
+          {
+            type: "media",
+            mime: "image/png",
+            url: "https://example.com/generated.png",
+            extra: {
+              lifecycle: { state: "succeeded" },
+              tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 0 },
+              generation: { prompt: "赛博茶馆" }
+            }
+          }
+        ],
+        status: "completed"
+      }
+    ];
+
+    render(<AgentConversation messages={messages} isActive={false} />);
+    const moreButton = screen.getByRole("button", { name: "更多图片操作 1" });
+
+    await userEvent.click(moreButton);
+    expect(screen.getByRole("menuitem", { name: "复制图片链接 1" })).toBeInTheDocument();
+
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("menuitem", { name: "复制图片链接 1" })).not.toBeInTheDocument());
+
+    expect(document.activeElement).not.toBe(moreButton);
   });
 
   it("工具事件里的图片不会自动变成正文资源", () => {
@@ -413,10 +745,10 @@ describe("AgentConversation", () => {
     const { container } = render(<AgentConversation messages={messages} isActive={false} />);
 
     expect(screen.getByText("图片已经生成。")).toBeInTheDocument();
-    expect(container.querySelector(".message-image-assets")).toBeNull();
+    expect(container.querySelector(".message-image-gallery")).toBeNull();
   });
 
-  it("图片资源交互按钮浮在图片上并只在 hover 或 focus 时显示", () => {
+  it("正文图片使用左对齐的固定上限画廊，长边铺满且短边自适应", () => {
     const messages: ChatMessage[] = [
       {
         id: "msg_1:assistant",
@@ -453,19 +785,70 @@ describe("AgentConversation", () => {
     ];
 
     const { container } = render(<AgentConversation messages={messages} isActive={false} />);
-    const imageStage = container.querySelector(".tool-image-stage");
-    const actions = screen.getByRole("link", { name: "下载图片 1" }).closest(".tool-image-actions");
+    const gallery = container.querySelector(".message-image-gallery");
+    const tile = container.querySelector(".message-image-tile");
+    const frame = container.querySelector(".message-image-frame");
+    const actions = screen.getByRole("link", { name: "下载图片 1" }).closest(".message-image-actions");
 
-    expect(imageStage).not.toBeNull();
+    expect(gallery).toHaveClass("single");
+    expect(tile).not.toBeNull();
+    expect(frame).not.toBeNull();
     expect(actions).not.toBeNull();
-    expect(imageStage?.contains(actions)).toBe(true);
+    expect(frame?.contains(actions)).toBe(true);
 
     const styles = readFileSync(stylesPath, "utf8");
-    expect(styles).toMatch(/\.tool-image-stage\s*{[^}]*position:\s*relative;/s);
-    expect(styles).toMatch(/\.tool-image-actions\s*{[^}]*position:\s*absolute;[^}]*opacity:\s*0;/s);
-    expect(styles).toMatch(/\.tool-image-preview:hover\s+\.tool-image-actions/s);
-    expect(styles).toMatch(/\.tool-image-preview:focus-within\s+\.tool-image-actions/s);
+    expect(styles).toMatch(/\.message-image-gallery\s*{[^}]*justify-content:\s*start;/s);
+    expect(styles).toMatch(/\.message-image-tile\s*{[^}]*max-width:\s*300px;/s);
+    expect(styles).toMatch(/\.message-image-frame\s*{[^}]*max-width:\s*300px;[^}]*max-height:\s*300px;/s);
+    expect(styles).toMatch(/\.message-image-frame img\s*{[^}]*object-fit:\s*contain;/s);
+    expect(styles).toMatch(/\.message-image-actions\s*{[^}]*position:\s*absolute;[^}]*opacity:\s*0;/s);
+    expect(styles).toMatch(/\.message-image-tile:hover\s+\.message-image-actions/s);
+    expect(styles).toMatch(/\.message-image-tile:focus-within\s+\.message-image-actions/s);
     expect(screen.getByRole("button", { name: "更多图片操作 1" })).toHaveClass("MuiIconButton-root");
+  });
+
+  it("多张正文图片复用同一套左对齐画廊布局", () => {
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_1:assistant",
+        role: "assistant",
+        parts: [
+          { type: "text", value: "图片已生成。" },
+          {
+            type: "media",
+            mime: "image/png",
+            url: "https://example.com/landscape.png",
+            width: 1024,
+            height: 768,
+            extra: {
+              lifecycle: { state: "succeeded" },
+              tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 0 },
+              generation: { prompt: "横图", provider: "volcengine_seedream" }
+            }
+          },
+          {
+            type: "media",
+            mime: "image/png",
+            url: "https://example.com/portrait.png",
+            width: 768,
+            height: 1024,
+            extra: {
+              lifecycle: { state: "succeeded" },
+              tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 1 },
+              generation: { prompt: "竖图", provider: "volcengine_seedream" }
+            }
+          }
+        ],
+        status: "completed"
+      }
+    ];
+
+    const { container } = render(<AgentConversation messages={messages} isActive={false} />);
+
+    expect(container.querySelector(".message-image-gallery")).toHaveClass("multi");
+    expect(container.querySelectorAll(".message-image-tile")).toHaveLength(2);
+    expect(screen.getByRole("img", { name: "横图" })).toHaveAttribute("src", "https://example.com/landscape.png");
+    expect(screen.getByRole("img", { name: "竖图" })).toHaveAttribute("src", "https://example.com/portrait.png");
   });
 
   it("图片点击预览使用 MUI Dialog 承载", async () => {
@@ -514,8 +897,8 @@ describe("AgentConversation", () => {
 
   it("图片预览按原图比例展示，不做 1:1 裁切", () => {
     const styles = readFileSync(stylesPath, "utf8");
-    const imageRule = styles.match(/\n\.tool-image-preview img\s*{(?<body>[^}]*)}/s)?.groups?.body ?? "";
-    const mainImageRule = styles.match(/\.message-image-assets \.tool-image-preview img\s*{(?<body>[^}]*)}/s)?.groups?.body ?? "";
+    const imageRule = styles.match(/\n\.message-image-frame img\s*{(?<body>[^}]*)}/s)?.groups?.body ?? "";
+    const mainImageRule = styles.match(/\.message-image-frame\s*{(?<body>[^}]*)}/s)?.groups?.body ?? "";
 
     expect(imageRule).not.toContain("aspect-ratio: 1 / 1");
     expect(mainImageRule).not.toContain("object-fit: cover");
@@ -587,10 +970,11 @@ describe("AgentConversation", () => {
       }
     ];
 
-    render(<AgentConversation messages={messages} isActive={false} />);
+    const { container } = render(<AgentConversation messages={messages} isActive={false} />);
 
     expect(screen.getByText("批量图片处理完成。")).toBeInTheDocument();
-    expect(screen.getByText("水彩风格的小猪")).toBeInTheDocument();
+    expect(container.querySelector(".message-image-gallery")).not.toHaveTextContent("水彩风格的小猪");
+    expect(container.querySelector(".message-image-caption")).toBeNull();
     expect(screen.getByRole("img", { name: "水彩风格的小猪" })).toHaveAttribute(
       "src",
       "https://example.com/watercolor-pig.png"
@@ -622,9 +1006,10 @@ describe("AgentConversation", () => {
       }
     ];
 
-    render(<AgentConversation messages={messages} isActive={false} />);
+    const { container } = render(<AgentConversation messages={messages} isActive={false} />);
 
-    expect(screen.getByText("像素小猪")).toBeInTheDocument();
+    expect(container.querySelector(".message-image-gallery")).not.toHaveTextContent("像素小猪");
+    expect(container.querySelector(".message-image-caption")).toBeNull();
     expect(screen.getByRole("img", { name: "像素小猪" })).toHaveAttribute(
       "src",
       "https://example.com/fast-pixel-pig.png"
@@ -670,13 +1055,14 @@ describe("AgentConversation", () => {
     expect(screen.getByText("我正在为你生成图片")).toBeInTheDocument();
     expect(screen.getByText("正在生成图片")).toBeInTheDocument();
     expect(screen.getByText("1328 x 1328")).toBeInTheDocument();
-    expect(screen.getAllByText("粉色小猪").length).toBeGreaterThan(0);
 
-    const mainAssetArea = container.querySelector(".message-image-assets");
+    const mainAssetArea = container.querySelector(".message-image-gallery");
     const toolEventArea = container.querySelector(".tool-events");
 
     expect(mainAssetArea).not.toBeNull();
     expect(mainAssetArea?.textContent).toContain("正在生成图片");
+    expect(mainAssetArea).not.toHaveTextContent("粉色小猪");
+    expect(container.querySelector(".message-image-caption")).toBeNull();
     expect(container.textContent).not.toContain("Seedream");
     expect(toolEventArea?.textContent).not.toContain("Seedream 正在处理");
   });
