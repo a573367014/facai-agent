@@ -24,7 +24,8 @@ export const partSchema = new Schema({
       attrs: {
         mime: { default: "" },
         url: { default: "" },
-        name: { default: "" }
+        name: { default: "" },
+        size: { default: null }
       },
       parseDOM: [
         {
@@ -35,21 +36,48 @@ export const partSchema = new Schema({
             return {
               mime: element.dataset.mime ?? "",
               url: element.dataset.url ?? "",
-              name: element.dataset.name ?? ""
+              name: element.dataset.name ?? "",
+              size: element.dataset.size ? Number(element.dataset.size) : null
             };
           }
         }
       ],
-      toDOM: (node) => [
-        "span",
-        {
+      toDOM: (node) => {
+        const label = node.attrs.name || "图片";
+        const attrs: Record<string, string> = {
           class: "pm-part pm-part--media",
-          "data-mime": node.attrs.mime,
-          "data-url": node.attrs.url,
-          "data-name": node.attrs.name
-        },
-        node.attrs.name || node.attrs.url || "媒体"
-      ]
+          contenteditable: "false",
+          "data-mime": String(node.attrs.mime ?? ""),
+          "data-url": String(node.attrs.url ?? ""),
+          "data-name": String(node.attrs.name ?? ""),
+          title: "点击替换图片"
+        };
+
+        if (node.attrs.size !== null && node.attrs.size !== undefined) {
+          attrs["data-size"] = String(node.attrs.size);
+        }
+
+        return [
+          "span",
+          attrs,
+          node.attrs.url
+            ? ["img", { class: "pm-part-media-thumb", src: node.attrs.url, alt: label, draggable: "false" }]
+            : ["span", { class: "pm-part-media-placeholder" }, "图片"],
+          ["span", { class: "pm-part-media-name" }, label],
+          [
+            "button",
+            {
+              class: "pm-part-media-remove",
+              type: "button",
+              title: "删除图片",
+              "aria-label": `删除图片 ${label}`,
+              contenteditable: "false",
+              tabindex: "-1"
+            },
+            "×"
+          ]
+        ];
+      }
     }
   }
 });

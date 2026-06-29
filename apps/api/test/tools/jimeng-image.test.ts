@@ -1,8 +1,195 @@
 import { describe, expect, it } from "vitest";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { AppError } from "../../src/errors/app-error.js";
-import { createJimengImageTool } from "../../src/tools/jimeng-image.js";
+import { createJimengImageEditTool, createJimengImageTool } from "../../src/tools/jimeng-image.js";
 
 describe("createJimengImageTool", () => {
+  it("SeedEdit3.0 会把本地上传图片转成 base64，避免火山下载 localhost URL", async () => {
+    const uploadDirectory = await mkdtemp(join(tmpdir(), "agent-seededit-upload-"));
+    const imageBuffer = Buffer.from("fake image bytes");
+    await mkdir(join(uploadDirectory, "images"), { recursive: true });
+    await writeFile(join(uploadDirectory, "images", "source.png"), imageBuffer);
+
+    const requests: Array<{ action: string | null; body: Record<string, unknown> }> = [];
+    const responses = [
+      {
+        code: 10000,
+        data: { task_id: "task_seededit_local" },
+        message: "Success"
+      },
+      {
+        code: 10000,
+        data: {
+          status: "done",
+          image_urls: ["https://example.com/edited-local-pig.png"],
+          binary_data_base64: null
+        },
+        message: "Success"
+      }
+    ];
+    const fetchImpl: typeof fetch = async (url, init) => {
+      const parsedUrl = new URL(String(url));
+      requests.push({
+        action: parsedUrl.searchParams.get("Action"),
+        body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>
+      });
+
+      return new Response(JSON.stringify(responses.shift()), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    };
+    const tool = createJimengImageEditTool({
+      accessKeyId: "ak-test",
+      secretAccessKey: "sk-test",
+      uploadDirectory,
+      pollIntervalMs: 0,
+      maxPollAttempts: 1,
+      fetchImpl
+    });
+
+    const output = await tool.execute(
+      {
+        prompt: "把小猪换成水彩风格，保留田园背景",
+        imageUrl: "http://localhost:4001/uploads/images/source.png",
+        seed: 12,
+        scale: 0.6
+      },
+      {}
+    );
+
+    expect(output).toMatchObject({
+      data: {
+        provider: "volcengine_seededit",
+        imageUrl: "http://localhost:4001/uploads/images/source.png",
+        imageUrls: ["https://example.com/edited-local-pig.png"]
+      }
+    });
+    expect(requests[0]).toEqual({
+      action: "CVSync2AsyncSubmitTask",
+      body: {
+        req_key: "seededit_v3.0",
+        prompt: "把小猪换成水彩风格，保留田园背景",
+        binary_data_base64: [imageBuffer.toString("base64")],
+        seed: 12,
+        scale: 0.6
+      }
+    });
+    expect(requests[0].body).not.toHaveProperty("image_urls");
+  });
+
+  it("配置 AK/SK 时用 SeedEdit3.0 根据图片 URL 和指令生成新图片", async () => {
+    const requests: Array<{ action: string | null; version: string | null; body: Record<string, unknown> }> = [];
+    const responses = [
+      {
+        code: 10000,
+        data: { task_id: "task_seededit" },
+        message: "Success"
+      },
+      {
+        code: 10000,
+        data: {
+          status: "done",
+          image_urls: ["https://example.com/edited-pig.png"],
+          binary_data_base64: null
+        },
+        message: "Success"
+      }
+    ];
+    const fetchImpl: typeof fetch = async (url, init) => {
+      const parsedUrl = new URL(String(url));
+      requests.push({
+        action: parsedUrl.searchParams.get("Action"),
+        version: parsedUrl.searchParams.get("Version"),
+        body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>
+      });
+
+      return new Response(JSON.stringify(responses.shift()), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    };
+    const tool = createJimengImageEditTool({
+      accessKeyId: "ak-test",
+      secretAccessKey: "sk-test",
+      pollIntervalMs: 0,
+      maxPollAttempts: 1,
+      fetchImpl
+    });
+
+    const output = await tool.execute(
+      {
+        prompt: "把小猪换成水彩风格，保留田园背景",
+        imageUrl: "https://cdn.example.com/source-pig.png",
+        seed: 12,
+        scale: 0.6
+      },
+      {}
+    );
+
+    expect(output).toEqual({
+      data: {
+        provider: "volcengine_seededit",
+        reqKey: "seededit_v3.0",
+        taskId: "task_seededit",
+        status: "done",
+        prompt: "把小猪换成水彩风格，保留田园背景",
+        imageUrl: "https://cdn.example.com/source-pig.png",
+        imageUrls: ["https://example.com/edited-pig.png"],
+        binaryDataBase64: [],
+        seed: 12,
+        scale: 0.6
+      },
+      llmContent: expect.stringContaining("图片已编辑完成")
+    });
+    expect(String((output as { llmContent?: string }).llmContent)).not.toContain("https://example.com/edited-pig.png");
+    expect(String((output as { llmContent?: string }).llmContent)).not.toContain("https://cdn.example.com/source-pig.png");
+    expect(requests).toEqual([
+      {
+        action: "CVSync2AsyncSubmitTask",
+        version: "2022-08-31",
+        body: {
+          req_key: "seededit_v3.0",
+          prompt: "把小猪换成水彩风格，保留田园背景",
+          image_urls: ["https://cdn.example.com/source-pig.png"],
+          seed: 12,
+          scale: 0.6
+        }
+      },
+      {
+        action: "CVSync2AsyncGetResult",
+        version: "2022-08-31",
+        body: {
+          req_key: "seededit_v3.0",
+          task_id: "task_seededit",
+          req_json: JSON.stringify({ return_url: true })
+        }
+      }
+    ]);
+  });
+
+  it("SeedEdit3.0 只接受 http 或 https 图片 URL", async () => {
+    const tool = createJimengImageEditTool({
+      accessKeyId: "ak-test",
+      secretAccessKey: "sk-test",
+      fetchImpl: async () => {
+        throw new Error("不应该发起请求");
+      }
+    });
+
+    await expect(
+      tool.execute(
+        {
+          prompt: "换成水彩风格",
+          imageUrl: "file:///tmp/source.png"
+        },
+        {}
+      )
+    ).rejects.toThrow("imageUrl 只支持 http 或 https 地址");
+  });
+
   it("配置 AK/SK 时用 HMAC-SHA256 签名调用通用3.0文生图同步转异步接口", async () => {
     const requests: Array<{ url: string; init: RequestInit; body: Record<string, unknown> }> = [];
     const responses = [

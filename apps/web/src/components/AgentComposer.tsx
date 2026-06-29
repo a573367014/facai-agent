@@ -1,21 +1,21 @@
-import { Box, IconButton, Paper, Stack, TextField, Tooltip } from "@mui/material";
-import { Send, Square } from "lucide-react";
-import type { FormEvent } from "react";
-import { PartComposer } from "./PartComposer";
+import { Box, IconButton, Paper, Stack, Tooltip } from "@mui/material";
+import { ImagePlus, Send, Square } from "lucide-react";
+import { useRef, type FormEvent } from "react";
+import { PartComposer, type PartComposerHandle } from "./PartComposer";
 import type { RuntimePart } from "../prosemirror/part-serialization";
 
 interface AgentComposerProps {
   parts: RuntimePart[];
-  maxIterations: number;
   isStreaming: boolean;
   focusToken?: number;
   onPartsChange: (parts: RuntimePart[]) => void;
-  onMaxIterationsChange: (value: number) => void;
   onSubmit: () => void;
   onCancel: () => void;
+  onUploadImage?: (file: File) => Promise<RuntimePart>;
 }
 
 export function AgentComposer(props: AgentComposerProps) {
+  const composerRef = useRef<PartComposerHandle | null>(null);
   const canSubmit = hasSubmittableParts(props.parts);
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -41,28 +41,30 @@ export function AgentComposer(props: AgentComposerProps) {
   return (
     <Paper component="form" className="chat-composer" elevation={0} onSubmit={handleSubmit}>
       <PartComposer
+        ref={composerRef}
         parts={props.parts}
         focusToken={props.focusToken}
         onChange={props.onPartsChange}
         onSubmit={handleComposerSubmit}
         onCancel={props.onCancel}
+        onUploadImage={props.onUploadImage}
       />
 
       <Stack className="composer-toolbar" direction="row" spacing={1}>
-        <TextField
-          className="iteration-field"
-          label="迭代"
-          id="max-iterations"
-          type="number"
-          value={props.maxIterations}
-          onChange={(event) => props.onMaxIterationsChange(Number(event.target.value))}
-          slotProps={{
-            htmlInput: {
-              min: 1,
-              max: 8
-            }
-          }}
-        />
+        <Tooltip title="上传图片">
+          <span>
+            <IconButton
+              aria-label="上传图片"
+              className="composer-icon-button"
+              disabled={!props.onUploadImage}
+              onClick={() => composerRef.current?.openImagePicker()}
+              size="small"
+              type="button"
+            >
+              <ImagePlus size={18} />
+            </IconButton>
+          </span>
+        </Tooltip>
 
         <Box className="composer-spacer" />
         <Tooltip title={submitButtonLabel}>

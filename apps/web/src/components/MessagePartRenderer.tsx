@@ -1,18 +1,19 @@
-import { Alert } from "@mui/material";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { MediaPart, MessagePart } from "../api/agent-client";
-import { ImageLoadingPreview, ImagePreview, type ToolImageActionPayload } from "./ToolResultPreview";
+import type { AgentResourceRecord, MediaPart, MessagePart } from "../api/agent-client";
+import { MessageImageGallery, type MessageImageGalleryItem } from "./MessageImageGallery";
+import type { ToolImageActionPayload } from "./ToolResultPreview";
 import type { ToolTrace } from "../utils/tool-traces";
 
 interface MessagePartRendererProps {
   role: "user" | "assistant";
   parts: MessagePart[];
+  resourcesById?: Record<string, AgentResourceRecord>;
   showCursor?: boolean;
   onImageAction?: (payload: ToolImageActionPayload) => void;
 }
 
-export function MessagePartRenderer({ role, parts, showCursor = false, onImageAction }: MessagePartRendererProps) {
+export function MessagePartRenderer({ role, parts, resourcesById = {}, showCursor = false, onImageAction }: MessagePartRendererProps) {
   const text = parts
     .filter((part): part is Extract<MessagePart, { type: "text" }> => part.type === "text")
     .map((part) => part.value)
@@ -37,84 +38,87 @@ export function MessagePartRenderer({ role, parts, showCursor = false, onImageAc
       ) : null}
 
       {mediaParts.length > 0 ? (
-        <div className="message-image-assets">
-          {mediaParts.map((part, index) => (
-            <MediaPartPreview
-              key={`${part.extra?.tool?.toolCallId ?? part.url ?? "media"}:${part.extra?.tool?.outputIndex ?? index}`}
-              index={index}
-              part={part}
-              onImageAction={onImageAction}
-            />
-          ))}
-        </div>
+        <MessageImageGallery
+          items={mediaParts.map((part, index) =>
+            toMediaGalleryItem(part, index, part.extra?.resource?.id ? resourcesById[part.extra.resource.id] : undefined)
+          )}
+          onImageAction={onImageAction}
+        />
       ) : null}
     </>
   );
 }
 
-function MediaPartPreview({
-  part,
-  index,
-  onImageAction
-}: {
-  part: MediaPart;
-  index: number;
-  onImageAction?: (payload: ToolImageActionPayload) => void;
-}) {
-  const trace = toMediaTrace(part, index);
-  const state = part.extra?.lifecycle?.state;
+function toMediaGalleryItem(part: MediaPart, index: number, resource?: AgentResourceRecord): MessageImageGalleryItem {
+  const trace = toMediaTrace(part, index, resource);
+  const state = resource?.status ?? part.extra?.lifecycle?.state;
+  const url = resource?.url ?? part.url;
+  const prompt = getResourcePrompt(resource) ?? part.extra?.generation?.prompt ?? part.name;
+  const width = resource?.width ?? part.width;
+  const height = resource?.height ?? part.height;
 
-  if (state === "pending" || !part.url) {
-    return <ImageLoadingPreview trace={trace} />;
-  }
-
-  if (state === "failed") {
-    return (
-      <Alert className="error-box inline-error" severity="error">
-        {part.extra?.lifecycle?.error?.message ?? "图片生成失败"}
-      </Alert>
-    );
-  }
-
-  return (
-    <ImagePreview
-      trace={trace}
-      result={{
-        prompt: part.extra?.generation?.prompt,
-        imageUrls: [part.url],
-        items: [
-          {
-            index,
-            status: "success",
-            prompt: part.extra?.generation?.prompt ?? part.name,
-            width: part.width,
-            height: part.height,
-            imageUrls: [part.url]
-          }
-        ]
-      }}
-      onImageAction={onImageAction}
-    />
-  );
+  return {
+    id: `${part.extra?.resource?.id ?? part.extra?.tool?.toolCallId ?? url ?? "media"}:${part.extra?.tool?.outputIndex ?? index}`,
+    url,
+    prompt,
+    width,
+    height,
+    state:
+      state === "failed"
+        ? "failed"
+        : state === "pending" || !url
+          ? "pending"
+          : "succeeded",
+    error: getResourceErrorMessage(resource) ?? part.extra?.lifecycle?.error?.message,
+    trace
+  };
 }
 
-function toMediaTrace(part: MediaPart, index: number): ToolTrace {
+function toMediaTrace(part: MediaPart, index: number, resource?: AgentResourceRecord): ToolTrace {
+  const state = resource?.status ?? part.extra?.lifecycle?.state;
+  const url = resource?.url ?? part.url;
+  const prompt = getResourcePrompt(resource) ?? part.extra?.generation?.prompt;
+  const width = resource?.width ?? part.width;
+  const height = resource?.height ?? part.height;
+
   return {
     id: part.extra?.tool?.toolCallId ?? `media:${index}`,
     iteration: 0,
     toolName: part.extra?.tool?.name ?? "media",
     status:
-      part.extra?.lifecycle?.state === "failed"
+      state === "failed"
         ? "failed"
-        : part.extra?.lifecycle?.state === "succeeded"
+        : state === "succeeded"
           ? "success"
           : "running",
     arguments: {
-      prompt: part.extra?.generation?.prompt,
-      width: part.width,
-      height: part.height
+      prompt,
+      width,
+      height
     },
-    result: part.url ? { imageUrls: [part.url], prompt: part.extra?.generation?.prompt } : undefined,
-    error: part.extra?.lifecycle?.error
+    result: url ? { imageUrls: [url], prompt } : undefined,
+    error: resource?.status === "failed" ? getResourceError(resource) : part.extra?.lifecycle?.error
   };
+}
+
+function getResourcePrompt(resource?: AgentResourceRecord): string | undefined {
+  const prompt = resource?.metadata?.prompt;
+  return typeof prompt === "string" ? prompt : undefined;
+}
+
+function getResourceError(resource?: AgentResourceRecord): { code: string; message: string } | undefined {
+  const error = resource?.metadata?.error;
+
+  if (!error || typeof error !== "object" || Array.isArray(error)) {
+    return undefined;
+  }
+
+  const code = "code" in error && typeof error.code === "string" ? error.code : "RESOURCE_ERROR";
+  const message = "message" in error && typeof error.message === "string" ? error.message : "图片生成失败";
+
+  return { code, message };
+}
+
+function getResourceErrorMessage(resource?: AgentResourceRecord): string | undefined {
+  return getResourceError(resource)?.message;
 }

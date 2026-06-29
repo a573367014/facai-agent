@@ -1,16 +1,21 @@
 import { createHash, createHmac } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import { AppError } from "../errors/app-error.js";
 import type { JsonObject, RegisteredTool, ToolExecutionContext } from "./types.js";
 
 const VOLCENGINE_ENDPOINT = "https://visual.volcengineapi.com";
 const VOLCENGINE_VERSION = "2022-08-31";
+const VOLCENGINE_SEEDEDIT_VERSION = VOLCENGINE_VERSION;
 const DEFAULT_REGION = "cn-north-1";
 const DEFAULT_SERVICE = "cv";
 const DEFAULT_REQ_KEY = "high_aes_general_v30l_zt2i";
+const DEFAULT_EDIT_REQ_KEY = "seededit_v3.0";
 const DEFAULT_WIDTH = 1328;
 const DEFAULT_HEIGHT = 1328;
 const DEFAULT_SEED = -1;
+const DEFAULT_EDIT_SCALE = 0.5;
 const DEFAULT_POLL_INTERVAL_MS = 1500;
 const DEFAULT_MAX_POLL_ATTEMPTS = 40;
 const DEFAULT_TOOL_TIMEOUT_MS = 300000;
@@ -80,6 +85,28 @@ const imageArgsSchema = z
     }
   });
 
+const httpImageUrlSchema = z
+  .string()
+  .trim()
+  .url()
+  .superRefine((value, context) => {
+    const url = new URL(value);
+
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "imageUrl 只支持 http 或 https 地址"
+      });
+    }
+  });
+
+const editImageArgsSchema = z.object({
+  prompt: z.string().trim().min(1).max(800),
+  imageUrl: httpImageUrlSchema,
+  seed: z.number().int().min(-1).optional(),
+  scale: z.number().min(0).max(1).optional()
+});
+
 const jimengResponseSchema = z
   .object({
     code: z.number().optional(),
@@ -114,11 +141,13 @@ const jimengResponseSchema = z
 
 type ImageArgs = z.infer<typeof imageArgsSchema>;
 type ImageItemArgs = z.infer<typeof imageItemSchema>;
+type EditImageArgs = z.infer<typeof editImageArgsSchema>;
 type JimengResponse = z.infer<typeof jimengResponseSchema>;
 
 export interface JimengImageToolOptions {
   accessKeyId?: string;
   secretAccessKey?: string;
+  uploadDirectory?: string;
   endpoint?: string;
   region?: string;
   service?: string;
@@ -131,6 +160,8 @@ export interface JimengImageToolOptions {
   now?: () => Date;
   fetchImpl?: typeof fetch;
 }
+
+export type JimengImageEditToolOptions = JimengImageToolOptions;
 
 interface GeneratedImagePayload {
   taskId: string;
@@ -192,6 +223,16 @@ interface JimengImageBatchResult {
 
 type JimengImageResult = JimengImageSingleResult | JimengImageBatchResult;
 
+interface JimengImageEditResult extends GeneratedImagePayload {
+  provider: "volcengine_seededit";
+  reqKey: string;
+  status: "done";
+  prompt: string;
+  imageUrl: string;
+  seed: number;
+  scale: number;
+}
+
 interface VolcengineCredentials {
   accessKeyId: string;
   secretAccessKey: string;
@@ -212,6 +253,51 @@ function toSubmitBody(args: ImageItemArgs, reqKey: string) {
     width: args.width ?? DEFAULT_WIDTH,
     height: args.height ?? DEFAULT_HEIGHT,
     ...(args.usePreLlm !== undefined ? { use_pre_llm: args.usePreLlm } : {})
+  };
+}
+
+function isLocalhost(hostname: string) {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+}
+
+function isPathInside(basePath: string, targetPath: string) {
+  const childPath = relative(basePath, targetPath);
+  return childPath === "" || (!childPath.startsWith("..") && !childPath.startsWith(sep) && childPath !== "..");
+}
+
+async function tryReadLocalUploadAsBase64(imageUrl: string, uploadDirectory?: string) {
+  if (!uploadDirectory) {
+    return undefined;
+  }
+
+  const parsedUrl = new URL(imageUrl);
+
+  if (!isLocalhost(parsedUrl.hostname) || !parsedUrl.pathname.startsWith("/uploads/")) {
+    return undefined;
+  }
+
+  const relativeUploadPath = decodeURIComponent(parsedUrl.pathname.slice("/uploads/".length));
+  const rootPath = resolve(uploadDirectory);
+  const filePath = resolve(rootPath, relativeUploadPath);
+
+  if (!isPathInside(rootPath, filePath)) {
+    throw new AppError("VALIDATION_ERROR", "图片地址不在允许的上传目录内", 400);
+  }
+
+  // TODO: 后续上传切到 OSS/CDN 公网地址后，移除这段 localhost 图片转 base64 的兼容逻辑。
+  const buffer = await readFile(filePath);
+  return buffer.toString("base64");
+}
+
+async function toEditSubmitBody(args: EditImageArgs, reqKey: string, uploadDirectory?: string) {
+  const localUploadBase64 = await tryReadLocalUploadAsBase64(args.imageUrl, uploadDirectory);
+
+  return {
+    req_key: reqKey,
+    prompt: args.prompt,
+    ...(localUploadBase64 ? { binary_data_base64: [localUploadBase64] } : { image_urls: [args.imageUrl] }),
+    seed: args.seed ?? DEFAULT_SEED,
+    scale: args.scale ?? DEFAULT_EDIT_SCALE
   };
 }
 
@@ -282,6 +368,16 @@ function renderImageResultForLlm(result: JimengImageResult) {
   ].join("\n");
 }
 
+function renderEditImageResultForLlm(result: JimengImageEditResult) {
+  const imageCount = result.imageUrls.length || result.binaryDataBase64.length;
+
+  return [
+    `图片已编辑完成，共 ${imageCount} 张。`,
+    "图片资源已交给前端界面展示。",
+    "回复用户时不要输出原图链接、生成图链接、Markdown 图片、下载链接、任务 ID 或 base64 内容。"
+  ].join("\n");
+}
+
 function toImageItems(args: ImageArgs): ImageItemArgs[] {
   // execute 后面的主流程只关心“要生成哪些图片”。
   // 这里把单张调用也包成数组，后面就可以复用同一套提交/轮询逻辑。
@@ -326,18 +422,18 @@ async function emitImageBatchProgress(
   });
 }
 
-function ensureCredentials(options: JimengImageToolOptions): VolcengineCredentials {
+function ensureCredentials(options: JimengImageToolOptions, toolLabel = "通用文生图"): VolcengineCredentials {
   const accessKeyId = options.accessKeyId?.trim();
   const secretAccessKey = options.secretAccessKey?.trim();
 
   if (!accessKeyId || !secretAccessKey) {
-    throw new AppError("TOOL_EXECUTION_ERROR", "火山引擎 AK/SK 未配置，无法使用通用文生图", 500);
+    throw new AppError("TOOL_EXECUTION_ERROR", `火山引擎 AK/SK 未配置，无法使用${toolLabel}`, 500);
   }
 
   return { accessKeyId, secretAccessKey };
 }
 
-function ensureSuccessfulResponse(payload: JimengResponse, actionLabel: string) {
+function ensureSuccessfulResponse(payload: JimengResponse, actionLabel: string, serviceLabel = "火山通用文生图") {
   if (payload.code === 10000) {
     return;
   }
@@ -348,7 +444,7 @@ function ensureSuccessfulResponse(payload: JimengResponse, actionLabel: string) 
   const requestIdText = requestId ? `，request_id=${requestId}` : "";
   throw new AppError(
     "TOOL_EXECUTION_ERROR",
-    `火山通用文生图${actionLabel}失败：${payload.message ?? volcError?.Message ?? code}${requestIdText}`,
+    `${serviceLabel}${actionLabel}失败：${payload.message ?? volcError?.Message ?? code}${requestIdText}`,
     502
   );
 }
@@ -429,6 +525,59 @@ function signRequest(input: {
   };
 }
 
+async function requestVolcengine(input: {
+  action: string;
+  body: Record<string, unknown>;
+  context: ToolExecutionContext;
+  endpoint: string;
+  version: string;
+  region: string;
+  service: string;
+  options: JimengImageToolOptions;
+  fetchImpl: typeof fetch;
+  now: () => Date;
+  toolLabel: string;
+  serviceLabel: string;
+  permissionHint: string;
+}) {
+  const credentials = ensureCredentials(input.options, input.toolLabel);
+  const url = toRequestUrl(input.endpoint, input.action, input.version);
+  const bodyText = JSON.stringify(input.body);
+  const response = await input.fetchImpl(url, {
+    method: "POST",
+    headers: signRequest({
+      url,
+      bodyText,
+      credentials,
+      region: input.region,
+      service: input.service,
+      date: input.now()
+    }),
+    body: bodyText,
+    signal: input.context.signal
+  });
+
+  const responseText = await response.text();
+  const payload = jimengResponseSchema.safeParse(responseText ? JSON.parse(responseText) : {});
+
+  if (!response.ok) {
+    const parsedError = payload.success ? payload.data : undefined;
+    const rawMessage =
+      parsedError?.ResponseMetadata?.Error?.Message ??
+      parsedError?.message ??
+      responseText.slice(0, 200) ??
+      "未知错误";
+    const message = /access denied/i.test(rawMessage) ? input.permissionHint : rawMessage;
+    throw new AppError("TOOL_EXECUTION_ERROR", `${input.serviceLabel}接口请求失败，HTTP ${response.status}：${message}`, 502);
+  }
+
+  if (!payload.success) {
+    throw new AppError("TOOL_EXECUTION_ERROR", `${input.serviceLabel}接口返回格式异常`, 502);
+  }
+
+  return payload.data;
+}
+
 async function sleep(ms: number, signal?: AbortSignal) {
   if (ms <= 0) {
     return;
@@ -478,44 +627,22 @@ export function createJimengImageTool(options: JimengImageToolOptions): Register
   const now = options.now ?? (() => new Date());
 
   const request = async (action: string, body: Record<string, unknown>, context: ToolExecutionContext) => {
-    const credentials = ensureCredentials(options);
-    const url = toRequestUrl(endpoint, action, version);
-    const bodyText = JSON.stringify(body);
-    const response = await fetchImpl(url, {
-      method: "POST",
-      headers: signRequest({
-        url,
-        bodyText,
-        credentials,
-        region,
-        service,
-        date: now()
-      }),
-      body: bodyText,
-      signal: context.signal
+    return requestVolcengine({
+      action,
+      body,
+      context,
+      endpoint,
+      version,
+      region,
+      service,
+      options,
+      fetchImpl,
+      now,
+      toolLabel: "通用文生图",
+      serviceLabel: "火山通用文生图",
+      permissionHint:
+        "火山 AK/SK 已参与签名，但当前账号或密钥没有智能绘图（文生图）接口权限，请在火山控制台确认视觉智能/智能绘图（文生图）服务已开通，并给该 AK 授权"
     });
-
-    const responseText = await response.text();
-    const payload = jimengResponseSchema.safeParse(responseText ? JSON.parse(responseText) : {});
-
-    if (!response.ok) {
-      const parsedError = payload.success ? payload.data : undefined;
-      const rawMessage =
-        parsedError?.ResponseMetadata?.Error?.Message ??
-        parsedError?.message ??
-        responseText.slice(0, 200) ??
-        "未知错误";
-      const message = /access denied/i.test(rawMessage)
-        ? "火山 AK/SK 已参与签名，但当前账号或密钥没有智能绘图（文生图）接口权限，请在火山控制台确认视觉智能/智能绘图（文生图）服务已开通，并给该 AK 授权"
-        : rawMessage;
-      throw new AppError("TOOL_EXECUTION_ERROR", `火山通用文生图接口请求失败，HTTP ${response.status}：${message}`, 502);
-    }
-
-    if (!payload.success) {
-      throw new AppError("TOOL_EXECUTION_ERROR", "火山通用文生图接口返回格式异常", 502);
-    }
-
-    return payload.data;
   };
 
   const generateImageItem = async (item: ImageItemArgs, context: ToolExecutionContext): Promise<GeneratedImagePayload> => {
@@ -723,6 +850,136 @@ export function createJimengImageTool(options: JimengImageToolOptions): Register
       return {
         data: result,
         llmContent: renderImageResultForLlm(result)
+      };
+    }
+  };
+}
+
+export function createJimengImageEditTool(options: JimengImageEditToolOptions): RegisteredTool {
+  const endpoint = options.endpoint ?? VOLCENGINE_ENDPOINT;
+  const version = options.version ?? VOLCENGINE_SEEDEDIT_VERSION;
+  const region = options.region?.trim() || DEFAULT_REGION;
+  const service = options.service?.trim() || DEFAULT_SERVICE;
+  const reqKey = options.reqKey?.trim() || DEFAULT_EDIT_REQ_KEY;
+  const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  const maxPollAttempts = options.maxPollAttempts ?? DEFAULT_MAX_POLL_ATTEMPTS;
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const now = options.now ?? (() => new Date());
+
+  const request = async (action: string, body: Record<string, unknown>, context: ToolExecutionContext) => {
+    return requestVolcengine({
+      action,
+      body,
+      context,
+      endpoint,
+      version,
+      region,
+      service,
+      options,
+      fetchImpl,
+      now,
+      toolLabel: "SeedEdit3.0 图片编辑",
+      serviceLabel: "火山 SeedEdit3.0",
+      permissionHint:
+        "火山 AK/SK 已参与签名，但当前账号或密钥没有即梦 AI 图片生成/图像编辑接口权限，请在火山控制台确认即梦AI-图片生成服务已开通，并给该 AK 授权"
+    });
+  };
+
+  const editImage = async (args: EditImageArgs, context: ToolExecutionContext): Promise<GeneratedImagePayload> => {
+    const submitPayload = await request(
+      "CVSync2AsyncSubmitTask",
+      await toEditSubmitBody(args, reqKey, options.uploadDirectory),
+      context
+    );
+    ensureSuccessfulResponse(submitPayload, "提交任务", "火山 SeedEdit3.0");
+
+    const taskId = submitPayload.data?.task_id ?? submitPayload.task_id;
+
+    if (!taskId) {
+      throw new AppError("TOOL_EXECUTION_ERROR", "火山 SeedEdit3.0 提交任务成功但没有返回 task_id", 502);
+    }
+
+    for (let attempt = 0; attempt < maxPollAttempts; attempt += 1) {
+      const resultPayload = await request("CVSync2AsyncGetResult", toGetResultBody(taskId, reqKey), context);
+      ensureSuccessfulResponse(resultPayload, "查询结果", "火山 SeedEdit3.0");
+
+      const status = resultPayload.data?.status;
+
+      if (status === "done") {
+        const imageUrls = resultPayload.data?.image_urls ?? [];
+        const binaryDataBase64 = resultPayload.data?.binary_data_base64 ?? [];
+
+        if (imageUrls.length === 0 && binaryDataBase64.length === 0) {
+          throw new AppError("TOOL_EXECUTION_ERROR", "火山 SeedEdit3.0 任务完成但没有返回图片", 502);
+        }
+
+        return {
+          taskId,
+          imageUrls,
+          binaryDataBase64
+        };
+      }
+
+      if (status === "not_found" || status === "expired") {
+        throw new AppError("TOOL_EXECUTION_ERROR", `火山 SeedEdit3.0 任务状态异常：${status}`, 502);
+      }
+
+      await sleep(pollIntervalMs, context.signal);
+    }
+
+    throw new AppError("TOOL_EXECUTION_ERROR", "火山 SeedEdit3.0 任务未在限定时间内完成", 504);
+  };
+
+  return {
+    name: "edit_image",
+    description:
+      "使用火山引擎 SeedEdit3.0 根据输入图片和编辑指令生成新图片。适合用户要求修改、重绘、换风格、替换局部、基于已有图片继续创作的场景。",
+    parameters: {
+      type: "object",
+      properties: {
+        prompt: {
+          type: "string",
+          description: "图片编辑指令，描述要保留什么、修改什么，以及目标风格。"
+        },
+        imageUrl: {
+          type: "string",
+          description: "需要编辑的源图片 URL。当前 demo 直接传 http/https URL，后续会增加 CDN 白名单校验。"
+        },
+        seed: {
+          type: "number",
+          description: "随机种子；-1 表示随机生成，默认 -1。"
+        },
+        scale: {
+          type: "number",
+          description: "编辑强度，0 到 1，默认 0.5；越高越贴近编辑指令，越低越保留原图。"
+        }
+      },
+      required: ["prompt", "imageUrl"]
+    },
+    argumentSchema: editImageArgsSchema,
+    timeoutMs: options.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS,
+    async execute(args: JsonObject, context: ToolExecutionContext) {
+      const parsedArgs = editImageArgsSchema.parse(args);
+
+      ensureCredentials(options, "SeedEdit3.0 图片编辑");
+
+      const generated = await editImage(parsedArgs, context);
+      const result: JimengImageEditResult = {
+        provider: "volcengine_seededit",
+        reqKey,
+        taskId: generated.taskId,
+        status: "done",
+        prompt: parsedArgs.prompt,
+        imageUrl: parsedArgs.imageUrl,
+        imageUrls: generated.imageUrls,
+        binaryDataBase64: generated.binaryDataBase64,
+        seed: parsedArgs.seed ?? DEFAULT_SEED,
+        scale: parsedArgs.scale ?? DEFAULT_EDIT_SCALE
+      };
+
+      return {
+        data: result,
+        llmContent: renderEditImageResultForLlm(result)
       };
     }
   };

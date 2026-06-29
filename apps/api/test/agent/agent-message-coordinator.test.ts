@@ -185,6 +185,110 @@ describe("AgentMessageCoordinator", () => {
     }
   });
 
+  it("重新生成会使用目标回答当时可用的 summary 版本，不混入后续对话", async () => {
+    const answerCalls: string[][] = [];
+    const registry = new ToolRegistry();
+    const provider: LlmProvider = {
+      complete: async ({ messages }) => {
+        answerCalls.push(messages.map((message) => `${message.role}:${"content" in message ? message.content : ""}`));
+        return { content: "重新生成的回答" };
+      }
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const session = store.createSession("重新生成会话");
+    const backgroundUser = store.createMessage({
+      sessionId: session.id,
+      role: "user",
+      status: "completed",
+      parts: [{ type: "text", value: "背景：只讨论 Agent 架构" }]
+    });
+    const backgroundAssistant = store.createMessage({
+      sessionId: session.id,
+      role: "assistant",
+      status: "completed",
+      parts: [{ type: "text", value: "已记录 Agent 架构背景" }]
+    });
+    store.upsertSessionSummary({
+      sessionId: session.id,
+      coveredMessageId: backgroundAssistant.id,
+      summary: {
+        userGoal: "理解 Agent 架构",
+        currentTask: "",
+        decisions: ["只包含背景"],
+        preferences: [],
+        constraints: [],
+        importantFacts: [],
+        openQuestions: [],
+        recentProgress: []
+      }
+    });
+    const targetUser = store.createMessage({
+      sessionId: session.id,
+      role: "user",
+      status: "completed",
+      parts: [{ type: "text", value: "介绍一下 Agent Runtime" }]
+    });
+    const targetAssistant = store.createMessage({
+      sessionId: session.id,
+      role: "assistant",
+      status: "completed",
+      parts: [{ type: "text", value: "旧回答" }]
+    });
+    const futureUser = store.createMessage({
+      sessionId: session.id,
+      role: "user",
+      status: "completed",
+      parts: [{ type: "text", value: "后续再加入图片生成" }]
+    });
+    const futureAssistant = store.createMessage({
+      sessionId: session.id,
+      role: "assistant",
+      status: "completed",
+      parts: [{ type: "text", value: "未来回答" }]
+    });
+    store.upsertSessionSummary({
+      sessionId: session.id,
+      coveredMessageId: futureAssistant.id,
+      summary: {
+        userGoal: "理解 Agent 架构和图片生成",
+        currentTask: "",
+        decisions: ["包含后续图片生成"],
+        preferences: [],
+        constraints: [],
+        importantFacts: [],
+        openQuestions: [],
+        recentProgress: []
+      }
+    });
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService(provider, registry),
+      store,
+      new AgentContextBuilder({ maxHistoryMessages: 10 })
+    );
+
+    try {
+      const regenerated = await coordinator.regenerateMessage(targetAssistant.id);
+
+      await waitForRun(coordinator, regenerated.run.id);
+
+      const prompt = answerCalls[0]?.join("\n") ?? "";
+      const messages = coordinator.getSession(session.id).messages;
+      const regeneratedAssistant = messages.find(
+        (message) => message.role === "assistant" && message.parts[0]?.type === "text" && message.parts[0].value === "重新生成的回答"
+      );
+
+      expect(regenerated.userMessage.id).toBe(targetUser.id);
+      expect(regeneratedAssistant).toBeDefined();
+      expect(prompt).toContain("只包含背景");
+      expect(prompt).toContain("介绍一下 Agent Runtime");
+      expect(prompt).not.toContain("包含后续图片生成");
+      expect(prompt).not.toContain("后续再加入图片生成");
+      expect(prompt).not.toContain("未来回答");
+    } finally {
+      store.close();
+    }
+  });
+
   it("run 压缩成功入库后，即使回答阶段被取消，下次 run 也不会重复压缩同一段消息", async () => {
     const summaryCalls: string[][] = [];
     const registry = new ToolRegistry();
@@ -243,7 +347,7 @@ describe("AgentMessageCoordinator", () => {
       await waitForSessionSummary(store, first.session.id);
 
       const summaryAfterCompression = store.getSessionSummary(first.session.id);
-      coordinator.cancelRun(third.run.id);
+      await coordinator.cancelRun(third.run.id);
       await waitForRun(coordinator, third.run.id);
 
       expect(summaryAfterCompression?.coveredMessageId).toBe(coordinator.getRun(first.run.id).run.assistantMessageId);
@@ -694,7 +798,7 @@ describe("AgentMessageCoordinator", () => {
     }
   });
 
-  it("图片工具结果写入 assistant message 的 media parts", async () => {
+  it("图片工具结果写入资源表，并让 assistant media part 引用资源", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "generate_image",
@@ -743,7 +847,12 @@ describe("AgentMessageCoordinator", () => {
 
       await waitForMessage(coordinator, started.assistantMessage.id);
       const session = coordinator.getSession(started.session.id);
+      const assistant = session.messages.find((message) => message.id === started.assistantMessage.id);
+      const mediaPart = assistant?.parts.find((part) => part.type === "media");
+      const resourceId = mediaPart?.extra?.resource?.id;
 
+      expect(resourceId).toMatch(/^res_/);
+      expect(mediaPart).not.toHaveProperty("url");
       expect(session.messages).toEqual([
         expect.objectContaining({
           role: "user",
@@ -755,9 +864,29 @@ describe("AgentMessageCoordinator", () => {
             { type: "text", value: "图片已生成。" },
             expect.objectContaining({
               type: "media",
-              url: "https://example.com/pig.png"
+              extra: expect.objectContaining({
+                resource: { id: resourceId },
+                tool: expect.objectContaining({
+                  name: "generate_image",
+                  toolCallId: "call_image",
+                  toolCallRowId: expect.stringMatching(/^tool_call_/),
+                  outputIndex: 0
+                })
+              })
             })
           ]
+        })
+      ]);
+      expect(session.resources).toEqual([
+        expect.objectContaining({
+          id: resourceId,
+          messageId: started.assistantMessage.id,
+          toolCallId: "call_image",
+          type: "image",
+          mime: "image/png",
+          status: "succeeded",
+          url: "https://example.com/pig.png",
+          metadata: { prompt: "小猪", provider: "test_image" }
         })
       ]);
     } finally {
@@ -765,7 +894,101 @@ describe("AgentMessageCoordinator", () => {
     }
   });
 
-  it("流式回答会更新 assistant message 的 text part 并发出 part delta 事件", async () => {
+  it("图片编辑工具结果也写入资源表，并让 assistant media part 引用资源", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "edit_image",
+      description: "编辑图片",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string" },
+          imageUrl: { type: "string" }
+        },
+        required: ["prompt", "imageUrl"]
+      },
+      argumentSchema: z.object({
+        prompt: z.string(),
+        imageUrl: z.string().url()
+      }),
+      execute: ({ prompt, imageUrl }) => ({
+        provider: "test_seededit",
+        prompt,
+        imageUrl,
+        imageUrls: ["https://example.com/edited-pig.png"]
+      })
+    });
+    let callCount = 0;
+    const provider: LlmProvider = {
+      complete: async () => {
+        callCount += 1;
+
+        if (callCount === 1) {
+          return {
+            toolCalls: [
+              {
+                id: "call_edit_image",
+                name: "edit_image",
+                arguments: {
+                  prompt: "把小猪改成水彩风格",
+                  imageUrl: "https://cdn.example.com/source-pig.png"
+                }
+              }
+            ]
+          };
+        }
+
+        return { content: "图片已编辑完成。" };
+      }
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+
+    try {
+      const started = await coordinator.startMessage({ input: "把这张小猪图改成水彩风格" });
+
+      await waitForMessage(coordinator, started.assistantMessage.id);
+      const session = coordinator.getSession(started.session.id);
+      const assistant = session.messages.find((message) => message.id === started.assistantMessage.id);
+      const mediaPart = assistant?.parts.find((part) => part.type === "media");
+      const resourceId = mediaPart?.extra?.resource?.id;
+
+      expect(resourceId).toMatch(/^res_/);
+      expect(mediaPart).not.toHaveProperty("url");
+      expect(mediaPart).toMatchObject({
+        type: "media",
+        extra: {
+          resource: { id: resourceId },
+          tool: {
+            name: "edit_image",
+            toolCallId: "call_edit_image",
+            toolCallRowId: expect.stringMatching(/^tool_call_/),
+            outputIndex: 0
+          }
+        }
+      });
+      expect(session.resources).toEqual([
+        expect.objectContaining({
+          id: resourceId,
+          messageId: started.assistantMessage.id,
+          toolCallId: "call_edit_image",
+          type: "image",
+          mime: "image/png",
+          status: "succeeded",
+          url: "https://example.com/edited-pig.png",
+          metadata: {
+            prompt: "把小猪改成水彩风格",
+            provider: "test_seededit",
+            sourceImageUrl: "https://cdn.example.com/source-pig.png"
+          }
+        })
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("流式回答会更新 assistant message 的 text part，但不把 part delta 写入事件表", async () => {
     const registry = new ToolRegistry();
     const provider: LlmProvider = {
       complete: async () => {
@@ -791,16 +1014,53 @@ describe("AgentMessageCoordinator", () => {
         events
           .map((event) => event.event)
           .filter((event) => event.type === "message.part.delta")
-      ).toEqual([
-        { type: "message.part.delta", messageId: started.assistantMessage.id, partIndex: 0, delta: "你好" },
-        { type: "message.part.delta", messageId: started.assistantMessage.id, partIndex: 0, delta: "世界" }
-      ]);
+      ).toEqual([]);
     } finally {
       store.close();
     }
   });
 
-  it("图片工具结果会写入 assistant message 的 media parts", async () => {
+  it("运行中 snapshot 使用 running draft，持久化 message 完成后才写最终 parts", async () => {
+    const registry = new ToolRegistry();
+    const firstDeltaReceived = createDeferred<void>();
+    const allowFinish = createDeferred<void>();
+    const provider: LlmProvider = {
+      complete: async () => {
+        throw new Error("streaming path should be used");
+      },
+      completeStream: async (_request, onDelta) => {
+        await onDelta("正在生成");
+        firstDeltaReceived.resolve();
+        await allowFinish.promise;
+        await onDelta("完成");
+        return { content: "正在生成完成" };
+      }
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+
+    try {
+      const started = await coordinator.startMessage({ input: "写一段话" });
+
+      await firstDeltaReceived.promise;
+
+      expect(store.getMessage(started.assistantMessage.id)?.parts).toEqual([{ type: "text", value: "" }]);
+
+      const runningSnapshot = await coordinator.getMessageSnapshot(started.assistantMessage.id);
+      expect(runningSnapshot).toMatchObject({ version: 1 });
+      expect(runningSnapshot.message.parts).toEqual([{ type: "text", value: "正在生成" }]);
+
+      allowFinish.resolve();
+      await waitForMessage(coordinator, started.assistantMessage.id);
+
+      expect(store.getMessage(started.assistantMessage.id)?.parts).toEqual([{ type: "text", value: "正在生成完成" }]);
+    } finally {
+      allowFinish.resolve();
+      store.close();
+    }
+  });
+
+  it("图片工具结果会发出资源事件并保留消息 part 引用", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "generate_image",
@@ -849,22 +1109,169 @@ describe("AgentMessageCoordinator", () => {
 
       await waitForMessage(coordinator, started.assistantMessage.id);
       const { message, events } = coordinator.getMessage(started.assistantMessage.id);
+      const mediaPart = message.parts.find((part) => part.type === "media");
+      const resourceId = mediaPart?.extra?.resource?.id;
 
+      expect(resourceId).toMatch(/^res_/);
+      expect(mediaPart).not.toHaveProperty("url");
       expect(message.parts).toEqual([
         { type: "text", value: "图片已生成。" },
         expect.objectContaining({
           type: "media",
-          mime: "image/png",
-          url: "https://example.com/pig.png",
           extra: expect.objectContaining({
-            lifecycle: { state: "succeeded" },
-            tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 0 },
-            generation: { prompt: "小猪", provider: "test_image" }
+            resource: { id: resourceId },
+            tool: {
+              name: "generate_image",
+              toolCallId: "call_image",
+              toolCallRowId: expect.stringMatching(/^tool_call_/),
+              outputIndex: 0
+            }
           })
         })
       ]);
       expect(events.map((event) => event.event.type)).toContain("message.part.created");
       expect(events.map((event) => event.event.type)).toContain("message.part.updated");
+      expect(events.map((event) => event.event.type)).toContain("resource.created");
+      expect(events.map((event) => event.event.type)).toContain("resource.updated");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("批量图片部分失败后重试时保留用户请求的图片顺序", async () => {
+    const registry = new ToolRegistry();
+    let executeCount = 0;
+
+    registry.register({
+      name: "generate_image",
+      description: "生成图片",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string" },
+          items: { type: "array" }
+        }
+      },
+      argumentSchema: z.object({
+        prompt: z.string().optional(),
+        items: z
+          .array(
+            z.object({
+              prompt: z.string(),
+              width: z.number().optional(),
+              height: z.number().optional()
+            })
+          )
+          .optional()
+      }),
+      execute: () => {
+        executeCount += 1;
+
+        if (executeCount === 1) {
+          return {
+            provider: "test_image",
+            status: "partial_failed",
+            total: 2,
+            succeeded: 1,
+            failed: 1,
+            imageUrls: ["https://example.com/dog.png"],
+            items: [
+              {
+                index: 0,
+                status: "failed",
+                prompt: "宝宝",
+                error: "并发限制"
+              },
+              {
+                index: 1,
+                status: "success",
+                prompt: "狗狗",
+                imageUrls: ["https://example.com/dog.png"]
+              }
+            ]
+          };
+        }
+
+        return {
+          provider: "test_image",
+          status: "done",
+          prompt: "宝宝",
+          imageUrls: ["https://example.com/baby.png"]
+        };
+      }
+    });
+
+    let callCount = 0;
+    const provider: LlmProvider = {
+      complete: async () => {
+        callCount += 1;
+
+        if (callCount === 1) {
+          return {
+            toolCalls: [
+              {
+                id: "call_batch",
+                name: "generate_image",
+                arguments: {
+                  items: [
+                    { prompt: "宝宝", width: 1328, height: 1328 },
+                    { prompt: "狗狗", width: 1328, height: 1328 }
+                  ]
+                }
+              }
+            ]
+          };
+        }
+
+        if (callCount === 2) {
+          return {
+            toolCalls: [
+              {
+                id: "call_retry_baby",
+                name: "generate_image",
+                arguments: { prompt: "宝宝", width: 1328, height: 1328 }
+              }
+            ]
+          };
+        }
+
+        return { content: "两张图片已生成。" };
+      }
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+
+    try {
+      const started = await coordinator.startMessage({ input: "分别生成宝宝和狗狗图片" });
+
+      await waitForMessage(coordinator, started.assistantMessage.id);
+      const session = coordinator.getSession(started.session.id);
+      const assistant = session.messages.find((message) => message.id === started.assistantMessage.id);
+      const mediaParts = assistant?.parts.filter((part) => part.type === "media") ?? [];
+      const resourcesById = new Map(session.resources.map((resource) => [resource.id, resource]));
+      const events = coordinator.getMessage(started.assistantMessage.id).events.map((event) => event.event);
+      const mediaCreatedEvents = events.filter((event) => event.type === "message.part.created");
+      const retryMediaUpdateEvent = events.find(
+        (event) =>
+          event.type === "message.part.updated" &&
+          event.part.type === "media" &&
+          event.part.extra?.tool?.toolCallId === "call_retry_baby"
+      );
+
+      expect(mediaParts).toHaveLength(2);
+      expect(mediaParts.map((part) => resourcesById.get(part.extra?.resource?.id ?? "")?.metadata?.prompt)).toEqual([
+        "宝宝",
+        "狗狗"
+      ]);
+      expect(mediaParts.map((part) => resourcesById.get(part.extra?.resource?.id ?? "")?.url)).toEqual([
+        "https://example.com/baby.png",
+        "https://example.com/dog.png"
+      ]);
+      expect(mediaCreatedEvents).toHaveLength(2);
+      expect(retryMediaUpdateEvent).toMatchObject({
+        type: "message.part.updated",
+        partIndex: 1
+      });
     } finally {
       store.close();
     }

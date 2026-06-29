@@ -1,6 +1,6 @@
 # facai-agent
 
-一个基于 Node.js Fastify 和 React 的工具调用型 Agent Demo。
+一个基于 Node.js Fastify 和 React 的工具调用型 Agent 本地开发版。当前默认使用 SQLite 和内存运行态，也可以通过配置切到 Redis 保存运行中 draft；架构边界按后续替换 MySQL / Redis 的产品化方向设计。
 
 ## 结构
 
@@ -19,15 +19,25 @@
 - `AGENT_SUMMARY_KEEP_RECENT_MESSAGES`：生成摘要后仍保留的最近原文消息数，默认 `8`
 - `AGENT_SUMMARY_TRIGGER_CHARS`：待压缩旧消息的有效文本量达到该字符数才真正压缩，默认 `2000`；设为 `0` 表示只按消息条数判断
 - `AGENT_TOOL_TIMEOUT_MS`：工具调用超时时间，默认 `10000`
+- `AGENT_EVENT_RETENTION_DAYS`：事件时间线保留天数，默认 `3`
+- `AGENT_EVENT_CLEANUP_HOUR`：每天几点清理过期事件，使用服务本地时区，默认 `3`
+- `AGENT_EVENT_CLEANUP_BATCH_SIZE`：每轮每张事件表最多删除多少条，默认 `2000`
+- `AGENT_EVENT_CLEANUP_MAX_BATCHES`：每次清理最多执行多少轮，默认 `20`
+- `AGENT_RUNNING_STATE_STORE`：运行中消息 draft 存储，`memory` 或 `redis`，默认 `memory`
+- `REDIS_URL`：Redis 连接地址，仅 `AGENT_RUNNING_STATE_STORE=redis` 时使用，默认 `redis://localhost:6379`
+- `AGENT_RUNNING_STATE_TTL_SECONDS`：运行中 draft 的 Redis TTL，默认 `7200`
+- `AGENT_RUNNING_STATE_REDIS_KEY_PREFIX`：运行中 draft 的 Redis key 前缀，默认 `agent`
 - `AGENT_ALLOWED_TOOLS`：允许暴露和执行的工具名，逗号分隔；留空表示允许全部已注册工具
 - `TAVILY_API_KEY`：Tavily Search API Key；配置后会启用 `web_search` 工具
 - `SEARCH_MAX_RESULTS`：默认搜索结果数量，默认 `5`，范围 `1-10`
-- `VOLCENGINE_ACCESS_KEY_ID`：火山引擎 Access Key ID；和 SK 同时配置后会启用 `generate_image`
+- `VOLCENGINE_ACCESS_KEY_ID`：火山引擎 Access Key ID；和 SK 同时配置后会启用 `generate_image` 和 `edit_image`
 - `VOLCENGINE_SECRET_ACCESS_KEY`：火山引擎 Secret Access Key；只放在本地 `.env`，不要提交
 - `VOLCENGINE_IMAGE_ENDPOINT`：火山视觉 OpenAPI 地址，默认 `https://visual.volcengineapi.com`
 - `VOLCENGINE_IMAGE_REGION`：签名 Region，默认 `cn-north-1`
 - `VOLCENGINE_IMAGE_SERVICE`：签名 Service，默认 `cv`
 - `VOLCENGINE_IMAGE_REQ_KEY`：Seedream 通用3.0 文生图服务标识，默认 `high_aes_general_v30l_zt2i`
+- `VOLCENGINE_IMAGE_EDIT_VERSION`：SeedEdit3.0 OpenAPI 版本，默认 `2022-08-31`
+- `VOLCENGINE_IMAGE_EDIT_REQ_KEY`：SeedEdit3.0 图像编辑服务标识，默认 `seededit_v3.0`
 - `VOLCENGINE_IMAGE_POLL_INTERVAL_MS`：轮询间隔，默认 `1500`
 - `VOLCENGINE_IMAGE_MAX_POLL_ATTEMPTS`：最大轮询次数，默认 `40`
 - `VOLCENGINE_IMAGE_TOOL_TIMEOUT_MS`：生图工具独立超时时间，默认 `90000`
@@ -65,6 +75,8 @@ npm run dev:web
 - API: `http://localhost:4001`
 - Web: `http://localhost:4000`
 
+如果用局域网 IP 访问 Web，例如 `http://10.1.65.46:4000`，前端会自动把 API 推导为 `http://10.1.65.46:4001`。`VITE_API_BASE_URL` 留空即可自动推导；后端默认允许 `localhost`、`127.0.0.1` 和局域网 IP 的 Origin，方便本地联调。只有部署到独立 API 域名时才需要显式配置 `VITE_API_BASE_URL`，同时用 `CORS_ORIGINS=https://your-web.example.com` 收紧后端 CORS 白名单。
+
 ## 开发约定
 
 - 每次做结构性改造时，都要给核心代码补充“阅读理解型”注释。
@@ -75,9 +87,27 @@ npm run dev:web
 
 ## 演进路线 / TODO
 
-当前项目已经具备 Agent Demo 的基础能力：Fastify API、React 工作台、SSE 流式事件、session/message、SQLite 持久化、事件压缩、断线恢复和上下文续聊。后续建议按下面顺序演进，优先把 Agent Runtime 的核心能力打稳。
+当前项目已经具备 Agent 本地开发版的基础能力：Fastify API、React 工作台、SSE 流式事件、session/message、SQLite 持久化、运行中 draft、资源表、工具调用表、事件压缩、断线恢复和上下文续聊。后续建议按产品化顺序演进，优先把 Agent Runtime、数据层和资源体系打稳。
 
-### 1. 工具系统升级
+### 1. Agent Runtime 稳定化
+
+目标：让一次 assistant message / run 的生命周期稳定可恢复，适合后续多实例部署。
+
+- [x] 支持取消生成：`POST /agents/messages/:messageId/cancel`。
+- [x] 后端引入 `AbortController`，让 LLM 请求和工具执行都能响应取消。
+- [x] 运行中刷新页面后自动恢复订阅，并先返回 `message.snapshot`。
+- [x] 抽出 `RunningMessageStateStore`，运行中 full draft 不再每个 delta 写入持久化 message。
+- [x] 实现 `RedisRunningMessageStateStore`，用 Redis 保存运行中 full draft。
+- [x] Redis append / setParts 使用 Lua 脚本原子更新 version、updatedAt 和 TTL。
+- [x] 给 snapshot / delta 增加 version，前端可判断乱序或重复事件。
+- [x] 收紧 run/message 状态机，明确 running、completed、failed、cancelled 的合法流转。
+- [ ] 支持重试生成：`POST /agents/messages/:messageId/retry`。
+- [ ] 支持重新生成当前 assistant message 的回答。
+- [ ] 支持删除 session 和 message。
+
+为什么先做它：Agent 产品最核心的是“生成中不断、刷新不丢、失败可解释、用户可控制”。运行态和状态机稳定后，接工具、资源、RAG、队列都会更稳。
+
+### 2. 工具系统升级
 
 目标：让工具调用从 demo 能力升级成稳定、可扩展、可观测的执行平台。
 
@@ -85,62 +115,33 @@ npm run dev:web
 - [x] 给 Tool 参数增加统一校验，避免非法参数进入工具内部。
 - [x] 给 Tool 执行增加超时控制，防止某个工具长期挂起。
 - [x] 统一 Tool 成功/失败返回格式，例如 `ok`、`data`、`error`、`durationMs`。
-- [ ] 记录 Tool 调用日志，方便排查 Agent 为什么这么做。
+- [x] 记录 Tool 调用日志，方便排查 Agent 为什么这么做。
 - [x] 增加 Tool 权限控制，为后续文件、网络、数据库类工具做准备。
 - [x] 拆分 Tool 完整结果和 LLM 观察文本，避免大结果直接塞进模型上下文。
 - [x] 前端更清晰地展示工具调用参数、结果、耗时和错误。
+- [ ] 增加工具成本统计，例如模型、供应商、耗时、token / 图片张数、估算费用。
+- [ ] 增加工具级重试策略，只对幂等且安全的工具开放。
+- [ ] 增加工具执行前确认机制，文件写入、数据库修改等高风险工具必须二次确认。
 
-为什么先做它：Agent 的核心价值不只是聊天，而是能可靠地调用工具完成任务。工具层如果不先规范，后面接文件、网页搜索、RAG、数据库查询时，`AgentService` 会越来越难维护。
+为什么做它：Agent 的核心价值不只是聊天，而是能可靠地调用工具完成任务。工具层如果不先规范，后面接文件、网页搜索、RAG、数据库查询时，`AgentService` 会越来越难维护。
 
-当前实现背景：
+### 3. 数据层产品化
 
-- `ToolRegistry` 只做工具目录，负责注册、查找、暴露工具定义。
-- `ToolExecutor` 负责运行时治理，包括参数校验、权限检查、超时控制、错误包装和耗时记录。
-- `ToolAccessPolicy` 负责工具 allow-list；`AgentService` 用它过滤 LLM 可见工具，`ToolExecutor` 用它兜底阻止越权执行。
-- `ToolOutput.data` 保存完整结构化结果，给前端展示、事件持久化和后续审计使用；`ToolOutput.llmContent` 是工具主动整理出的精简文本，专门作为 `role=tool` 消息回灌给 LLM。
-- Web 侧用 `buildToolTraces` 把工具事件聚合成调用轨迹，再按工具类型展示搜索来源、图片预览或通用 JSON，避免用户只能看 raw event。
-- 可恢复工具错误会走双通道：`tool_error` 事件给前端做结构化 UI，`role=tool` 错误观察结果回灌给 LLM 生成自然语言回复。
-- `web_search` 使用 Tavily Search API 提供通用互联网搜索能力；没有配置 `TAVILY_API_KEY` 时不会注册该工具。
-- `generate_image` 使用火山视觉 OpenAPI 的 Seedream 通用3.0 文生图接口；没有同时配置 `VOLCENGINE_ACCESS_KEY_ID` 和 `VOLCENGINE_SECRET_ACCESS_KEY` 时不会注册该工具。
-- 选择 allow-list 是为了后续接入文件、网络、数据库等高风险工具时，可以用最小权限方式逐步开放能力。
+目标：从本地 SQLite 开发存储升级为可迁移、可审计、可扩展的数据模型。
 
-Tavily 搜索流程：
+- [x] 用 `AgentStore` 隔离业务层和具体数据库实现。
+- [x] message 使用 `parts` 保存结构化内容，支持文本、图片和后续附件。
+- [x] 增加 `agent_tool_calls`，支持按工具调用做审计和聚合查询。
+- [x] 增加 `agent_resources`，资源独立成表，message part 只引用 `resourceId`。
+- [x] event 表增加 `expires_at`，默认保留 3 天，并按批清理。
+- [ ] 设计 MySQL / PostgreSQL schema 和 migration 方案。
+- [ ] 增加数据库连接池、事务边界和索引设计。
+- [ ] 将 event 清理迁移为产品级后台 job，避免和 API 请求争抢资源。
+- [ ] 增加用户 / 租户字段，为后续多用户隔离做准备。
 
-```txt
-用户提出需要实时信息的问题
-  -> LLM 看到 web_search 工具并决定搜索 query
-  -> ToolExecutor 校验参数、套用超时、执行 Tavily 请求
-  -> web_search 返回 ToolOutput：data 是完整搜索结构，llmContent 是精简搜索摘要
-  -> AgentService 把 data 发成 tool_result 事件，把 llmContent 作为 role=tool 写回上下文
-  -> LLM 基于搜索结果生成中文回答，并尽量附来源链接
-```
+为什么做它：SQLite 适合本地开发，但产品化需要连接池、迁移、索引、事务和数据隔离。当前接口已经在往可替换数据库实现的方向靠。
 
-Seedream 通用3.0 生图流程：
-
-```txt
-用户提出画图或生成图片需求
-  -> LLM 看到 generate_image 工具并整理 prompt、尺寸等参数
-  -> ToolExecutor 校验参数、套用生图工具独立超时
-  -> generate_image 使用 AK/SK 生成 HMAC-SHA256 签名并提交 CVSync2AsyncSubmitTask
-  -> 拿到 task_id 后轮询 CVSync2AsyncGetResult
-  -> 工具返回图片 URL、taskId 和精简 llmContent
-  -> AgentService 发出 tool_result，并让 LLM 把图片链接整理成最终中文回复
-```
-
-### 2. Message 生命周期补完整
-
-目标：让用户能控制一次 assistant message 的生成，而不是只能等待它自然结束。
-
-- [x] 支持取消生成：`POST /agents/messages/:messageId/cancel`。
-- [ ] 支持重试生成：`POST /agents/messages/:messageId/retry`。
-- [ ] 支持重新生成当前 assistant message 的回答。
-- [ ] 支持运行中刷新页面后自动恢复订阅。
-- [ ] 支持查看、删除 session 和 message。
-- [ ] 后端引入 `AbortController`，让 LLM 请求和工具执行都能响应取消。
-
-为什么做它：真实 LLM 请求和工具调用都可能耗时较久，用户需要停止、重试、恢复这些基本控制能力。
-
-### 3. 上下文管理
+### 4. 上下文管理
 
 目标：从“把所有历史都喂给模型”升级为可控的上下文构建策略。
 
@@ -154,26 +155,31 @@ Seedream 通用3.0 生图流程：
 - [ ] 增加 token 预算，避免上下文无限增长。
 - [ ] 支持重要事实记忆，保存用户偏好、项目背景等长期信息。
 - [ ] 对工具结果做摘要，避免大结果反复进入上下文。
+- [ ] 根据当前任务检索相关资源和历史事实，而不是只按时间窗口取上下文。
 
 为什么做它：如果同一个 session 下的历史 message 全部进入新 message 上下文，短期简单有效，长期会带来 token 成本、上下文窗口和旧信息干扰问题。
 
-当前实现背景：
+### 5. 资源和附件系统
 
-- `AgentMessageCoordinator` 只决定“新 message 需要同 session 历史”，并按摘要 cursor 只读取需要进入上下文的最近消息。
-- `AgentContextBuilder` 负责筛选可进入上下文的 message、按时间排序、按最近条数和字符预算裁剪，并把结构化摘要渲染成 system message。
-- `AgentSummaryService` 在 assistant message 完成后按阈值刷新结构化摘要；未超过阈值时只做 count，不读取全量 messages。
-- `GET /agents/sessions/:sessionId` 默认只返回最近一页消息和 `pageInfo`；`GET /agents/sessions/:sessionId/messages?before=...&limit=...` 用于向前分页加载历史消息。
-- completed message 会进入上下文为原始消息内容；failed message 会进入上下文为简短失败摘要；cancelled message 会进入上下文为被用户中断摘要。
-- running message 不进入上下文，避免把尚未完成的并发状态喂给新 message。
-- 最近一轮历史即使超过字符预算也会保留，避免用户刚问过的关键上下文突然消失。
-- 目前字符预算是轻量 guardrail，不是严格 tokenizer；后续可以在这个抽象内升级为真实 token 预算或摘要策略。
+目标：让图片、文件、链接等资源成为一等对象，而不是散落在 Markdown 或工具结果里。
 
-### 4. 真实业务能力
+- [x] 图片生成结果写入 `agent_resources`。
+- [x] assistant message 的 media part 通过 `resourceId` 引用资源。
+- [x] 前端图片预览支持资源交互。
+- [ ] 支持用户上传文件和图片。
+- [ ] 支持资源引用，例如“用这张图继续生成”。
+- [ ] 接入对象存储，避免长期依赖供应商临时 URL。
+- [ ] 增加资源库视图，按 session、类型、工具、时间筛选资源。
+
+为什么做它：资源是 Agent 产品从聊天走向创作和工作流的关键。资源独立后，工具调用、上下文引用、审计和 UI 交互都会更清晰。
+
+### 6. 真实业务能力
 
 目标：在稳定 Runtime 上接入更有用的 Agent 能力。
 
 - [ ] 文件上传和文档问答。
 - [x] 网页搜索工具。
+- [x] 图片生成工具。
 - [ ] 数据库查询工具。
 - [ ] 本地知识库 RAG。
 - [ ] 多步骤任务计划。
@@ -181,16 +187,43 @@ Seedream 通用3.0 生图流程：
 
 为什么稍后做它：这些能力很诱人，但都依赖工具治理、持久化、事件追踪和上下文策略。先打地基，再扩业务能力，后面会更稳。
 
-### 5. 评测与回放
+### 7. Worker 和队列
 
-目标：让 Agent 行为可以复盘、比较和持续优化。
+目标：把长时间运行的 Agent 任务从 API 进程里拆出来，支持更可靠的并发和扩容。
 
-- [ ] 保存完整 message 输入、事件、工具调用和最终答案。
-- [ ] 支持按 message 回放事件流。
+- [ ] 引入 job 队列，例如 BullMQ。
+- [ ] API 只负责创建 run/message 和投递任务。
+- [ ] Worker 负责 LLM 调用、工具执行、running draft 更新和最终落库。
+- [ ] 增加任务重试、超时、并发限制和 worker 心跳。
+- [ ] SSE gateway 从 running state / pubsub 获取运行状态。
+
+为什么做它：真实 Agent 任务可能很长，API 进程不适合长期承载所有执行逻辑。队列化后才能更稳地扩容和恢复。
+
+### 8. 评测与观测
+
+目标：让 Agent 行为可以排查、比较和持续优化。
+
+- [x] 保存 message 输入、关键事件、工具调用、资源和最终答案。
+- [x] 事件时间线作为短期排查日志，默认保留 3 天。
 - [ ] 增加固定样例集，用来比较不同模型、prompt 和工具策略。
 - [ ] 记录失败原因分类，帮助发现系统性问题。
+- [ ] 增加模型调用成本和工具调用成本统计。
+- [ ] 增加 traceId / requestId，让一次 run 可以串起 API、LLM、工具和存储日志。
 
-为什么做它：Agent 系统很容易“看起来能跑，但不知道为什么好或坏”。评测和回放能让优化变得可验证。
+注意：当前产品方向不做完整 delta 回放。实时恢复依赖 `message.snapshot` + running draft；event 表只做短期观测和排查，不作为用户界面恢复源。
+
+### 9. 用户、权限和产品 UI
+
+目标：从单机本地工作台升级为多用户可用的产品形态。
+
+- [ ] 登录和用户体系。
+- [ ] session、message、resource 按 user / tenant 隔离。
+- [ ] 工具权限按用户或团队配置。
+- [ ] API rate limit 和用量额度。
+- [ ] 普通用户模式隐藏 raw event，开发者模式显示事件时间线和原始事件。
+- [ ] 增加设置页，管理模型、工具、密钥和资源策略。
+
+为什么做它：本地 Demo 可以默认信任所有操作，产品化必须考虑身份、权限、限流、用量、密钥和不同用户的 UI 复杂度。
 
 ## 测试
 

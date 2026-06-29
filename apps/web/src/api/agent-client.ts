@@ -17,9 +17,13 @@ export interface AgentSessionSummary {
 }
 
 export interface AgentSessionSummaryRecord {
+  id: string;
   sessionId: string;
+  version: number;
   summary: AgentSessionSummary;
   coveredMessageId: string;
+  coveredMessageCreatedAt: string;
+  sourceSummaryId?: string;
   schemaVersion: number;
   createdAt: string;
   updatedAt: string;
@@ -43,7 +47,11 @@ export interface PartExtra {
   tool?: {
     name: string;
     toolCallId: string;
+    toolCallRowId?: string;
     outputIndex?: number;
+  };
+  resource?: {
+    id: string;
   };
   generation?: {
     prompt?: string;
@@ -61,9 +69,10 @@ export interface TextPart {
 
 export interface MediaPart {
   type: "media";
-  mime: string;
-  url: string;
+  mime?: string;
+  url?: string;
   name?: string;
+  size?: number;
   width?: number;
   height?: number;
   extra?: PartExtra;
@@ -104,6 +113,24 @@ export interface AgentRunRecord {
   completedAt?: string;
 }
 
+export interface AgentResourceRecord {
+  id: string;
+  sessionId: string;
+  messageId: string;
+  toolCallRowId?: string;
+  toolCallId?: string;
+  type: string;
+  mime?: string;
+  url?: string;
+  name?: string;
+  status: "pending" | "succeeded" | "failed";
+  width?: number;
+  height?: number;
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface AgentMessagePageInfo {
   hasMore: boolean;
   oldestCursor?: string;
@@ -125,9 +152,12 @@ export type AgentStreamEvent =
   | { type: "llm_start"; iteration: number }
   | { type: "session.message.created"; message: AgentMessageRecord }
   | { type: "session.message.updated"; message: AgentMessageRecord }
-  | { type: "message.part.created"; messageId: string; partIndex: number; part: MessagePart }
-  | { type: "message.part.delta"; messageId: string; partIndex: number; delta: string }
-  | { type: "message.part.updated"; messageId: string; partIndex: number; part: MessagePart }
+  | { type: "message.snapshot"; message: AgentMessageRecord; resources: AgentResourceRecord[]; version?: number }
+  | { type: "message.part.created"; messageId: string; partIndex: number; part: MessagePart; version?: number }
+  | { type: "message.part.delta"; messageId: string; partIndex: number; delta: string; version?: number }
+  | { type: "message.part.updated"; messageId: string; partIndex: number; part: MessagePart; version?: number }
+  | { type: "resource.created"; resource: AgentResourceRecord }
+  | { type: "resource.updated"; resource: AgentResourceRecord }
   | {
       type: "summary_start";
       sessionId: string;
@@ -179,6 +209,7 @@ export interface StoredAgentEvent {
   runId?: string;
   event: AgentStreamEvent;
   createdAt: string;
+  transient?: boolean;
 }
 
 export interface StartAgentMessageResponse {
@@ -193,15 +224,23 @@ export interface StartAgentRunResponse {
   userMessage: AgentMessageRecord;
 }
 
+export interface RegenerateAgentMessageResponse {
+  run: AgentRunRecord;
+  session: AgentSessionRecord;
+  userMessage: AgentMessageRecord;
+}
+
 export interface AgentSessionResponse {
   session: AgentSessionRecord;
   messages: AgentMessageRecord[];
+  resources?: AgentResourceRecord[];
   pageInfo?: AgentMessagePageInfo;
   summary?: AgentSessionSummaryRecord;
 }
 
 export interface AgentSessionMessagesResponse {
   messages: AgentMessageRecord[];
+  resources?: AgentResourceRecord[];
   pageInfo: AgentMessagePageInfo;
 }
 
@@ -211,7 +250,9 @@ export interface AgentSessionsResponse {
 
 export interface AgentMessageDetailResponse {
   message: AgentMessageRecord;
+  resources?: AgentResourceRecord[];
   events: StoredAgentEvent[];
+  version?: number;
 }
 
 export interface AgentRunDetailResponse {
@@ -227,6 +268,10 @@ export interface CancelAgentRunResponse {
   run: AgentRunRecord;
 }
 
+export interface UploadAgentImageResponse {
+  file: MediaPart;
+}
+
 export interface ApiErrorResponse {
   error: {
     code: string;
@@ -234,7 +279,42 @@ export interface ApiErrorResponse {
   };
 }
 
-const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:4001";
+const defaultApiPort = "4001";
+
+export function resolveApiBaseUrl(configuredBaseUrl?: string, pageHref = window.location.href): string {
+  const pageUrl = new URL(pageHref);
+  const configured = configuredBaseUrl?.trim();
+
+  if (!configured) {
+    return `${pageUrl.protocol}//${pageUrl.hostname}:${defaultApiPort}`;
+  }
+
+  if (configured.startsWith("/")) {
+    return trimTrailingSlash(configured);
+  }
+
+  try {
+    const configuredUrl = new URL(configured);
+
+    if (isLoopbackHost(configuredUrl.hostname) && !isLoopbackHost(pageUrl.hostname)) {
+      configuredUrl.hostname = pageUrl.hostname;
+    }
+
+    return trimTrailingSlash(configuredUrl.toString());
+  } catch {
+    return trimTrailingSlash(configured);
+  }
+}
+
+function isLoopbackHost(hostname: string) {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+}
+
+function trimTrailingSlash(value: string) {
+  return value.replace(/\/$/, "");
+}
+
+export const apiBaseUrl = resolveApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
 
 function parseSseBlock<T>(block: string): T | null {
   const dataLine = block
@@ -251,10 +331,9 @@ function parseSseBlock<T>(block: string): T | null {
 
 export async function startAgentMessage(
   input: string | MessagePart[],
-  maxIterations: number,
   sessionId?: string
 ): Promise<StartAgentMessageResponse> {
-  const requestPayload = Array.isArray(input) ? { parts: input, maxIterations, sessionId } : { input, maxIterations, sessionId };
+  const requestPayload = Array.isArray(input) ? { parts: input, sessionId } : { input, sessionId };
   const response = await fetch(`${apiBaseUrl}/agents/messages`, {
     method: "POST",
     headers: {
@@ -275,10 +354,9 @@ export async function startAgentMessage(
 
 export async function startAgentRun(
   input: string | MessagePart[],
-  maxIterations: number,
   sessionId?: string
 ): Promise<StartAgentRunResponse> {
-  const requestPayload = Array.isArray(input) ? { parts: input, maxIterations, sessionId } : { input, maxIterations, sessionId };
+  const requestPayload = Array.isArray(input) ? { parts: input, sessionId } : { input, sessionId };
   const response = await fetch(`${apiBaseUrl}/agents/runs`, {
     method: "POST",
     headers: {
@@ -295,6 +373,20 @@ export async function startAgentRun(
   }
 
   return payload as StartAgentRunResponse;
+}
+
+export async function regenerateAgentMessage(messageId: string): Promise<RegenerateAgentMessageResponse> {
+  const response = await fetch(`${apiBaseUrl}/agents/messages/${messageId}/regenerate`, {
+    method: "POST"
+  });
+  const payload = (await response.json()) as RegenerateAgentMessageResponse | ApiErrorResponse;
+
+  if (!response.ok) {
+    const errorPayload = payload as ApiErrorResponse;
+    throw new Error(`${errorPayload.error.code}: ${errorPayload.error.message}`);
+  }
+
+  return payload as RegenerateAgentMessageResponse;
 }
 
 export async function getAgentSession(sessionId: string): Promise<AgentSessionResponse> {
@@ -397,6 +489,24 @@ export async function cancelAgentRun(runId: string): Promise<CancelAgentRunRespo
   }
 
   return payload as CancelAgentRunResponse;
+}
+
+export async function uploadAgentImage(file: File): Promise<MediaPart> {
+  const body = new FormData();
+  body.append("image", file);
+
+  const response = await fetch(`${apiBaseUrl}/agents/uploads/images`, {
+    method: "POST",
+    body
+  });
+  const payload = (await response.json()) as UploadAgentImageResponse | ApiErrorResponse;
+
+  if (!response.ok) {
+    const errorPayload = payload as ApiErrorResponse;
+    throw new Error(`${errorPayload.error.code}: ${errorPayload.error.message}`);
+  }
+
+  return (payload as UploadAgentImageResponse).file;
 }
 
 export async function streamAgentMessageEvents(

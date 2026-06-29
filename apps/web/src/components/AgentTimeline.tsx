@@ -7,8 +7,13 @@ interface AgentTimelineProps {
 }
 
 type TimelineEvent = AgentStreamEvent;
+type VisibleTimelineEvent = Exclude<AgentStreamEvent, { type: "message.snapshot" }>;
 
-function getEventTitle(event: TimelineEvent): string {
+function isVisibleTimelineEvent(event: TimelineEvent): event is VisibleTimelineEvent {
+  return event.type !== "message.snapshot";
+}
+
+function getEventTitle(event: VisibleTimelineEvent): string {
   switch (event.type) {
     case "iteration_start":
       return `第 ${event.iteration + 1} 轮开始`;
@@ -28,6 +33,10 @@ function getEventTitle(event: TimelineEvent): string {
       return "消息片段增量";
     case "message.part.updated":
       return "消息片段已更新";
+    case "resource.created":
+      return "资源已创建";
+    case "resource.updated":
+      return "资源已更新";
     case "summary_start":
       return "开始压缩上下文";
     case "summary_completed":
@@ -59,7 +68,7 @@ function getEventTitle(event: TimelineEvent): string {
   }
 }
 
-function getEventSummary(event: TimelineEvent): string {
+function getEventSummary(event: VisibleTimelineEvent): string {
   switch (event.type) {
     case "answer_delta":
       return event.delta;
@@ -71,6 +80,9 @@ function getEventSummary(event: TimelineEvent): string {
     case "session.message.created":
     case "session.message.updated":
       return `${event.message.role} · ${event.message.status}`;
+    case "resource.created":
+    case "resource.updated":
+      return `${event.resource.type} · ${event.resource.status}`;
     case "summary_start":
       return `待整理 ${event.uncoveredMessageCount} 条，压缩 ${event.summarizedMessageCount} 条`;
     case "summary_completed":
@@ -107,12 +119,12 @@ function getEventSummary(event: TimelineEvent): string {
   }
 }
 
-function getEventIteration(event: TimelineEvent): number | null {
+function getEventIteration(event: VisibleTimelineEvent): number | null {
   return "iteration" in event ? event.iteration : null;
 }
 
 export function AgentTimeline({ events }: AgentTimelineProps) {
-  const visibleEvents = events;
+  const visibleEvents = events.filter(isVisibleTimelineEvent);
 
   if (visibleEvents.length === 0) {
     return <p className="muted">流式运行后会在这里展示实时 trace。</p>;

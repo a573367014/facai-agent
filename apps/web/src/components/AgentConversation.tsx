@@ -1,5 +1,5 @@
-import { Alert, Box, Chip, CircularProgress, Paper, Typography } from "@mui/material";
-import { CircleAlert, CircleStop } from "lucide-react";
+import { Alert, Box, Chip, CircularProgress, IconButton, Paper, Tooltip, Typography, type TooltipProps } from "@mui/material";
+import { CircleAlert, CircleStop, Copy, Pencil, RefreshCw } from "lucide-react";
 import {
   useEffect,
   useLayoutEffect,
@@ -8,7 +8,7 @@ import {
   type UIEvent,
   type WheelEvent
 } from "react";
-import type { AgentState, AgentStreamEvent, MessagePart } from "../api/agent-client";
+import type { AgentResourceRecord, AgentState, AgentStreamEvent, MessagePart } from "../api/agent-client";
 import type { ToolImageActionPayload } from "./ToolResultPreview";
 import { ToolTraceList } from "./ToolTraceList";
 import { MessagePartRenderer } from "./MessagePartRenderer";
@@ -20,18 +20,25 @@ export interface ChatMessage {
   role: "user" | "assistant" | "system";
   parts: MessagePart[];
   status?: ChatMessageStatus;
+  version?: number;
   events?: AgentStreamEvent[];
   error?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  completedAt?: string;
 }
 
 interface AgentConversationProps {
   messages: ChatMessage[];
+  resourcesById?: Record<string, AgentResourceRecord>;
   isActive: boolean;
   error?: string | null;
   hasMoreMessages?: boolean;
   isLoadingOlderMessages?: boolean;
   onImageAction?: (payload: ToolImageActionPayload) => void;
   onLoadOlderMessages?: () => void;
+  onEditUserMessage?: (text: string) => void;
+  onRegenerateMessage?: (messageId: string) => void;
   onSuggestionSelect?: (suggestion: string) => void;
 }
 
@@ -40,6 +47,7 @@ interface ScrollSnapshot {
   lastId?: string;
   scrollHeight: number;
   scrollTop: number;
+  clientHeight: number;
 }
 
 const stateText: Record<AgentState, string> = {
@@ -61,6 +69,19 @@ const emptySuggestions = [
 
 const LOAD_OLDER_SCROLL_THRESHOLD = 120;
 const USER_SCROLL_INTENT_TTL_MS = 800;
+const AUTO_SCROLL_BOTTOM_THRESHOLD = 24;
+const messageActionTooltipSlotProps: TooltipProps["slotProps"] = {
+  popper: {
+    modifiers: [
+      {
+        name: "offset",
+        options: {
+          offset: [0, -8]
+        }
+      }
+    ]
+  }
+};
 
 function getLatestState(events: AgentStreamEvent[] = []) {
   return [...events].reverse().find((event) => event.type === "agent_state");
@@ -109,6 +130,50 @@ function getTextContent(parts: MessagePart[]) {
     .join("\n");
 }
 
+function copyText(value: string) {
+  const writePromise = navigator.clipboard?.writeText(value);
+
+  if (writePromise) {
+    void writePromise.catch(() => undefined);
+  }
+}
+
+function padTimePart(value: number) {
+  return String(value).padStart(2, "0");
+}
+
+function formatMessageTimestamp(value?: string) {
+  if (!value) {
+    return undefined;
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return undefined;
+  }
+
+  const now = new Date();
+  const time = `${padTimePart(date.getHours())}:${padTimePart(date.getMinutes())}`;
+  const isSameYear = date.getFullYear() === now.getFullYear();
+  const isSameMonth = isSameYear && date.getMonth() === now.getMonth();
+  const isSameDay = isSameMonth && date.getDate() === now.getDate();
+
+  if (isSameDay) {
+    return time;
+  }
+
+  if (isSameMonth) {
+    return `${date.getDate()}日 ${time}`;
+  }
+
+  if (isSameYear) {
+    return `${date.getMonth() + 1}月${date.getDate()}日 ${time}`;
+  }
+
+  return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日 ${time}`;
+}
+
 function SystemStatusMessage({ message }: { message: ChatMessage }) {
   const text = getTextContent(message.parts) || message.error || "系统状态已更新";
   const isRunning = message.status === "running";
@@ -127,12 +192,15 @@ function SystemStatusMessage({ message }: { message: ChatMessage }) {
 
 export function AgentConversation({
   messages,
+  resourcesById = {},
   isActive,
   error,
   hasMoreMessages = false,
   isLoadingOlderMessages = false,
   onImageAction,
   onLoadOlderMessages,
+  onEditUserMessage,
+  onRegenerateMessage,
   onSuggestionSelect
 }: AgentConversationProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -170,8 +238,13 @@ export function AgentConversation({
       firstId: messages[0]?.id,
       lastId: messages.at(-1)?.id,
       scrollHeight: scrollElement.scrollHeight,
-      scrollTop: scrollElement.scrollTop
+      scrollTop: scrollElement.scrollTop,
+      clientHeight: scrollElement.clientHeight
     };
+  }
+
+  function isAtBottom(snapshot: ScrollSnapshot) {
+    return snapshot.scrollHeight - snapshot.scrollTop - snapshot.clientHeight <= AUTO_SCROLL_BOTTOM_THRESHOLD;
   }
 
   function requestLoadOlderMessages() {
@@ -205,6 +278,8 @@ export function AgentConversation({
   }
 
   function handleScroll(event: UIEvent<HTMLDivElement>) {
+    previousScrollSnapshotRef.current = createScrollSnapshot();
+
     if (event.currentTarget.scrollTop <= LOAD_OLDER_SCROLL_THRESHOLD) {
       requestLoadOlderMessages();
     }
@@ -241,7 +316,8 @@ export function AgentConversation({
         firstId,
         lastId,
         scrollHeight: scrollElement.scrollHeight,
-        scrollTop: scrollElement.scrollTop
+        scrollTop: scrollElement.scrollTop,
+        clientHeight: scrollElement.clientHeight
       };
 
       return;
@@ -249,12 +325,30 @@ export function AgentConversation({
 
     pendingPrependScrollSnapshotRef.current = undefined;
 
+    const isReplacingMessageList = previousSnapshot
+      ? previousSnapshot.firstId !== firstId && previousSnapshot.lastId !== lastId
+      : false;
+    const shouldAutoScroll = !previousSnapshot || isReplacingMessageList || isAtBottom(previousSnapshot);
+
+    if (!shouldAutoScroll) {
+      previousScrollSnapshotRef.current = {
+        firstId,
+        lastId,
+        scrollHeight: scrollElement.scrollHeight,
+        scrollTop: scrollElement.scrollTop,
+        clientHeight: scrollElement.clientHeight
+      };
+
+      return;
+    }
+
     scrollElement.scrollTop = scrollElement.scrollHeight;
     previousScrollSnapshotRef.current = {
       firstId,
       lastId,
       scrollHeight: scrollElement.scrollHeight,
-      scrollTop: scrollElement.scrollTop
+      scrollTop: scrollElement.scrollTop,
+      clientHeight: scrollElement.clientHeight
     };
   }, [messages]);
 
@@ -317,6 +411,13 @@ export function AgentConversation({
 
                 const showCursor = message.role === "assistant" && message.status === "running";
                 const messageBodyClassName = message.role === "assistant" ? "chat-answer assistant" : "chat-bubble user";
+                const userMessageText = message.role === "user" ? getTextContent(message.parts) : "";
+                const canCopyUserMessage = message.role === "user" && userMessageText.length > 0;
+                const canEditUserMessage = canCopyUserMessage && typeof onEditUserMessage === "function";
+                const canRegenerate =
+                  message.role === "assistant" && message.status !== "running" && typeof onRegenerateMessage === "function";
+                const messageTimestamp = formatMessageTimestamp(message.createdAt);
+                const hasMessageMeta = Boolean(messageTimestamp || canCopyUserMessage || canRegenerate);
 
                 return (
                   <Box component="article" className={`chat-row ${message.role}`} key={message.id}>
@@ -334,6 +435,7 @@ export function AgentConversation({
                           <MessagePartRenderer
                             role={message.role}
                             parts={message.parts}
+                            resourcesById={resourcesById}
                             showCursor={showCursor}
                             onImageAction={onImageAction}
                           />
@@ -345,6 +447,62 @@ export function AgentConversation({
                         ) : null}
 
                         {message.role === "assistant" ? <ToolTraceList events={message.events} onImageAction={onImageAction} /> : null}
+
+                        {hasMessageMeta ? (
+                          <Box className={`message-meta-row ${message.role}`}>
+                            {canRegenerate ? (
+                              <Box className="message-actions assistant-actions">
+                                <Tooltip title="重新生成" placement="top" slotProps={messageActionTooltipSlotProps}>
+                                  <IconButton
+                                    aria-label="重新生成"
+                                    className="message-action-button"
+                                    onClick={() => onRegenerateMessage(message.id)}
+                                    size="small"
+                                    type="button"
+                                  >
+                                    <RefreshCw size={15} />
+                                  </IconButton>
+                                </Tooltip>
+                              </Box>
+                            ) : null}
+
+                            {messageTimestamp ? (
+                              <time className="message-timestamp" dateTime={message.createdAt}>
+                                {messageTimestamp}
+                              </time>
+                            ) : null}
+
+                            {canCopyUserMessage ? (
+                              <Box className="message-actions user-actions">
+                                <Tooltip title="复制" placement="top" slotProps={messageActionTooltipSlotProps}>
+                                  <IconButton
+                                    aria-label="复制消息"
+                                    className="message-action-button"
+                                    onClick={() => copyText(userMessageText)}
+                                    size="small"
+                                    type="button"
+                                  >
+                                    <Copy size={15} />
+                                  </IconButton>
+                                </Tooltip>
+
+                                {canEditUserMessage ? (
+                                  <Tooltip title="修改" placement="top" slotProps={messageActionTooltipSlotProps}>
+                                    <IconButton
+                                      aria-label="修改消息"
+                                      className="message-action-button"
+                                      onClick={() => onEditUserMessage(userMessageText)}
+                                      size="small"
+                                      type="button"
+                                    >
+                                      <Pencil size={15} />
+                                    </IconButton>
+                                  </Tooltip>
+                                ) : null}
+                              </Box>
+                            ) : null}
+                          </Box>
+                        ) : null}
                       </div>
                     </div>
                   </Box>

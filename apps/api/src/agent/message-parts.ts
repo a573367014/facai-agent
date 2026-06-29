@@ -35,7 +35,11 @@ export interface PartExtra {
   tool?: {
     name: string;
     toolCallId: string;
+    toolCallRowId?: string;
     outputIndex?: number;
+  };
+  resource?: {
+    id: string;
   };
   generation?: {
     prompt?: string;
@@ -57,8 +61,8 @@ export interface TextPart extends PartBase {
 
 export interface MediaPart extends PartBase {
   type: "media";
-  mime: string;
-  url: string;
+  mime?: string;
+  url?: string;
   name?: string;
   width?: number;
   height?: number;
@@ -93,10 +97,12 @@ export function appendTextDelta(parts: MessagePart[], partIndex: number, delta: 
 
 export interface GeneratedImagePartInput {
   state: LifecycleState;
+  resourceId: string;
   toolName: string;
   toolCallId: string;
+  toolCallRowId?: string;
   outputIndex: number;
-  mime: string;
+  mime?: string;
   url?: string;
   name?: string;
   width?: number;
@@ -112,28 +118,20 @@ export function upsertGeneratedImageParts(parts: MessagePart[], input: Generated
   const existingIndex = parts.findIndex(
     (part) =>
       part.type === "media" &&
-      part.extra?.tool?.toolCallId === input.toolCallId &&
-      part.extra.tool.outputIndex === input.outputIndex
+      ((part.extra?.resource?.id === input.resourceId) ||
+        (part.extra?.tool?.toolCallId === input.toolCallId && part.extra.tool.outputIndex === input.outputIndex))
   );
   const mediaPart: MediaPart = removeUndefinedDeep({
     type: "media",
-    mime: input.mime,
-    url: input.url ?? "",
-    name: input.name,
-    width: input.width,
-    height: input.height,
     extra: {
       placeholder: input.state === "pending" ? { type: "image", label: "图片生成中" } : undefined,
-      lifecycle: {
-        state: input.state,
-        error: input.error
-      },
+      resource: { id: input.resourceId },
       tool: {
         name: input.toolName,
         toolCallId: input.toolCallId,
+        toolCallRowId: input.toolCallRowId,
         outputIndex: input.outputIndex
-      },
-      generation: input.generation
+      }
     }
   }) as MediaPart;
 
@@ -177,12 +175,28 @@ function projectMediaPart(part: MediaPart, options: { includePendingMedia: boole
     return message ? `资源生成失败：${message}` : "资源生成失败。";
   }
 
-  if (!part.url) {
-    return "";
+  const label = part.name ?? part.extra?.placeholder?.label ?? "媒体资源";
+  const mediaUrl = toProjectableMediaUrl(part.url);
+
+  if (mediaUrl) {
+    return `${label}：${mediaUrl}`;
   }
 
-  const label = part.name ?? part.extra?.placeholder?.label ?? "媒体资源";
-  return `${label}：${part.url}`;
+  const resourceId = part.extra?.resource?.id;
+  return resourceId ? `${label}：${resourceId}` : label;
+}
+
+function toProjectableMediaUrl(url?: string): string | undefined {
+  if (!url) {
+    return undefined;
+  }
+
+  try {
+    const parsedUrl = new URL(url);
+    return parsedUrl.protocol === "http:" || parsedUrl.protocol === "https:" ? url : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function removeUndefinedDeep(value: unknown): unknown {
