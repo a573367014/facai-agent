@@ -1,6 +1,6 @@
 import {
   appendTextDelta,
-  createTextPart,
+  ensureAppendableTextPart,
   type MessagePart
 } from "./message-parts.js";
 
@@ -68,7 +68,7 @@ export class InMemoryRunningMessageStateStore implements RunningMessageStateStor
       return undefined;
     }
 
-    const { parts, partIndex } = ensureTextPart(state.parts);
+    const { parts, partIndex } = ensureAppendableTextPart(state.parts);
     const nextState = this.replaceState(state, appendTextDelta(parts, partIndex, delta));
 
     return {
@@ -102,16 +102,6 @@ export class InMemoryRunningMessageStateStore implements RunningMessageStateStor
     this.states.set(state.messageId, nextState);
     return nextState;
   }
-}
-
-function ensureTextPart(parts: MessagePart[]): { parts: MessagePart[]; partIndex: number } {
-  const partIndex = parts.findIndex((part) => part.type === "text");
-
-  if (partIndex !== -1) {
-    return { parts, partIndex };
-  }
-
-  return { parts: [createTextPart(""), ...parts], partIndex: 0 };
 }
 
 function cloneState(state: RunningMessageState): RunningMessageState {

@@ -1921,6 +1921,7 @@ textarea {
 .message-image-frame.failed {
   display: grid;
   align-content: center;
+  justify-items: center;
   gap: 6px;
   padding: 16px;
   border-color: #d58b76;
@@ -1933,10 +1934,8 @@ textarea {
   font-size: 14px;
 }
 
-.message-image-frame.failed p {
-  margin: 0;
-  color: #7a2418;
-  font-size: 13px;
+.message-image-failed-icon {
+  color: #b73524;
 }
 
 .message-image-menu .MuiPaper-root {

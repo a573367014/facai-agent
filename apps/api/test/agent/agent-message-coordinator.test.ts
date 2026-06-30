@@ -458,6 +458,175 @@ describe("AgentMessageCoordinator", () => {
     }
   });
 
+  it("重新生成媒体回答时复用目标回答的工具参数，避免连续重试丢失批量数量", async () => {
+    const executedArguments: unknown[] = [];
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "generate_image",
+      description: "生成图片",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string" },
+          items: { type: "array" }
+        }
+      },
+      argumentSchema: z.object({
+        prompt: z.string().optional(),
+        items: z
+          .array(
+            z.object({
+              prompt: z.string()
+            })
+          )
+          .optional()
+      }),
+      execute: (args) => {
+        executedArguments.push(args);
+        const prompts = Array.isArray(args.items)
+          ? args.items.map((item) => item.prompt)
+          : [args.prompt ?? "单张"];
+
+        return {
+          provider: "test_image",
+          status: "done",
+          imageUrls: prompts.map((prompt) => `https://example.com/${encodeURIComponent(prompt)}.png`),
+          items: prompts.map((prompt, index) => ({
+            index,
+            status: "success",
+            prompt,
+            imageUrls: [`https://example.com/${encodeURIComponent(prompt)}.png`]
+          }))
+        };
+      }
+    });
+    const provider: LlmProvider = {
+      complete: async ({ messages, tools }) => {
+        if (tools.length > 0 && !messages.some((message) => message.role === "tool")) {
+          return {
+            toolCalls: [
+              {
+                id: "call_model_single",
+                name: "generate_image",
+                arguments: { prompt: "模型退化成单张" }
+              }
+            ]
+          };
+        }
+
+        return { content: "图片已重新生成。" };
+      }
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const session = store.createSession("连续重试媒体回答");
+    const targetUser = store.createMessage({
+      sessionId: session.id,
+      role: "user",
+      status: "completed",
+      parts: [{ type: "text", value: "生成两张图：小猫和小狗" }]
+    });
+    const targetAssistant = store.createMessage({
+      sessionId: session.id,
+      role: "assistant",
+      status: "completed",
+      parts: [{ type: "text", value: "两张图片已生成。" }]
+    });
+    store.createToolCall({
+      sessionId: session.id,
+      messageId: targetAssistant.id,
+      iteration: 0,
+      toolCallId: "call_original_batch",
+      toolName: "generate_image",
+      status: "succeeded",
+      arguments: {
+        items: [{ prompt: "小猫" }, { prompt: "小狗" }]
+      }
+    });
+    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+
+    try {
+      const regenerated = await coordinator.regenerateMessage(targetAssistant.id);
+
+      await waitForRun(coordinator, regenerated.run.id);
+      const completedRun = coordinator.getRun(regenerated.run.id).run;
+      const regeneratedAssistant = completedRun.assistantMessageId ? store.getMessage(completedRun.assistantMessageId) : undefined;
+      const mediaParts = regeneratedAssistant?.parts.filter((part) => part.type === "media") ?? [];
+
+      expect(regenerated.userMessage.id).toBe(targetUser.id);
+      expect(executedArguments).toEqual([
+        {
+          items: [{ prompt: "小猫" }, { prompt: "小狗" }]
+        }
+      ]);
+      expect(mediaParts).toHaveLength(2);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("重新生成由重试产生的回答时使用 run 记录的原始用户消息，而不是最近用户消息", async () => {
+    const answerInputs: string[] = [];
+    const registry = new ToolRegistry();
+    const provider: LlmProvider = {
+      complete: async ({ messages }) => {
+        const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
+        answerInputs.push(lastUserMessage && "content" in lastUserMessage ? lastUserMessage.content : "");
+        return { content: `回答 ${answerInputs.length}` };
+      }
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const session = store.createSession("连续重试原始用户绑定");
+    const originalUser = store.createMessage({
+      sessionId: session.id,
+      role: "user",
+      status: "completed",
+      parts: [{ type: "text", value: "生成两张图：小猫和小狗" }]
+    });
+    const originalAssistant = store.createMessage({
+      sessionId: session.id,
+      role: "assistant",
+      status: "completed",
+      parts: [{ type: "text", value: "两张图片已生成。" }]
+    });
+    store.createMessage({
+      sessionId: session.id,
+      role: "user",
+      status: "completed",
+      parts: [{ type: "text", value: "后续很远的另一个问题" }]
+    });
+    store.createMessage({
+      sessionId: session.id,
+      role: "assistant",
+      status: "completed",
+      parts: [{ type: "text", value: "后续回答" }]
+    });
+    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+
+    try {
+      const firstRegeneration = await coordinator.regenerateMessage(originalAssistant.id);
+
+      await waitForRun(coordinator, firstRegeneration.run.id);
+      const firstRegeneratedAssistantId = coordinator.getRun(firstRegeneration.run.id).run.assistantMessageId;
+
+      if (!firstRegeneratedAssistantId) {
+        throw new Error("first regenerated assistant was not created");
+      }
+
+      const secondRegeneration = await coordinator.regenerateMessage(firstRegeneratedAssistantId);
+
+      await waitForRun(coordinator, secondRegeneration.run.id);
+
+      expect(firstRegeneration.userMessage.id).toBe(originalUser.id);
+      expect(secondRegeneration.userMessage.id).toBe(originalUser.id);
+      expect(answerInputs).toEqual([
+        "生成两张图：小猫和小狗",
+        "生成两张图：小猫和小狗"
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
   it("run 压缩成功入库后，即使回答阶段被取消，下次 run 也不会重复压缩同一段消息", async () => {
     const summaryCalls: string[][] = [];
     const registry = new ToolRegistry();
@@ -1054,7 +1223,6 @@ describe("AgentMessageCoordinator", () => {
         expect.objectContaining({
           role: "assistant",
           parts: [
-            { type: "text", value: "图片已生成。" },
             expect.objectContaining({
               type: "media",
               extra: expect.objectContaining({
@@ -1066,7 +1234,8 @@ describe("AgentMessageCoordinator", () => {
                   outputIndex: 0
                 })
               })
-            })
+            }),
+            { type: "text", value: "图片已生成。" }
           ]
         })
       ]);
@@ -1176,7 +1345,6 @@ describe("AgentMessageCoordinator", () => {
         expect.objectContaining({
           role: "assistant",
           parts: [
-            { type: "text", value: "视频已生成。" },
             expect.objectContaining({
               type: "media",
               extra: expect.objectContaining({
@@ -1188,7 +1356,8 @@ describe("AgentMessageCoordinator", () => {
                   outputIndex: 0
                 })
               })
-            })
+            }),
+            { type: "text", value: "视频已生成。" }
           ]
         })
       ]);
@@ -1367,7 +1536,7 @@ describe("AgentMessageCoordinator", () => {
 
       await firstDeltaReceived.promise;
 
-      expect(store.getMessage(started.assistantMessage.id)?.parts).toEqual([{ type: "text", value: "" }]);
+      expect(store.getMessage(started.assistantMessage.id)?.parts).toEqual([]);
 
       const runningSnapshot = await coordinator.getMessageSnapshot(started.assistantMessage.id);
       expect(runningSnapshot).toMatchObject({ version: 1 });
@@ -1446,7 +1615,6 @@ describe("AgentMessageCoordinator", () => {
         }
       });
       expect(message.parts).toEqual([
-        { type: "text", value: "图片已生成。" },
         expect.objectContaining({
           type: "media",
           extra: expect.objectContaining({
@@ -1458,7 +1626,8 @@ describe("AgentMessageCoordinator", () => {
               outputIndex: 0
             }
           })
-        })
+        }),
+        { type: "text", value: "图片已生成。" }
       ]);
       expect(events.map((event) => event.event.type)).toContain("message.part.created");
       expect(events.map((event) => event.event.type)).toContain("message.part.updated");
@@ -1579,7 +1748,7 @@ describe("AgentMessageCoordinator", () => {
     }
   });
 
-  it("批量图片部分失败后重试时保留用户请求的图片顺序", async () => {
+  it("批量图片部分失败后保留失败占位并无工具总结原因", async () => {
     const registry = new ToolRegistry();
     let executeCount = 0;
 
@@ -1608,44 +1777,38 @@ describe("AgentMessageCoordinator", () => {
       execute: () => {
         executeCount += 1;
 
-        if (executeCount === 1) {
-          return {
-            provider: "test_image",
-            status: "partial_failed",
-            total: 2,
-            succeeded: 1,
-            failed: 1,
-            imageUrls: ["https://example.com/dog.png"],
-            items: [
-              {
-                index: 0,
-                status: "failed",
-                prompt: "宝宝",
-                error: "并发限制"
-              },
-              {
-                index: 1,
-                status: "success",
-                prompt: "狗狗",
-                imageUrls: ["https://example.com/dog.png"]
-              }
-            ]
-          };
-        }
-
         return {
           provider: "test_image",
-          status: "done",
-          prompt: "宝宝",
-          imageUrls: ["https://example.com/baby.png"]
+          status: "partial_failed",
+          total: 2,
+          succeeded: 1,
+          failed: 1,
+          imageUrls: ["https://example.com/dog.png"],
+          items: [
+            {
+              index: 0,
+              status: "failed",
+              prompt: "宝宝",
+              error: "并发限制"
+            },
+            {
+              index: 1,
+              status: "success",
+              prompt: "狗狗",
+              imageUrls: ["https://example.com/dog.png"]
+            }
+          ]
         };
       }
     });
 
     let callCount = 0;
+    const toolCountsByCall: number[] = [];
+    const summaryPrompts: string[][] = [];
     const provider: LlmProvider = {
-      complete: async () => {
+      complete: async ({ messages, tools }) => {
         callCount += 1;
+        toolCountsByCall.push(tools.length);
 
         if (callCount === 1) {
           return {
@@ -1665,18 +1828,11 @@ describe("AgentMessageCoordinator", () => {
         }
 
         if (callCount === 2) {
-          return {
-            toolCalls: [
-              {
-                id: "call_retry_baby",
-                name: "generate_image",
-                arguments: { prompt: "宝宝", width: 1328, height: 1328 }
-              }
-            ]
-          };
+          summaryPrompts.push(messages.map((message) => `${message.role}:${"content" in message ? message.content : ""}`));
+          return { content: "狗狗图片已生成，宝宝图片因并发限制失败。可以稍后再试。" };
         }
 
-        return { content: "两张图片已生成。" };
+        throw new Error("不应该继续进入第三轮模型调用");
       }
     };
     const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
@@ -1692,31 +1848,44 @@ describe("AgentMessageCoordinator", () => {
       const resourcesById = new Map(session.resources.map((resource) => [resource.id, resource]));
       const events = coordinator.getMessage(started.assistantMessage.id).events.map((event) => event.event);
       const mediaCreatedEvents = events.filter((event) => event.type === "message.part.created");
-      const retryMediaUpdateEvent = events.find(
-        (event) =>
-          event.type === "message.part.updated" &&
-          event.part.type === "media" &&
-          event.part.extra?.tool?.toolCallId === "call_retry_baby"
-      );
 
+      expect(executeCount).toBe(1);
+      expect(callCount).toBe(2);
+      expect(toolCountsByCall).toEqual([1, 0]);
+      expect(summaryPrompts[0]).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining("最多 2 句"),
+          expect.stringContaining("不要表格"),
+          expect.stringContaining("不要分点"),
+          expect.stringContaining("不要再次调用工具")
+        ])
+      );
+      expect(summaryPrompts[0].join("\n")).not.toContain("总结哪些内容已成功、哪些内容失败");
+      expect(assistant?.parts.find((part) => part.type === "text")).toEqual({
+        type: "text",
+        value: "狗狗图片已生成，宝宝图片因并发限制失败。可以稍后再试。"
+      });
       expect(mediaParts).toHaveLength(2);
       expect(mediaParts.map((part) => resourcesById.get(part.extra?.resource?.id ?? "")?.metadata?.prompt)).toEqual([
         "宝宝",
         "狗狗"
       ]);
       expect(mediaParts.map((part) => resourcesById.get(part.extra?.resource?.id ?? "")?.url)).toEqual([
-        "https://example.com/baby.png",
+        undefined,
         "https://example.com/dog.png"
       ]);
+      expect(mediaParts.map((part) => part.extra?.lifecycle?.state)).toEqual(["failed", "succeeded"]);
       expect(mediaParts.map((part) => (part.type === "media" ? part.url : undefined))).toEqual([
-        "https://example.com/baby.png",
+        undefined,
         "https://example.com/dog.png"
       ]);
       expect(mediaCreatedEvents).toHaveLength(2);
-      expect(retryMediaUpdateEvent).toMatchObject({
-        type: "message.part.updated",
-        partIndex: 1
-      });
+      expect(events).not.toContainEqual(
+        expect.objectContaining({
+          type: "tool_start",
+          toolCallId: "call_retry_baby"
+        })
+      );
     } finally {
       store.close();
     }

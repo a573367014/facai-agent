@@ -336,18 +336,18 @@ function renderBatchImageResultForLlm(result: JimengImageBatchResult) {
   const imageCount = result.imageUrls.length || result.binaryDataBase64.length;
 
   // llmContent 是“给模型看的工具观察结果”，不是给前端渲染的完整数据。
-  // 批量生图允许部分成功：如果这里只给总数，模型很容易误把已经成功的项目再次重试。
-  // 所以这里刻意列出每个子任务的序号、prompt 和成功/失败状态，但仍然不放 URL/taskId/base64。
-  const retryInstruction =
+  // 批量生图允许部分成功：这里列出每个子任务的序号、prompt 和成功/失败状态，
+  // 让后续最终回复能概括结果，但仍然不放 URL/taskId/base64，也不诱导长篇分析。
+  const failureInstruction =
     result.failed > 0
-      ? "如果需要继续处理，只重试失败项；不要重试已经成功的项目。"
-      : "所有子任务均已完成，不需要重试。";
+      ? "请简短说明成功/失败数量和最关键失败原因；不要展开分析；不要自动重试失败项。"
+      : "所有子任务均已完成。";
 
   return [
     `图片已生成，共 ${imageCount} 张。`,
     `批量生图完成：成功 ${result.succeeded} 项，失败 ${result.failed} 项。`,
     ...result.items.map(renderBatchItemForLlm),
-    retryInstruction,
+    failureInstruction,
     "回复用户时不要输出图片链接、Markdown 图片、下载链接、任务 ID 或 base64 内容。"
   ].join("\n");
 }

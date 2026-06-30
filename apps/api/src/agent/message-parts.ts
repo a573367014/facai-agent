@@ -95,6 +95,17 @@ export function appendTextDelta(parts: MessagePart[], partIndex: number, delta: 
   });
 }
 
+export function ensureAppendableTextPart(parts: MessagePart[]): { parts: MessagePart[]; partIndex: number } {
+  const lastIndex = parts.length - 1;
+  const lastPart = parts[lastIndex];
+
+  if (lastPart?.type === "text") {
+    return { parts, partIndex: lastIndex };
+  }
+
+  return { parts: [...parts, createTextPart("")], partIndex: parts.length };
+}
+
 export interface GeneratedImagePartInput {
   state: LifecycleState;
   resourceId: string;

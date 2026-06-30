@@ -409,7 +409,7 @@ describe("agent routes", () => {
     expect(payload.assistantMessage).toMatchObject({
       role: "assistant",
       status: "running",
-      parts: [{ type: "text", value: "" }]
+      parts: []
     });
     expect(payload.assistantMessage).not.toHaveProperty("content");
     expect(payload.assistantMessage).not.toHaveProperty("assets");
@@ -1248,7 +1248,6 @@ describe("agent routes", () => {
         role: "assistant",
         status: "completed",
         parts: [
-          { type: "text", value: "图片已经生成好了。" },
           expect.objectContaining({
             type: "media",
             mime: "image/png",
@@ -1264,7 +1263,8 @@ describe("agent routes", () => {
               },
               generation: { prompt: "温馨田园小猪", provider: "test_image" }
             })
-          })
+          }),
+          { type: "text", value: "图片已经生成好了。" }
         ]
       })
     ]);

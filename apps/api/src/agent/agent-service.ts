@@ -6,6 +6,14 @@ import type { ToolRegistry } from "../tools/registry.js";
 import { SYSTEM_INSTRUCTIONS } from "./instructions.js";
 import type { AgentMessage, AgentExecutionInput, AgentExecutionResult, AgentStreamEvent } from "./types.js";
 
+const MEDIA_SUMMARY_TOOL_NAMES = new Set(["generate_image", "edit_image", "generate_video"]);
+const MEDIA_FAILURE_SUMMARY_INSTRUCTION = [
+  "请基于上面的媒体生成工具结果给出最终回复。",
+  "回复必须简短直接，最多 2 句；不要表格、不要标题、不要分点或长篇原因分析。",
+  "只说明成功/失败数量和最关键失败原因；必要时用一句话提示调整提示词或稍后重试。",
+  "不要再次调用工具，不要自动重试，不要输出图片链接、下载链接、任务 ID 或 base64 内容。"
+].join("\n");
+
 export interface AgentServiceOptions {
   provider: LlmProvider;
   toolRegistry: ToolRegistry;
@@ -23,6 +31,7 @@ export class AgentService {
 
   async run(input: AgentExecutionInput): Promise<AgentExecutionResult> {
     const maxIterations = input.maxIterations ?? this.options.defaultMaxIterations;
+    const replayToolCalls = input.replayToolCalls?.length ? input.replayToolCalls : undefined;
     const messages: AgentMessage[] = [
       { role: "system", content: SYSTEM_INSTRUCTIONS },
       ...(input.history ?? []),
@@ -39,13 +48,17 @@ export class AgentService {
       assertNotAborted(input.signal);
       await emit({ type: "iteration_start", iteration });
       await emit({ type: "agent_state", iteration, state: "thinking", label: "模型思考中" });
-      await emit({ type: "llm_start", iteration });
       const response =
-        input.onEvent && this.options.provider.completeStream
-          ? await this.options.provider.completeStream({ messages, tools, signal: input.signal }, async (delta) => {
-              await emit({ type: "answer_delta", iteration, delta });
-            })
-          : await this.options.provider.complete({ messages, tools, signal: input.signal });
+        iteration === 0 && replayToolCalls
+          ? { toolCalls: replayToolCalls }
+          : await (async () => {
+              await emit({ type: "llm_start", iteration });
+              return input.onEvent && this.options.provider.completeStream
+                ? await this.options.provider.completeStream({ messages, tools, signal: input.signal }, async (delta) => {
+                    await emit({ type: "answer_delta", iteration, delta });
+                  })
+                : await this.options.provider.complete({ messages, tools, signal: input.signal });
+            })();
       await emit({
         type: "llm_response",
         iteration,
@@ -79,6 +92,7 @@ export class AgentService {
       messages.push({ role: "assistant", content: response.content, toolCalls: response.toolCalls });
       let hasSuccessfulToolResult = false;
       let hasRecoverableToolError = false;
+      let shouldSummarizeMediaFailure = false;
 
       for (const toolCall of response.toolCalls) {
         await emit({ type: "agent_state", iteration, state: "calling_tool", label: `调用工具 ${toolCall.name}` });
@@ -163,6 +177,7 @@ export class AgentService {
           // 像 web_search 这种大结果工具，则优先用工具自己提供的 llmContent 控制 token 和可读性。
           content: execution.llmContent ?? JSON.stringify(execution.data)
         });
+        shouldSummarizeMediaFailure ||= shouldSummarizeMediaFailureWithoutRetry(toolCall.name, execution.data);
       }
 
       const observationLabel =
@@ -172,10 +187,55 @@ export class AgentService {
             ? "工具错误已写回上下文"
             : "工具结果已写回上下文";
       await emit({ type: "agent_state", iteration, state: "observing", label: observationLabel });
+
+      if (shouldSummarizeMediaFailure) {
+        return await this.summarizeMediaFailureWithoutTools(messages, input, iteration, emit);
+      }
+
       await emit({ type: "iteration_end", iteration, outcome: "tool_calls" });
     }
 
     throw new AppError("AGENT_MAX_ITERATIONS", "Agent 达到最大迭代次数，仍未得到最终答案", 422);
+  }
+
+  private async summarizeMediaFailureWithoutTools(
+    messages: AgentMessage[],
+    input: AgentExecutionInput,
+    iteration: number,
+    emit: (event: AgentStreamEvent) => Promise<void>
+  ): Promise<AgentExecutionResult> {
+    const summaryMessages: AgentMessage[] = [
+      ...messages,
+      {
+        role: "user",
+        content: MEDIA_FAILURE_SUMMARY_INSTRUCTION
+      }
+    ];
+
+    await emit({ type: "agent_state", iteration, state: "answering", label: "总结生成结果" });
+    await emit({ type: "llm_start", iteration });
+    const response =
+      input.onEvent && this.options.provider.completeStream
+        ? await this.options.provider.completeStream({ messages: summaryMessages, tools: [], signal: input.signal }, async (delta) => {
+            await emit({ type: "answer_delta", iteration, delta });
+          })
+        : await this.options.provider.complete({ messages: summaryMessages, tools: [], signal: input.signal });
+    await emit({
+      type: "llm_response",
+      iteration,
+      content: response.content,
+      toolCalls: response.toolCalls
+    });
+
+    if (!response.content) {
+      await emit({ type: "agent_state", iteration, state: "failed", label: "模型响应无效" });
+      throw new AppError("PROVIDER_BAD_RESPONSE", "模型响应缺少最终回答", 502);
+    }
+
+    await emit({ type: "iteration_end", iteration, outcome: "final_answer" });
+    await emit({ type: "agent_state", iteration, state: "done", label: "运行完成" });
+    await emit({ type: "final_answer", answer: response.content });
+    return { answer: response.content };
   }
 }
 
@@ -183,4 +243,19 @@ function assertNotAborted(signal?: AbortSignal) {
   if (signal?.aborted) {
     throw new DOMException("Aborted", "AbortError");
   }
+}
+
+function shouldSummarizeMediaFailureWithoutRetry(toolName: string, data: unknown): boolean {
+  if (!MEDIA_SUMMARY_TOOL_NAMES.has(toolName) || !isRecord(data)) {
+    return false;
+  }
+
+  const status = data.status;
+  const failed = data.failed;
+
+  return (status === "partial_failed" || status === "failed") && typeof failed === "number" && failed > 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -4,6 +4,7 @@ import type { AgentService } from "./agent-service.js";
 import { AgentContextBuilder } from "./context-builder.js";
 import {
   createTextPart,
+  ensureAppendableTextPart,
   partsToLlmText,
   upsertGeneratedImageParts,
   type GeneratedImagePartInput,
@@ -20,7 +21,7 @@ import {
   type ToolResourceStorage,
   type ToolResourceType
 } from "./tool-resource-storage.js";
-import type { AgentErrorDetail, AgentMessage, AgentExecutionInput, AgentStreamEvent, JsonObject } from "./types.js";
+import type { AgentErrorDetail, AgentMessage, AgentExecutionInput, AgentStreamEvent, JsonObject, ToolCall } from "./types.js";
 import type {
   AgentEventListener,
   AgentMessagePage,
@@ -284,7 +285,7 @@ export class AgentMessageCoordinator {
       sessionId: session.id,
       role: "assistant",
       status: "running",
-      parts: [createTextPart("")],
+      parts: [],
       maxIterations: input.maxIterations
     });
     const controller = new AbortController();
@@ -374,6 +375,7 @@ export class AgentMessageCoordinator {
     });
     const controller = new AbortController();
     const history = this.buildConversationHistoryBefore(session.id, userMessage.id);
+    const replayToolCalls = this.getReplayableMediaToolCalls(sourceAssistantMessage);
 
     this.runningRuns.set(run.id, controller);
     const execution = this.executeRun(
@@ -382,6 +384,7 @@ export class AgentMessageCoordinator {
         input: userText,
         parts: userMessage.parts,
         maxIterations: sourceAssistantMessage.maxIterations,
+        replayToolCalls: replayToolCalls.length ? replayToolCalls : undefined,
         sessionId: session.id,
         signal: controller.signal
       },
@@ -595,7 +598,7 @@ export class AgentMessageCoordinator {
         sessionId: input.sessionId,
         role: "assistant",
         status: "running",
-        parts: [createTextPart("")],
+        parts: [],
         maxIterations: input.maxIterations
       });
       await this.initRunningMessageState(assistantMessage, runId);
@@ -608,6 +611,7 @@ export class AgentMessageCoordinator {
       const result = await this.agentService.run({
         input: input.input,
         history,
+        replayToolCalls: input.replayToolCalls,
         maxIterations: input.maxIterations,
         messageId: assistantMessage.id,
         sessionId: input.sessionId,
@@ -843,6 +847,15 @@ export class AgentMessageCoordinator {
   }
 
   private findInputUserMessageForAssistant(assistantMessage: AgentMessageRecord): AgentMessageRecord | undefined {
+    const linkedRun = [...this.store.getRunsByMessageId(assistantMessage.id)]
+      .reverse()
+      .find((run) => run.assistantMessageId === assistantMessage.id);
+    const linkedUserMessage = linkedRun ? this.store.getMessage(linkedRun.userMessageId) : undefined;
+
+    if (linkedUserMessage?.role === "user") {
+      return linkedUserMessage;
+    }
+
     const sessionMessages = this.store.getMessagesBySession(assistantMessage.sessionId);
     const assistantIndex = sessionMessages.findIndex((message) => message.id === assistantMessage.id);
 
@@ -851,6 +864,21 @@ export class AgentMessageCoordinator {
     }
 
     return [...sessionMessages.slice(0, assistantIndex)].reverse().find((message) => message.role === "user");
+  }
+
+  private getReplayableMediaToolCalls(assistantMessage: AgentMessageRecord): ToolCall[] {
+    return this.store
+      .getToolCallsBySession(assistantMessage.sessionId)
+      .filter((toolCall) => toolCall.messageId === assistantMessage.id && isMediaOutputToolName(toolCall.toolName))
+      .sort((leftToolCall, rightToolCall) => {
+        const iterationOrder = leftToolCall.iteration - rightToolCall.iteration;
+        return iterationOrder || leftToolCall.startedAt.localeCompare(rightToolCall.startedAt);
+      })
+      .map((toolCall) => ({
+        id: toolCall.toolCallId ?? toolCall.id,
+        name: toolCall.toolName,
+        arguments: toolCall.arguments
+      }));
   }
 
   private ensureMessage(messageId: string) {
@@ -1360,13 +1388,13 @@ export class AgentMessageCoordinator {
 
   private async withAssistantText(messageId: string, value: string): Promise<MessagePart[]> {
     const parts = await this.getDraftParts(messageId);
-    const { parts: ensuredParts, partIndex } = ensureTextPart(parts);
+    const { parts: ensuredParts, partIndex } = ensureAppendableTextPart(parts);
 
     return ensuredParts.map((part, index) => (index === partIndex && part.type === "text" ? { ...part, value } : part));
   }
 
   private async setAssistantTextAndEmitUpdate(messageId: string, value: string, runId?: string): Promise<MessagePart[]> {
-    const { parts, partIndex } = ensureTextPart(await this.getDraftParts(messageId, runId));
+    const { parts, partIndex } = ensureAppendableTextPart(await this.getDraftParts(messageId, runId));
     const nextParts = parts.map((part, index) => (index === partIndex && part.type === "text" ? { ...part, value } : part));
     const { parts: updatedParts, version } = await this.setDraftParts(messageId, nextParts, runId);
     const part = updatedParts[partIndex] ?? nextParts[partIndex];
@@ -2418,6 +2446,10 @@ function isVideoOutputToolName(toolName: string): boolean {
   return VIDEO_OUTPUT_TOOL_NAMES.has(toolName);
 }
 
+function isMediaOutputToolName(toolName: string): boolean {
+  return isImageOutputToolName(toolName) || isVideoOutputToolName(toolName);
+}
+
 function isImageToolResultWithId(
   event: AgentStreamEvent
 ): event is Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: string; toolCallId: string } {
@@ -2428,16 +2460,6 @@ function isVideoToolResultWithId(
   event: AgentStreamEvent
 ): event is Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: string; toolCallId: string } {
   return event.type === "tool_result" && isVideoOutputToolName(event.toolName) && typeof event.toolCallId === "string";
-}
-
-function ensureTextPart(parts: MessagePart[]): { parts: MessagePart[]; partIndex: number } {
-  const partIndex = parts.findIndex((part) => part.type === "text");
-
-  if (partIndex !== -1) {
-    return { parts, partIndex };
-  }
-
-  return { parts: [createTextPart(""), ...parts], partIndex: 0 };
 }
 
 function sortStoredEvents(events: StoredAgentEvent[]): StoredAgentEvent[] {

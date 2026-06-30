@@ -13,7 +13,6 @@ interface SessionSidebarProps {
   health: string;
   historyItems: SessionHistoryItem[];
   isCollapsed: boolean;
-  isBusy: boolean;
   hasMoreSessions: boolean;
   isLoadingMoreSessions: boolean;
   deletingSessionIds: Set<string>;
@@ -40,7 +39,6 @@ export function SessionSidebar({
   health,
   historyItems,
   isCollapsed,
-  isBusy,
   hasMoreSessions,
   isLoadingMoreSessions,
   deletingSessionIds,
@@ -99,7 +97,7 @@ export function SessionSidebar({
           </Box>
         </Box>
 
-        <Button className="new-session-button" type="button" variant="contained" startIcon={<Plus size={17} />} onClick={onNewSession} disabled={isBusy}>
+        <Button className="new-session-button" type="button" variant="contained" startIcon={<Plus size={17} />} onClick={onNewSession}>
           新建会话
         </Button>
 
@@ -122,7 +120,7 @@ export function SessionSidebar({
                     aria-label={item.title}
                     className="session-history-item"
                     selected={item.id === activeSessionId}
-                    disabled={isBusy || isDeleting}
+                    disabled={isDeleting}
                     onClick={() => onSelectSession(item.id)}
                   >
                     <MessageCircle size={15} />
@@ -132,7 +130,7 @@ export function SessionSidebar({
                   <IconButton
                     aria-label={`删除会话：${item.title}`}
                     className="session-delete-button"
-                    disabled={isBusy || isDeleting}
+                    disabled={isDeleting}
                     onClick={() => onDeleteSession(item.id)}
                     size="small"
                     type="button"
