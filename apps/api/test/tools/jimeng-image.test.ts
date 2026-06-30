@@ -458,7 +458,7 @@ describe("createJimengImageTool", () => {
     });
   });
 
-  it("批量生图部分失败时给 LLM 明确标注失败项，避免重试已经成功的图片", async () => {
+  it("批量生图部分失败时给 LLM 明确标注失败项，并要求总结原因不要自动重试", async () => {
     const fetchImpl: typeof fetch = async (url, init) => {
       const action = new URL(String(url)).searchParams.get("Action");
       const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
@@ -534,8 +534,12 @@ describe("createJimengImageTool", () => {
     expect(llmContent).toContain("HTTP 429");
     expect(llmContent).toContain("第 2 项成功");
     expect(llmContent).toContain("两只小狗在草地玩耍");
-    expect(llmContent).toContain("只重试失败项");
-    expect(llmContent).toContain("不要重试已经成功");
+    expect(llmContent).toContain("简短说明");
+    expect(llmContent).toContain("不要展开分析");
+    expect(llmContent).toContain("不要自动重试");
+    expect(llmContent).not.toContain("总结失败原因");
+    expect(llmContent).not.toContain("下次如何调整提示词");
+    expect(llmContent).not.toContain("只重试失败项");
     expect(llmContent).not.toContain("https://example.com/two-dogs.png");
     expect(llmContent).not.toContain("task_dogs");
   });

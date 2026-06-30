@@ -78,7 +78,12 @@ function createStartMessageResponse({
   const userMessage = createUserMessage(sessionId, input, { id: `${assistantMessageId}:user` });
 
   return {
-    session: { id: sessionId },
+    session: {
+      id: sessionId,
+      title: input,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    },
     run: {
       id: assistantMessageId,
       sessionId,
@@ -225,6 +230,92 @@ function createControlledStoredSseResponse(messageId: string) {
   };
 }
 
+function createControlledStoredRunSseResponse({
+  runId,
+  messageId,
+  sessionId,
+  startSeq = 0,
+  emitInitial = true
+}: {
+  runId: string;
+  messageId: string;
+  sessionId: string;
+  startSeq?: number;
+  emitInitial?: boolean;
+}) {
+  const encoder = new TextEncoder();
+  let seq = startSeq;
+  let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const writeEvent = (event: Record<string, unknown>) => {
+    seq += 1;
+    const storedEvent = {
+      id: `event_${seq}`,
+      seq,
+      runId,
+      messageId,
+      event,
+      createdAt: "2026-06-22T00:00:00.000Z"
+    };
+    streamController?.enqueue(encoder.encode(`id: ${seq}\ndata: ${JSON.stringify(storedEvent)}\n\n`));
+  };
+  const response = {
+    ok: true,
+    body: new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+
+        if (emitInitial) {
+          writeEvent({
+            type: "session.message.created",
+            message: createAssistantMessage(sessionId, "", { id: messageId, status: "running" })
+          });
+        }
+      }
+    })
+  } as Response;
+
+  return {
+    response,
+    emit(event: Record<string, unknown>) {
+      writeEvent(event);
+    },
+    close() {
+      streamController?.close();
+    }
+  };
+}
+
+function createMixedStoredSseResponse(
+  events: Array<{ runId: string; messageId: string; event: Record<string, unknown> }>
+): Response {
+  const encoder = new TextEncoder();
+
+  return {
+    ok: true,
+    body: new ReadableStream({
+      start(controller) {
+        const blocks = events
+          .map(({ runId, messageId, event }, index) => {
+            const seq = index + 1;
+            const storedEvent = {
+              id: `event_${seq}`,
+              seq,
+              runId,
+              messageId,
+              event,
+              createdAt: "2026-06-22T00:00:00.000Z"
+            };
+            return `id: ${seq}\ndata: ${JSON.stringify(storedEvent)}\n\n`;
+          })
+          .join("");
+
+        controller.enqueue(encoder.encode(blocks));
+        controller.close();
+      }
+    })
+  } as Response;
+}
+
 function createOpenSseResponse(): Response {
   return {
     ok: true,
@@ -245,7 +336,7 @@ function okResponse(): Response {
   } as Response;
 }
 
-function mockAppFetch(handler?: (url: string, init?: RequestInit) => Response | undefined) {
+function mockAppFetch(handler?: (url: string, init?: RequestInit) => Response | Promise<Response> | undefined) {
   globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     const customResponse = handler?.(url, init);
@@ -385,6 +476,87 @@ describe("App", () => {
     expect(screen.getByLabelText("搜索会话")).toBeInTheDocument();
     expect(container.querySelector(".chat-composer")).toContainElement(screen.getByLabelText("发消息"));
     expect(container.querySelector(".session-sidebar")).not.toContainElement(screen.getByLabelText("发消息"));
+  });
+
+  it("切换会话时立即丢弃上一个会话的消息，等待目标会话重新加载", async () => {
+    window.history.replaceState(null, "", "/?sessionId=session_from_url");
+    let resolveOtherSession: ((response: Response) => void) | undefined;
+
+    mockAppFetch((url) => {
+      if (url.endsWith("/agents/sessions/session_from_url")) {
+        return jsonResponse({
+          session: {
+            id: "session_from_url",
+            title: "URL 会话",
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:00.000Z"
+          },
+          messages: [
+            createUserMessage("session_from_url", "从 URL 恢复", { id: "msg_user_from_url" }),
+            createAssistantMessage("session_from_url", "上一会话回答", {
+              id: "msg_assistant_from_url",
+              completedAt: "2026-06-22T00:00:01.000Z"
+            })
+          ]
+        });
+      }
+
+      if (url.endsWith("/agents/sessions/session_other")) {
+        return new Promise<Response>((resolve) => {
+          resolveOtherSession = resolve;
+        });
+      }
+
+      if (url.endsWith("/agents/sessions")) {
+        return jsonResponse({
+          sessions: [
+            {
+              id: "session_from_url",
+              title: "URL 会话",
+              createdAt: "2026-06-22T00:00:00.000Z",
+              updatedAt: "2026-06-22T00:00:01.000Z"
+            },
+            {
+              id: "session_other",
+              title: "另一个会话",
+              createdAt: "2026-06-21T00:00:00.000Z",
+              updatedAt: "2026-06-21T00:00:01.000Z"
+            }
+          ]
+        });
+      }
+
+      return undefined;
+    });
+
+    const { container } = render(<App />);
+
+    await waitFor(() => expect(screen.getByText("上一会话回答")).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: "另一个会话" }));
+
+    expect(screen.queryByText("上一会话回答")).not.toBeInTheDocument();
+
+    resolveOtherSession?.(
+      jsonResponse({
+        session: {
+          id: "session_other",
+          title: "另一个会话",
+          createdAt: "2026-06-21T00:00:00.000Z",
+          updatedAt: "2026-06-21T00:00:01.000Z"
+        },
+        messages: [
+          createUserMessage("session_other", "新的问题", { id: "msg_user_other" }),
+          createAssistantMessage("session_other", "目标会话回答", {
+            id: "msg_assistant_other",
+            completedAt: "2026-06-21T00:00:01.000Z"
+          })
+        ],
+        resources: [],
+        pageInfo: { hasMore: false, limit: 30 }
+      })
+    );
+
+    await waitFor(() => expect(screen.getByText("目标会话回答")).toBeInTheDocument());
   });
 
   it("当前会话选中背景挂在整行容器上，避免删除按钮区域背景断开", async () => {
@@ -584,7 +756,7 @@ describe("App", () => {
       return undefined;
     });
 
-    render(<App />);
+    const { container } = render(<App />);
 
     await waitFor(() => expect(screen.getByText("删除前回答")).toBeInTheDocument());
     await userEvent.click(screen.getByRole("button", { name: "删除会话：要删除的会话" }));
@@ -1993,6 +2165,95 @@ describe("App", () => {
     firstStream?.close();
   });
 
+  it("只处理当前前台 run 的 SSE 事件", async () => {
+    let createCount = 0;
+    let firstStream: ReturnType<typeof createControlledStoredSseResponse> | undefined;
+
+    mockAppFetch((url, init) => {
+      if (url.endsWith("/agents/runs") && init?.method === "POST") {
+        createCount += 1;
+        const body = JSON.parse(String(init.body)) as { parts: Array<{ type: "text"; value: string }> };
+
+        return jsonResponse(
+          createStartMessageResponse({
+            input: body.parts[0]?.value ?? "",
+            assistantMessageId: `msg_${createCount}`
+          })
+        );
+      }
+
+      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+        firstStream = createControlledStoredSseResponse("msg_1");
+        return firstStream.response;
+      }
+
+      if (url.endsWith("/agents/runs/msg_1/cancel") && init?.method === "POST") {
+        return jsonResponse({
+          run: {
+            id: "msg_1",
+            sessionId: "session_1",
+            status: "cancelled",
+            phase: "cancelled",
+            userMessageId: "msg_1:user",
+            assistantMessageId: "msg_1",
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:01.000Z",
+            completedAt: "2026-06-22T00:00:01.000Z"
+          }
+        });
+      }
+
+      if (url.endsWith("/agents/runs/msg_2/events?after=0")) {
+        return createMixedStoredSseResponse([
+          {
+            runId: "msg_1",
+            messageId: "msg_1",
+            event: {
+              type: "session.message.updated",
+              message: createAssistantMessage("session_1", "旧流不应该污染当前 run", {
+                id: "msg_1",
+                completedAt: "2026-06-22T00:00:02.000Z"
+              })
+            }
+          },
+          {
+            runId: "msg_2",
+            messageId: "msg_2",
+            event: {
+              type: "session.message.created",
+              message: createAssistantMessage("session_1", "", { id: "msg_2", status: "running" })
+            }
+          },
+          {
+            runId: "msg_2",
+            messageId: "msg_2",
+            event: { type: "final_answer", answer: "第二轮答案" }
+          },
+          {
+            runId: "msg_2",
+            messageId: "msg_2",
+            event: { type: "run_completed", messageId: "msg_2" }
+          }
+        ]);
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await userEvent.type(screen.getByLabelText("发消息"), "第一轮");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(firstStream).toBeDefined());
+
+    await userEvent.type(screen.getByLabelText("发消息"), "第二轮{Enter}");
+
+    await waitFor(() => expect(screen.getAllByText("第二轮答案").length).toBeGreaterThan(0));
+    expect(screen.queryByText("旧流不应该污染当前 run")).not.toBeInTheDocument();
+
+    firstStream?.close();
+  });
+
   it("流式运行中可以中断当前 message", async () => {
     mockAppFetch((url, init) => {
       if (url.endsWith("/agents/runs") && init?.method === "POST") {
@@ -2051,6 +2312,235 @@ describe("App", () => {
       })
     );
     expect(screen.getByText("已中断")).toBeInTheDocument();
+  });
+
+  it("流式运行中左侧会话操作保持可用", async () => {
+    let runningStream: ReturnType<typeof createControlledStoredSseResponse> | undefined;
+
+    mockAppFetch((url, init) => {
+      if (url.endsWith("/agents/sessions") && (!init?.method || init.method === "GET")) {
+        return jsonResponse({
+          sessions: [
+            {
+              id: "session_other",
+              title: "另一个会话",
+              createdAt: "2026-06-22T00:00:00.000Z",
+              updatedAt: "2026-06-22T00:00:01.000Z"
+            }
+          ]
+        });
+      }
+
+      if (url.endsWith("/agents/runs") && init?.method === "POST") {
+        return jsonResponse(createStartMessageResponse({ input: "写一段很长的内容", assistantMessageId: "msg_1" }));
+      }
+
+      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+        runningStream = createControlledStoredSseResponse("msg_1");
+        return runningStream.response;
+      }
+
+      if (url.endsWith("/agents/sessions/session_other")) {
+        return jsonResponse({
+          session: {
+            id: "session_other",
+            title: "另一个会话",
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:01.000Z"
+          },
+          messages: [
+            createUserMessage("session_other", "旧问题", { id: "msg_user_other" }),
+            createAssistantMessage("session_other", "另一个会话回答", {
+              id: "msg_assistant_other",
+              completedAt: "2026-06-22T00:00:01.000Z"
+            })
+          ],
+          resources: [],
+          pageInfo: { hasMore: false, limit: 30 }
+        });
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "另一个会话" })).toBeInTheDocument());
+    await userEvent.type(screen.getByLabelText("发消息"), "写一段很长的内容");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument());
+
+    expect(screen.getByRole("button", { name: "新建会话" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "另一个会话" })).not.toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByRole("button", { name: "删除会话：另一个会话" })).toBeEnabled();
+
+    await userEvent.click(screen.getByRole("button", { name: "另一个会话" }));
+
+    await waitFor(() => expect(screen.getByText("另一个会话回答")).toBeInTheDocument());
+    runningStream?.emit({
+      type: "session.message.updated",
+      message: createAssistantMessage("session_1", "旧流不应该污染当前会话", {
+        id: "msg_1",
+        completedAt: "2026-06-22T00:00:02.000Z"
+      })
+    });
+    runningStream?.emit({ type: "run_completed", messageId: "msg_1" });
+
+    expect(
+      vi.mocked(globalThis.fetch).mock.calls.some(([url, init]) => String(url).endsWith("/agents/runs/msg_1/cancel") && init?.method === "POST")
+    ).toBe(false);
+    expect(screen.queryByText("旧流不应该污染当前会话")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "发送" })).toBeInTheDocument();
+    runningStream?.close();
+  });
+
+  it("切回仍在生成的会话时会恢复该会话的 SSE 流", async () => {
+    let firstStream: ReturnType<typeof createControlledStoredRunSseResponse> | undefined;
+    let secondStream: ReturnType<typeof createControlledStoredRunSseResponse> | undefined;
+    let resumedFirstStream: ReturnType<typeof createControlledStoredRunSseResponse> | undefined;
+
+    mockAppFetch((url, init) => {
+      if (url.endsWith("/agents/sessions") && (!init?.method || init.method === "GET")) {
+        return jsonResponse({
+          sessions: [
+            {
+              id: "session_other",
+              title: "另一个会话",
+              createdAt: "2026-06-22T00:00:00.000Z",
+              updatedAt: "2026-06-22T00:00:01.000Z"
+            }
+          ]
+        });
+      }
+
+      if (url.endsWith("/agents/runs") && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { parts: Array<{ type: "text"; value: string }> };
+        const input = body.parts[0]?.value ?? "";
+
+        if (input === "第一轮") {
+          return jsonResponse(createStartMessageResponse({ input, assistantMessageId: "msg_1" }));
+        }
+
+        return jsonResponse(createStartMessageResponse({ sessionId: "session_other", input, assistantMessageId: "msg_2" }));
+      }
+
+      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+        firstStream = createControlledStoredRunSseResponse({
+          runId: "msg_1",
+          messageId: "msg_1",
+          sessionId: "session_1"
+        });
+        return firstStream.response;
+      }
+
+      if (url.endsWith("/agents/sessions/session_other")) {
+        return jsonResponse({
+          session: {
+            id: "session_other",
+            title: "另一个会话",
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:01.000Z"
+          },
+          messages: [],
+          resources: [],
+          pageInfo: { hasMore: false, limit: 30 }
+        });
+      }
+
+      if (url.endsWith("/agents/runs/msg_2/events?after=0")) {
+        secondStream = createControlledStoredRunSseResponse({
+          runId: "msg_2",
+          messageId: "msg_2",
+          sessionId: "session_other"
+        });
+        return secondStream.response;
+      }
+
+      if (url.endsWith("/agents/sessions/session_1")) {
+        return jsonResponse({
+          session: {
+            id: "session_1",
+            title: "第一轮",
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:01.000Z"
+          },
+          messages: [
+            createUserMessage("session_1", "第一轮", { id: "msg_1:user" }),
+            createAssistantMessage("session_1", "", { id: "msg_1", status: "running" })
+          ],
+          resources: [],
+          pageInfo: { hasMore: false, limit: 30 }
+        });
+      }
+
+      if (url.endsWith("/agents/runs/msg_1")) {
+        return jsonResponse({
+          run: {
+            id: "msg_1",
+            sessionId: "session_1",
+            status: "running",
+            phase: "answering",
+            userMessageId: "msg_1:user",
+            assistantMessageId: "msg_1",
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:01.000Z"
+          },
+          events: [
+            {
+              id: "event_1",
+              seq: 1,
+              runId: "msg_1",
+              messageId: "msg_1",
+              event: {
+                type: "session.message.created",
+                message: createAssistantMessage("session_1", "", { id: "msg_1", status: "running" })
+              },
+              createdAt: "2026-06-22T00:00:00.000Z"
+            }
+          ]
+        });
+      }
+
+      if (url.endsWith("/agents/runs/msg_1/events?after=1")) {
+        resumedFirstStream = createControlledStoredRunSseResponse({
+          runId: "msg_1",
+          messageId: "msg_1",
+          sessionId: "session_1",
+          startSeq: 1,
+          emitInitial: false
+        });
+        return resumedFirstStream.response;
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "另一个会话" })).toBeInTheDocument());
+    await userEvent.type(screen.getByLabelText("发消息"), "第一轮");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(firstStream).toBeDefined());
+
+    await userEvent.click(screen.getByRole("button", { name: "另一个会话" }));
+    await waitFor(() => expect(window.location.search).toBe("?sessionId=session_other"));
+    await userEvent.type(screen.getByLabelText("发消息"), "第二轮");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(secondStream).toBeDefined());
+
+    await userEvent.click(screen.getByRole("button", { name: "第一轮" }));
+    await waitFor(() => expect(resumedFirstStream).toBeDefined());
+
+    resumedFirstStream?.emit({ type: "message.part.delta", messageId: "msg_1", partIndex: 0, delta: "A 会话续接内容" });
+
+    await waitFor(() => expect(screen.getAllByText("A 会话续接内容").length).toBeGreaterThan(0));
+    expect(
+      vi.mocked(globalThis.fetch).mock.calls.some(([url, init]) => String(url).includes("/cancel") && init?.method === "POST")
+    ).toBe(false);
+
+    firstStream?.close();
+    secondStream?.close();
+    resumedFirstStream?.close();
   });
 
   it("生成中按 Enter 会先中断当前 message 再发送新 message", async () => {
@@ -2169,7 +2659,7 @@ describe("App", () => {
       return undefined;
     });
 
-    render(<App />);
+    const { container } = render(<App />);
 
     await userEvent.type(screen.getByLabelText("发消息"), "用户问题");
     await userEvent.click(screen.getByRole("button", { name: "发送" }));
@@ -2208,6 +2698,43 @@ describe("App", () => {
     await userEvent.click(screen.getByRole("button", { name: "发送" }));
 
     await waitFor(() => expect(screen.getAllByText("新协议答案").length).toBeGreaterThan(0));
+  });
+
+  it("流式运行缺少 assistant 创建事件时也会实时展示答案", async () => {
+    mockAppFetch((url, init) => {
+      if (url.endsWith("/agents/runs") && init?.method === "POST") {
+        return jsonResponse(createStartMessageResponse({ input: "用户问题", assistantMessageId: "msg_1" }));
+      }
+
+      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+        return createMixedStoredSseResponse([
+          {
+            runId: "msg_1",
+            messageId: "msg_1",
+            event: { type: "message.part.delta", messageId: "msg_1", partIndex: 0, delta: "缺少创建事件也展示" }
+          },
+          {
+            runId: "msg_1",
+            messageId: "msg_1",
+            event: { type: "final_answer", answer: "缺少创建事件也展示" }
+          },
+          {
+            runId: "msg_1",
+            messageId: "msg_1",
+            event: { type: "run_completed", messageId: "msg_1" }
+          }
+        ]);
+      }
+
+      return undefined;
+    });
+
+    const { container } = render(<App />);
+
+    await userEvent.type(screen.getByLabelText("发消息"), "用户问题");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(container.querySelector(".chat-scroll")).toHaveTextContent("缺少创建事件也展示"));
   });
 
   it("刷新后根据本地 activeRunId 恢复事件流", async () => {

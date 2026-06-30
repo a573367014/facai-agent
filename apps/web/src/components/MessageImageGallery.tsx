@@ -1,5 +1,5 @@
 import { ButtonBase, CircularProgress, Dialog, DialogContent, IconButton, Menu, MenuItem } from "@mui/material";
-import { ChevronLeft, ChevronRight, Copy, Download, ExternalLink, MoreHorizontal, Quote, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Copy, Download, ExternalLink, ImageOff, MoreHorizontal, Quote, X } from "lucide-react";
 import { useState, type MouseEvent } from "react";
 import type { ToolTrace } from "../utils/tool-traces";
 import type { ToolImageActionPayload, ToolImageActionType } from "./ToolResultPreview";
@@ -201,8 +201,8 @@ function renderImageFrame(
   if (item.state === "failed") {
     return (
       <div className="message-image-frame failed" style={frameStyle}>
-        <strong>{mediaLabel}生成失败</strong>
-        <p>{item.error ?? `${mediaLabel}生成失败`}</p>
+        <ImageOff className="message-image-failed-icon" size={30} strokeWidth={1.8} aria-hidden="true" />
+        <strong>生成失败</strong>
       </div>
     );
   }

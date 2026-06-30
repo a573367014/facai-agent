@@ -100,6 +100,82 @@ describe("AgentService", () => {
     expect(observedToolContents).toEqual(["搜索摘要：完整结果 https://example.com"]);
   });
 
+  it("媒体工具部分失败后只让 provider 无工具总结，不自动重试", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "generate_image",
+      description: "generate image",
+      parameters: { type: "object", properties: {} },
+      execute: async () => ({
+        data: {
+          provider: "test_image",
+          status: "partial_failed",
+          total: 2,
+          succeeded: 1,
+          failed: 1,
+          imageUrls: ["https://example.com/dog.png"],
+          items: [
+            {
+              index: 0,
+              status: "failed",
+              prompt: "真实人物激烈打斗",
+              error: "Post Text Risk Not Pass"
+            },
+            {
+              index: 1,
+              status: "success",
+              prompt: "两只小狗在草地玩耍",
+              imageUrls: ["https://example.com/dog.png"]
+            }
+          ]
+        },
+        llmContent: [
+          "批量生图完成：成功 1 项，失败 1 项。",
+          "第 1 项失败：真实人物激烈打斗",
+          "原因：Post Text Risk Not Pass"
+        ].join("\n")
+      })
+    });
+    const toolCountsByCall: number[] = [];
+    const observedSummaryMessages: string[][] = [];
+    const provider: LlmProvider = {
+      complete: async ({ messages, tools }) => {
+        toolCountsByCall.push(tools.length);
+
+        if (messages.some((message) => message.role === "tool")) {
+          observedSummaryMessages.push(messages.map((message) => `${message.role}:${"content" in message ? message.content : ""}`));
+          return { content: "1 张图片已生成，另 1 张因内容安全审核失败。可以改用虚构角色并降低打斗描述。" };
+        }
+
+        return {
+          toolCalls: [
+            {
+              id: "call_image",
+              name: "generate_image",
+              arguments: { items: [{ prompt: "真实人物激烈打斗" }, { prompt: "两只小狗在草地玩耍" }] }
+            }
+          ]
+        };
+      }
+    };
+    const service = createAgentService(provider, registry);
+
+    await expect(service.run({ input: "生成两张图" })).resolves.toEqual({
+      answer: "1 张图片已生成，另 1 张因内容安全审核失败。可以改用虚构角色并降低打斗描述。"
+    });
+    expect(toolCountsByCall).toEqual([1, 0]);
+    expect(observedSummaryMessages[0]).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("tool:批量生图完成：成功 1 项，失败 1 项。"),
+        expect.stringContaining("最多 2 句"),
+        expect.stringContaining("不要表格"),
+        expect.stringContaining("不要分点"),
+        expect.stringContaining("不要再次调用工具")
+      ])
+    );
+    expect(observedSummaryMessages[0].join("\n")).not.toContain("总结哪些内容已成功、哪些内容失败");
+  });
+
   it("只把权限策略允许的工具暴露给 provider", async () => {
     const registry = new ToolRegistry();
     registry.register({

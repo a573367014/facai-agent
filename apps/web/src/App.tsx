@@ -34,11 +34,55 @@ import "./styles.css";
 
 const activeRunIdKey = "agent.activeRunId";
 const activeEventSeqKey = "agent.activeEventSeq";
+const runningRunsBySessionKey = "agent.runningRunsBySession";
 const sessionIdQueryKey = "sessionId";
 const defaultMessagePageLimit = 30;
 const defaultSessionPageLimit = 30;
 
 type ResourceMap = Record<string, AgentResourceRecord>;
+type RunningRunState = { runId: string; lastSeq: number };
+type RunningRunsBySession = Record<string, RunningRunState>;
+
+function readRunningRunsBySession(): RunningRunsBySession {
+  try {
+    const rawValue = localStorage.getItem(runningRunsBySessionKey);
+
+    if (!rawValue) {
+      return {};
+    }
+
+    const parsedValue = JSON.parse(rawValue) as Record<string, unknown>;
+    const runningRuns: RunningRunsBySession = {};
+
+    for (const [sessionId, value] of Object.entries(parsedValue)) {
+      if (!value || typeof value !== "object") {
+        continue;
+      }
+
+      const candidate = value as Partial<RunningRunState>;
+
+      if (typeof candidate.runId === "string") {
+        runningRuns[sessionId] = {
+          runId: candidate.runId,
+          lastSeq: typeof candidate.lastSeq === "number" && Number.isFinite(candidate.lastSeq) ? candidate.lastSeq : 0
+        };
+      }
+    }
+
+    return runningRuns;
+  } catch {
+    return {};
+  }
+}
+
+function writeRunningRunsBySession(runningRuns: RunningRunsBySession) {
+  if (Object.keys(runningRuns).length === 0) {
+    localStorage.removeItem(runningRunsBySessionKey);
+    return;
+  }
+
+  localStorage.setItem(runningRunsBySessionKey, JSON.stringify(runningRuns));
+}
 
 function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === "AbortError";
@@ -303,24 +347,71 @@ function applyPartEventToMessage(message: ChatMessage, event: AgentStreamEvent):
   }
 
   if (event.type === "message.part.delta") {
+    const parts = [...(message.parts ?? [])];
+    const targetPart = parts[event.partIndex];
+
+    if (!targetPart) {
+      parts[event.partIndex] = { type: "text", value: event.delta };
+      return {
+        ...message,
+        version: event.version ?? message.version,
+        parts
+      };
+    }
+
     return {
       ...message,
       version: event.version ?? message.version,
-      parts: (message.parts ?? []).map((part, index) =>
+      parts: parts.map((part, index) =>
         index === event.partIndex && part.type === "text" ? { ...part, value: part.value + event.delta } : part
       )
     };
   }
 
   if (event.type === "message.part.updated") {
+    const parts = [...(message.parts ?? [])];
+
+    if (!parts[event.partIndex]) {
+      parts[event.partIndex] = event.part;
+      return {
+        ...message,
+        version: event.version ?? message.version,
+        parts
+      };
+    }
+
     return {
       ...message,
       version: event.version ?? message.version,
-      parts: (message.parts ?? []).map((part, index) => (index === event.partIndex ? event.part : part))
+      parts: parts.map((part, index) => (index === event.partIndex ? event.part : part))
     };
   }
 
   return message;
+}
+
+function createStreamingAssistantMessage(messageId: string, event: AgentStreamEvent): ChatMessage {
+  const now = new Date().toISOString();
+
+  return {
+    id: messageId,
+    role: "assistant",
+    parts: event.type === "message.part.created" ? [] : [{ type: "text", value: "" }],
+    status: "running",
+    processSteps: [],
+    events: [],
+    createdAt: now,
+    updatedAt: now
+  };
+}
+
+function shouldCreateAssistantMessageForEvent(event: AgentStreamEvent) {
+  return (
+    event.type === "message.part.created" ||
+    event.type === "message.part.delta" ||
+    event.type === "message.part.updated" ||
+    event.type === "final_answer"
+  );
 }
 
 function appendStartedMessages(currentMessages: ChatMessage[], userMessage: AgentMessageRecord): ChatMessage[] {
@@ -460,6 +551,8 @@ export default function App() {
   const [isTracePanelCollapsed, setIsTracePanelCollapsed] = useState(false);
   const activeStreamControllerRef = useRef<AbortController | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
+  const activeSessionIdRef = useRef<string | undefined>(activeSessionId);
+  const runningRunsBySessionRef = useRef<RunningRunsBySession>(readRunningRunsBySession());
 
   useEffect(() => {
     const controller = new AbortController();
@@ -508,6 +601,7 @@ export default function App() {
       return;
     }
 
+    activeSessionIdRef.current = sessionId;
     setActiveSessionId(sessionId);
     writeSessionIdToUrl(sessionId);
 
@@ -525,6 +619,7 @@ export default function App() {
       .catch((sessionError) => {
         if (!cancelled) {
           clearSessionIdFromUrl(sessionId);
+          activeSessionIdRef.current = undefined;
           setActiveSessionId(undefined);
           setError(sessionError instanceof Error ? sessionError.message : "会话恢复失败");
         }
@@ -561,6 +656,7 @@ export default function App() {
         }
 
         rememberSession(snapshot.run.sessionId);
+        rememberRunningRun(snapshot.run.sessionId, runId);
         const sessionSnapshot = await getAgentSession(snapshot.run.sessionId);
 
         if (cancelled) {
@@ -577,12 +673,13 @@ export default function App() {
             return;
           }
 
-          applyStoredEvent(storedEvent);
+          applyStoredRunEvent(storedEvent, runId, snapshot.run.sessionId);
         }
 
         const lastEventSeq = snapshot.events[snapshot.events.length - 1]?.seq ?? 0;
 
         if (snapshot.run.status !== "running") {
+          forgetRunningRunByRunId(runId);
           clearActiveRun();
           return;
         }
@@ -592,7 +689,7 @@ export default function App() {
           lastEventSeq,
           (storedEvent) => {
             if (!cancelled) {
-              applyStoredEvent(storedEvent);
+              applyStoredRunEvent(storedEvent, runId, snapshot.run.sessionId);
             }
           },
           controller.signal
@@ -631,11 +728,71 @@ export default function App() {
     setActiveRunId(runId);
   }
 
+  function rememberRunningRun(sessionId: string, runId: string, lastSeq = 0) {
+    runningRunsBySessionRef.current = {
+      ...runningRunsBySessionRef.current,
+      [sessionId]: { runId, lastSeq }
+    };
+    writeRunningRunsBySession(runningRunsBySessionRef.current);
+  }
+
+  function updateRunningRunSeq(sessionId: string | undefined, runId: string, seq: number) {
+    if (!sessionId || seq <= 0) {
+      return;
+    }
+
+    const currentRun = runningRunsBySessionRef.current[sessionId];
+
+    if (!currentRun || currentRun.runId !== runId || currentRun.lastSeq >= seq) {
+      return;
+    }
+
+    rememberRunningRun(sessionId, runId, seq);
+  }
+
+  function forgetRunningRunByRunId(runId: string | undefined) {
+    if (!runId) {
+      return;
+    }
+
+    let didRemoveRun = false;
+    const nextRunningRuns: RunningRunsBySession = {};
+
+    for (const [sessionId, runningRun] of Object.entries(runningRunsBySessionRef.current)) {
+      if (runningRun.runId === runId) {
+        didRemoveRun = true;
+        continue;
+      }
+
+      nextRunningRuns[sessionId] = runningRun;
+    }
+
+    if (!didRemoveRun) {
+      return;
+    }
+
+    runningRunsBySessionRef.current = nextRunningRuns;
+    writeRunningRunsBySession(nextRunningRuns);
+  }
+
+  function forgetRunningRunForSession(sessionId: string) {
+    if (!runningRunsBySessionRef.current[sessionId]) {
+      return;
+    }
+
+    const nextRunningRuns = Object.fromEntries(
+      Object.entries(runningRunsBySessionRef.current).filter(([candidateSessionId]) => candidateSessionId !== sessionId)
+    );
+    runningRunsBySessionRef.current = nextRunningRuns;
+    writeRunningRunsBySession(nextRunningRuns);
+  }
+
   function releaseActiveRun(runId?: string) {
     if (runId && activeRunIdRef.current !== runId) {
       return;
     }
 
+    forgetRunningRunByRunId(runId ?? activeRunIdRef.current ?? undefined);
     clearActiveRun();
     activeStreamControllerRef.current = null;
     setIsStreaming(false);
@@ -657,12 +814,33 @@ export default function App() {
   }
 
   function rememberSession(sessionId: string) {
+    activeSessionIdRef.current = sessionId;
     setActiveSessionId(sessionId);
     writeSessionIdToUrl(sessionId);
   }
 
-  function updateAssistantMessage(messageId: string, update: (message: ChatMessage) => ChatMessage) {
-    setMessages((currentMessages) => currentMessages.map((message) => (message.id === messageId ? update(message) : message)));
+  function updateAssistantMessage(
+    messageId: string,
+    update: (message: ChatMessage) => ChatMessage,
+    options: { createFromEvent?: AgentStreamEvent } = {}
+  ) {
+    setMessages((currentMessages) => {
+      let didUpdate = false;
+      const nextMessages = currentMessages.map((message) => {
+        if (message.id !== messageId) {
+          return message;
+        }
+
+        didUpdate = true;
+        return update(message);
+      });
+
+      if (didUpdate || !options.createFromEvent) {
+        return nextMessages;
+      }
+
+      return [...currentMessages, update(createStreamingAssistantMessage(messageId, options.createFromEvent))];
+    });
   }
 
   function applyAgentEvent(event: AgentStreamEvent, messageId?: string, runId?: string) {
@@ -750,15 +928,17 @@ export default function App() {
           status: message.status === "completed" ? "completed" : "running",
           events: nextEvents
         };
-      });
+      }, shouldCreateAssistantMessageForEvent(event) ? { createFromEvent: event } : undefined);
     }
 
     if (event.type === "error") {
       setError(`${event.code}: ${event.message}`);
+      forgetRunningRunByRunId(runId ?? activeRunIdRef.current ?? undefined);
       clearActiveRun();
     }
 
     if (event.type === "cancelled") {
+      forgetRunningRunByRunId(runId ?? activeRunIdRef.current ?? undefined);
       clearActiveRun();
     }
 
@@ -772,6 +952,23 @@ export default function App() {
       localStorage.setItem(activeEventSeqKey, String(storedEvent.seq));
     }
     applyAgentEvent(storedEvent.event, storedEvent.messageId, storedEvent.runId);
+  }
+
+  function applyStoredRunEvent(storedEvent: StoredAgentEvent, expectedRunId: string, expectedSessionId?: string) {
+    if (activeRunIdRef.current !== expectedRunId) {
+      return;
+    }
+
+    if (expectedSessionId && activeSessionIdRef.current !== expectedSessionId) {
+      return;
+    }
+
+    if (storedEvent.runId && storedEvent.runId !== expectedRunId) {
+      return;
+    }
+
+    updateRunningRunSeq(expectedSessionId, expectedRunId, storedEvent.seq);
+    applyStoredEvent(storedEvent);
   }
 
   async function startRunWithCurrentSession(submittedParts: MessagePart[]) {
@@ -807,6 +1004,7 @@ export default function App() {
     } catch (cancelError) {
       setError(cancelError instanceof Error ? cancelError.message : "中断失败");
     } finally {
+      forgetRunningRunByRunId(runId);
       clearActiveRun();
 
       if (activeStreamControllerRef.current === controller) {
@@ -829,6 +1027,66 @@ export default function App() {
       }
 
       await refreshSessions();
+    }
+  }
+
+  function detachActiveRun() {
+    activeStreamControllerRef.current?.abort();
+    activeStreamControllerRef.current = null;
+    clearActiveRun();
+    setIsStreaming(false);
+  }
+
+  async function resumeSessionRunIfNeeded(sessionId: string) {
+    const runningRun = runningRunsBySessionRef.current[sessionId];
+
+    if (!runningRun) {
+      return;
+    }
+
+    const runId = runningRun.runId;
+    const controller = new AbortController();
+
+    setIsStreaming(true);
+    setActiveRun(runId);
+    activeStreamControllerRef.current = controller;
+    localStorage.setItem(activeRunIdKey, runId);
+    localStorage.setItem(activeEventSeqKey, String(runningRun.lastSeq));
+    setError(null);
+
+    try {
+      const snapshot = await getAgentRun(runId);
+
+      if (activeSessionIdRef.current !== sessionId || activeRunIdRef.current !== runId || activeStreamControllerRef.current !== controller) {
+        return;
+      }
+
+      if (snapshot.run.sessionId !== sessionId) {
+        forgetRunningRunForSession(sessionId);
+        clearActiveRun();
+        return;
+      }
+
+      const lastEventSeq = snapshot.events[snapshot.events.length - 1]?.seq ?? runningRun.lastSeq;
+      rememberRunningRun(sessionId, runId, lastEventSeq);
+      localStorage.setItem(activeEventSeqKey, String(lastEventSeq));
+
+      if (snapshot.run.status !== "running") {
+        forgetRunningRunByRunId(runId);
+        clearActiveRun();
+        return;
+      }
+
+      await streamAgentRunEvents(runId, lastEventSeq, (storedEvent) => applyStoredRunEvent(storedEvent, runId, sessionId), controller.signal);
+    } catch (streamError) {
+      if (activeStreamControllerRef.current === controller && !isAbortError(streamError)) {
+        setError(streamError instanceof Error ? streamError.message : "流式请求失败");
+      }
+    } finally {
+      if (activeStreamControllerRef.current === controller) {
+        activeStreamControllerRef.current = null;
+        setIsStreaming(false);
+      }
     }
   }
 
@@ -857,13 +1115,14 @@ export default function App() {
       rememberSession(session.id);
       upsertSession(session);
       setActiveRun(run.id);
+      rememberRunningRun(session.id, run.id);
       activeStreamControllerRef.current = controller;
       streamControllerAttached = true;
       localStorage.setItem(activeRunIdKey, run.id);
       localStorage.setItem(activeEventSeqKey, "0");
       setMessages((currentMessages) => appendStartedMessages(currentMessages, userMessage));
       setComposerParts([{ type: "text", value: "" }]);
-      await streamAgentRunEvents(run.id, 0, applyStoredEvent, controller.signal);
+      await streamAgentRunEvents(run.id, 0, (storedEvent) => applyStoredRunEvent(storedEvent, run.id, session.id), controller.signal);
       await refreshSessions();
     } catch (streamError) {
       if (!isAbortError(streamError) && (!streamControllerAttached || activeStreamControllerRef.current === controller)) {
@@ -897,11 +1156,12 @@ export default function App() {
       rememberSession(session.id);
       upsertSession(session);
       setActiveRun(run.id);
+      rememberRunningRun(session.id, run.id);
       activeStreamControllerRef.current = controller;
       streamControllerAttached = true;
       localStorage.setItem(activeRunIdKey, run.id);
       localStorage.setItem(activeEventSeqKey, "0");
-      await streamAgentRunEvents(run.id, 0, applyStoredEvent, controller.signal);
+      await streamAgentRunEvents(run.id, 0, (storedEvent) => applyStoredRunEvent(storedEvent, run.id, session.id), controller.signal);
       await refreshSessions();
     } catch (streamError) {
       if (!isAbortError(streamError) && (!streamControllerAttached || activeStreamControllerRef.current === controller)) {
@@ -922,9 +1182,10 @@ export default function App() {
     await cancelActiveRun();
   }
 
-  function handleNewSession() {
+  function resetToNewSession() {
     clearActiveRun();
     clearSessionIdFromUrl();
+    activeSessionIdRef.current = undefined;
     setActiveSessionId(undefined);
     setComposerParts([{ type: "text", value: "" }]);
     setMessages([]);
@@ -933,6 +1194,14 @@ export default function App() {
     setIsLoadingOlderMessages(false);
     setEvents([]);
     setError(null);
+  }
+
+  async function handleNewSession() {
+    if (activeRunId) {
+      detachActiveRun();
+    }
+
+    resetToNewSession();
   }
 
   function handleSuggestionSelect(suggestion: string) {
@@ -959,9 +1228,17 @@ export default function App() {
       return;
     }
 
+    if (activeRunId) {
+      detachActiveRun();
+    }
+
     clearActiveRun();
     setError(null);
     setEvents([]);
+    setMessages([]);
+    setResourcesById({});
+    setMessagePageInfo(createDefaultMessagePageInfo());
+    setIsLoadingOlderMessages(false);
 
     try {
       const { session, messages, resources, processSteps, pageInfo } = await getAgentSession(sessionId);
@@ -970,6 +1247,7 @@ export default function App() {
       setMessages(buildMessagesFromRecords(messages, processSteps));
       setResourcesById(resourcesToMap(resources));
       setMessagePageInfo(normalizeMessagePageInfo(pageInfo));
+      await resumeSessionRunIfNeeded(session.id);
     } catch (sessionError) {
       setError(sessionError instanceof Error ? sessionError.message : "会话恢复失败");
     }
@@ -1004,6 +1282,7 @@ export default function App() {
   async function handleDeleteSession(sessionId: string) {
     setDeletingSessionIds((currentIds) => new Set(currentIds).add(sessionId));
     setError(null);
+    forgetRunningRunForSession(sessionId);
 
     if (sessionId === activeSessionId && activeRunId) {
       activeStreamControllerRef.current?.abort();
@@ -1016,7 +1295,7 @@ export default function App() {
       setSessions((currentSessions) => currentSessions.filter((session) => session.id !== sessionId));
 
       if (sessionId === activeSessionId) {
-        handleNewSession();
+        resetToNewSession();
       }
     } catch (sessionError) {
       setError(sessionError instanceof Error ? sessionError.message : "删除会话失败");
@@ -1073,7 +1352,6 @@ export default function App() {
           health={health}
           historyItems={historyItems}
           isCollapsed={isSessionSidebarCollapsed}
-          isBusy={isStreaming}
           hasMoreSessions={sessionPageInfo.hasMore}
           isLoadingMoreSessions={isLoadingMoreSessions}
           deletingSessionIds={deletingSessionIds}

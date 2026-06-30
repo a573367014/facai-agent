@@ -19,6 +19,7 @@ export interface AgentExecutionInput {
   input: string;
   parts?: MessagePart[];
   history?: AgentMessage[];
+  replayToolCalls?: ToolCall[];
   maxIterations?: number;
   messageId?: string;
   sessionId?: string;

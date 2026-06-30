@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   appendTextDelta,
   createTextPart,
+  ensureAppendableTextPart,
   partsToLlmText,
   stripRuntimePartFields,
   upsertGeneratedImageParts,
@@ -70,6 +71,27 @@ describe("message parts", () => {
 
   it("appends text delta to the addressed text part", () => {
     expect(appendTextDelta([createTextPart("")], 0, "你好")).toEqual([{ type: "text", value: "你好" }]);
+  });
+
+  it("appends a new text part after existing media when text arrives later", () => {
+    const parts: MessagePart[] = [
+      {
+        type: "media",
+        mime: "image/png",
+        url: "https://example.com/generated.png",
+        extra: { lifecycle: { state: "succeeded" } }
+      }
+    ];
+
+    const result = ensureAppendableTextPart(parts);
+
+    expect(result).toEqual({
+      partIndex: 1,
+      parts: [
+        parts[0],
+        { type: "text", value: "" }
+      ]
+    });
   });
 
   it("creates and updates generated image parts by tool call id and output index", () => {

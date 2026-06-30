@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentConversation, type ChatMessage } from "./AgentConversation";
@@ -772,7 +772,7 @@ describe("AgentConversation", () => {
       }
     ];
 
-    render(
+    const { container } = render(
       <AgentConversation
         messages={messages}
         resourcesById={{
@@ -797,8 +797,50 @@ describe("AgentConversation", () => {
       />
     );
 
+    const gallery = container.querySelector(".message-image-gallery");
+
     expect(screen.queryByRole("img", { name: "田园小猪" })).not.toBeInTheDocument();
-    expect(screen.getByText("图片资源缺少地址")).toBeInTheDocument();
+    expect(gallery).toHaveTextContent("生成失败");
+    expect(gallery).not.toHaveTextContent("图片资源缺少地址");
+  });
+
+  it("media part 失败卡片不展示具体错误原因", () => {
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_1:assistant",
+        role: "assistant",
+        parts: [
+          { type: "text", value: "如果需要，我可以帮你重新调整提示词。原因：HTTP 429: Request Has Reached API Concurrent Limit" },
+          {
+            type: "media",
+            mime: "image/png",
+            width: 1024,
+            height: 1024,
+            extra: {
+              lifecycle: {
+                state: "failed",
+                error: { code: "IMAGE_GENERATION_FAILED", message: "HTTP 429: Request Has Reached API Concurrent Limit" }
+              },
+              tool: { name: "generate_image", toolCallId: "call_image", outputIndex: 0 },
+              generation: { prompt: "水彩风格的小猪", provider: "test" }
+            }
+          }
+        ],
+        status: "completed"
+      }
+    ];
+
+    const { container } = render(<AgentConversation messages={messages} isActive={false} />);
+    const markdown = container.querySelector(".markdown-body");
+    const gallery = container.querySelector(".message-image-gallery");
+
+    expect(markdown).not.toBeNull();
+    expect(within(markdown as HTMLElement).getByText(/HTTP 429: Request Has Reached API Concurrent Limit/)).toBeInTheDocument();
+    expect(gallery).not.toBeNull();
+    expect(gallery?.querySelector(".message-image-failed-icon")).not.toBeNull();
+    expect(within(gallery as HTMLElement).getByText("生成失败")).toBeInTheDocument();
+    expect(gallery).not.toHaveTextContent("HTTP 429");
+    expect(gallery).not.toHaveTextContent("Request Has Reached API Concurrent Limit");
   });
 
   it("renders assistant video media from message parts", () => {
@@ -850,6 +892,39 @@ describe("AgentConversation", () => {
     expect(screen.getByText("视频已生成。")).toBeInTheDocument();
     expect(screen.getByLabelText("田园小猪视频")).toHaveAttribute("src", "https://example.com/part-video.mp4");
     expect(screen.getByRole("link", { name: "下载视频 1" })).toHaveAttribute("href", "https://example.com/part-video.mp4");
+  });
+
+  it("按 assistant message parts 原始顺序渲染媒体和后续文本", () => {
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_1:assistant",
+        role: "assistant",
+        parts: [
+          {
+            type: "media",
+            mime: "image/png",
+            url: "https://example.com/generated.png",
+            extra: {
+              lifecycle: { state: "succeeded" },
+              generation: { prompt: "先生成的图片", provider: "test" }
+            }
+          },
+          { type: "text", value: "后续总结文本" }
+        ],
+        status: "completed"
+      }
+    ];
+
+    const { container } = render(<AgentConversation messages={messages} isActive={false} />);
+    const body = container.querySelector(".chat-answer");
+    const children = Array.from(body?.children ?? []);
+    const galleryIndex = children.findIndex((child) => child.classList.contains("message-image-gallery"));
+    const markdownIndex = children.findIndex((child) => child.classList.contains("markdown-body"));
+
+    expect(galleryIndex).toBeGreaterThanOrEqual(0);
+    expect(markdownIndex).toBeGreaterThanOrEqual(0);
+    expect(galleryIndex).toBeLessThan(markdownIndex);
+    expect(screen.getByText("后续总结文本")).toBeInTheDocument();
   });
 
   it("在回答主体展示图片预览，不再展示工具过程兜底", async () => {

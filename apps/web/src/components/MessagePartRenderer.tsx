@@ -7,6 +7,10 @@ import type { ToolImageActionPayload } from "./ToolResultPreview";
 import type { ToolTrace } from "../utils/tool-traces";
 import { UserPartSurface, type UserPartSurfaceHandle } from "./UserPartSurface";
 
+type AssistantPartGroup =
+  | { type: "text"; startIndex: number; value: string }
+  | { type: "media"; startIndex: number; parts: MediaPart[] };
+
 interface MessagePartRendererProps {
   role: "user" | "assistant";
   parts: MessagePart[];
@@ -28,30 +32,71 @@ export function MessagePartRenderer({
     return <UserPartSurface ref={userPartSurfaceRef} parts={parts} />;
   }
 
-  const text = parts
-    .filter((part): part is Extract<MessagePart, { type: "text" }> => part.type === "text")
-    .map((part) => part.value)
-    .filter((value) => value.length > 0)
-    .join("\n");
-  const mediaParts = parts.filter((part): part is MediaPart => part.type === "media");
+  const groups = groupAssistantParts(parts);
+  const lastTextGroupIndex = findLastTextGroupIndex(groups);
 
   return (
     <>
-      {text ? (
-        <div className="markdown-body">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
-          {showCursor ? <span className="typing-cursor" aria-hidden="true" /> : null}
-        </div>
-      ) : null}
+      {groups.map((group, groupIndex) => {
+        if (group.type === "text") {
+          return (
+            <div className="markdown-body" key={`text:${group.startIndex}`}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{group.value}</ReactMarkdown>
+              {showCursor && groupIndex === lastTextGroupIndex ? <span className="typing-cursor" aria-hidden="true" /> : null}
+            </div>
+          );
+        }
 
-      {mediaParts.length > 0 ? (
-        <MessageImageGallery
-          items={mediaParts.map((part, index) => toMediaGalleryItem(part, index))}
-          onImageAction={onImageAction}
-        />
-      ) : null}
+        return (
+          <MessageImageGallery
+            key={`media:${group.startIndex}`}
+            items={group.parts.map((part, index) => toMediaGalleryItem(part, index))}
+            onImageAction={onImageAction}
+          />
+        );
+      })}
     </>
   );
+}
+
+function findLastTextGroupIndex(groups: AssistantPartGroup[]): number {
+  for (let index = groups.length - 1; index >= 0; index -= 1) {
+    if (groups[index].type === "text") {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+function groupAssistantParts(parts: MessagePart[]): AssistantPartGroup[] {
+  const groups: AssistantPartGroup[] = [];
+
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    const lastGroup = groups[groups.length - 1];
+
+    if (part.type === "text") {
+      if (!part.value) {
+        continue;
+      }
+
+      if (lastGroup?.type === "text") {
+        lastGroup.value = [lastGroup.value, part.value].filter(Boolean).join("\n");
+      } else {
+        groups.push({ type: "text", startIndex: index, value: part.value });
+      }
+      continue;
+    }
+
+    if (lastGroup?.type === "media") {
+      lastGroup.parts.push(part);
+    } else {
+      groups.push({ type: "media", startIndex: index, parts: [part] });
+    }
+  }
+
+  return groups;
 }
 
 function toMediaGalleryItem(part: MediaPart, index: number): MessageImageGalleryItem {
