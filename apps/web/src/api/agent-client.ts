@@ -31,7 +31,7 @@ export interface AgentSessionSummaryRecord {
 
 export interface PartExtra {
   placeholder?: {
-    type: "text" | "input" | "select" | "image" | "skill";
+    type: "text" | "input" | "select" | "image" | "video" | "skill";
     label: string;
     defaultValue?: string;
     options?: Array<{ label: string; value: string; icon?: string }>;
@@ -131,11 +131,33 @@ export interface AgentResourceRecord {
   updatedAt: string;
 }
 
-export interface AgentMessagePageInfo {
+export interface AgentProcessStepRecord {
+  id: string;
+  sessionId: string;
+  runId?: string;
+  messageId: string;
+  toolCallRowId?: string;
+  toolCallId?: string;
+  kind: "thinking" | "tool" | "resource" | "summary" | "error";
+  title: string;
+  summary?: string;
+  status: "running" | "succeeded" | "failed" | "cancelled";
+  orderIndex: number;
+  metadata?: Record<string, unknown>;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+export interface AgentPageInfo {
   hasMore: boolean;
-  oldestCursor?: string;
+  nextCursor?: string;
   limit: number;
 }
+
+export type AgentMessagePageInfo = AgentPageInfo;
+
+export type AgentSessionPageInfo = AgentPageInfo;
 
 export type AgentState = "thinking" | "calling_tool" | "observing" | "answering" | "done" | "failed";
 
@@ -152,12 +174,20 @@ export type AgentStreamEvent =
   | { type: "llm_start"; iteration: number }
   | { type: "session.message.created"; message: AgentMessageRecord }
   | { type: "session.message.updated"; message: AgentMessageRecord }
-  | { type: "message.snapshot"; message: AgentMessageRecord; resources: AgentResourceRecord[]; version?: number }
+  | {
+      type: "message.snapshot";
+      message: AgentMessageRecord;
+      resources: AgentResourceRecord[];
+      processSteps?: AgentProcessStepRecord[];
+      version?: number;
+    }
   | { type: "message.part.created"; messageId: string; partIndex: number; part: MessagePart; version?: number }
   | { type: "message.part.delta"; messageId: string; partIndex: number; delta: string; version?: number }
   | { type: "message.part.updated"; messageId: string; partIndex: number; part: MessagePart; version?: number }
   | { type: "resource.created"; resource: AgentResourceRecord }
   | { type: "resource.updated"; resource: AgentResourceRecord }
+  | { type: "process.step.created"; step: AgentProcessStepRecord }
+  | { type: "process.step.updated"; step: AgentProcessStepRecord }
   | {
       type: "summary_start";
       sessionId: string;
@@ -234,6 +264,7 @@ export interface AgentSessionResponse {
   session: AgentSessionRecord;
   messages: AgentMessageRecord[];
   resources?: AgentResourceRecord[];
+  processSteps?: AgentProcessStepRecord[];
   pageInfo?: AgentMessagePageInfo;
   summary?: AgentSessionSummaryRecord;
 }
@@ -241,16 +272,19 @@ export interface AgentSessionResponse {
 export interface AgentSessionMessagesResponse {
   messages: AgentMessageRecord[];
   resources?: AgentResourceRecord[];
+  processSteps?: AgentProcessStepRecord[];
   pageInfo: AgentMessagePageInfo;
 }
 
 export interface AgentSessionsResponse {
   sessions: AgentSessionRecord[];
+  pageInfo?: AgentSessionPageInfo;
 }
 
 export interface AgentMessageDetailResponse {
   message: AgentMessageRecord;
   resources?: AgentResourceRecord[];
+  processSteps?: AgentProcessStepRecord[];
   events: StoredAgentEvent[];
   version?: number;
 }
@@ -427,8 +461,19 @@ export async function getAgentSessionMessages(
   return payload as AgentSessionMessagesResponse;
 }
 
-export async function listAgentSessions(): Promise<AgentSessionsResponse> {
-  const response = await fetch(`${apiBaseUrl}/agents/sessions`);
+export async function listAgentSessions(options: { after?: string; limit?: number } = {}): Promise<AgentSessionsResponse> {
+  const query = new URLSearchParams();
+
+  if (options.after) {
+    query.set("after", options.after);
+  }
+
+  if (options.limit !== undefined) {
+    query.set("limit", String(options.limit));
+  }
+
+  const queryString = query.toString();
+  const response = await fetch(`${apiBaseUrl}/agents/sessions${queryString ? `?${queryString}` : ""}`);
   const payload = (await response.json()) as AgentSessionsResponse | ApiErrorResponse;
 
   if (!response.ok) {
@@ -437,6 +482,17 @@ export async function listAgentSessions(): Promise<AgentSessionsResponse> {
   }
 
   return payload as AgentSessionsResponse;
+}
+
+export async function deleteAgentSession(sessionId: string): Promise<void> {
+  const response = await fetch(`${apiBaseUrl}/agents/sessions/${sessionId}`, {
+    method: "DELETE"
+  });
+
+  if (!response.ok) {
+    const errorPayload = (await response.json()) as ApiErrorResponse;
+    throw new Error(`${errorPayload.error.code}: ${errorPayload.error.message}`);
+  }
 }
 
 export async function getAgentMessage(messageId: string): Promise<AgentMessageDetailResponse> {

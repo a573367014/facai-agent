@@ -182,6 +182,42 @@ describe("PartComposer", () => {
     });
   });
 
+  it("全选后点击输入框外部会清除 media part 选中态", async () => {
+    render(
+      <>
+        <button type="button">外部区域</button>
+        <PartComposer
+          parts={[
+            { type: "text", value: "看" },
+            { type: "media", mime: "image/png", url: "http://localhost:4001/uploads/images/old.png", name: "old.png" },
+            { type: "text", value: "这张" }
+          ]}
+          onCancel={vi.fn()}
+          onChange={vi.fn()}
+          onSubmit={vi.fn()}
+          onUploadImage={vi.fn()}
+        />
+      </>
+    );
+
+    const textbox = screen.getByRole("textbox", { name: "发消息" });
+    await userEvent.click(textbox);
+    await userEvent.keyboard("{Control>}a{/Control}");
+
+    const mediaPart = screen.getByText("old.png").closest(".pm-part--media");
+    expect(mediaPart).toBeInstanceOf(HTMLElement);
+
+    await waitFor(() => {
+      expect(mediaPart).toHaveClass("is-range-selected");
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "外部区域" }));
+
+    await waitFor(() => {
+      expect(mediaPart).not.toHaveClass("is-range-selected");
+    });
+  });
+
   it("点击 media part 删除按钮会移除当前 part 并保留周围文本", async () => {
     const onChange = vi.fn();
     const onUploadImage = vi.fn();
@@ -217,6 +253,7 @@ describe("PartComposer", () => {
     expect(styles).toMatch(/\.pm-part--media\s*{[^}]*height:\s*var\(--part-composer-line-height\);/s);
     expect(styles).toMatch(/\.pm-part--media\s*{[^}]*padding:\s*0\s+[^;]+;/s);
     expect(styles).not.toMatch(/\.pm-part--media\s*{[^}]*margin-right:/s);
+    expect(styles).not.toMatch(/\.pm-part--media\s*{[^}]*user-select:\s*none;/s);
     expect(styles).toMatch(/\.pm-part-media-remove\s*{[^}]*width:\s*18px;[^}]*height:\s*18px;/s);
     expect(styles).toMatch(/\.pm-part-media-remove:hover\s*{[^}]*background:\s*var\(--eye-primary\);/s);
     expect(styles).toMatch(/\.pm-part--media\.ProseMirror-selectednode\s*{[^}]*box-shadow:/s);

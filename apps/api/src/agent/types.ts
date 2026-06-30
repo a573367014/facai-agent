@@ -74,6 +74,24 @@ export interface AgentResourceSnapshot {
   updatedAt: string;
 }
 
+export interface AgentProcessStepSnapshot {
+  id: string;
+  sessionId: string;
+  runId?: string;
+  messageId: string;
+  toolCallRowId?: string;
+  toolCallId?: string;
+  kind: "thinking" | "tool" | "resource" | "summary" | "error";
+  title: string;
+  summary?: string;
+  status: "running" | "succeeded" | "failed" | "cancelled";
+  orderIndex: number;
+  metadata?: JsonObject;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
 export type AgentStreamEvent =
   | { type: "iteration_start"; iteration: number }
   | { type: "iteration_end"; iteration: number; outcome: "tool_calls" | "final_answer" }
@@ -81,12 +99,20 @@ export type AgentStreamEvent =
   | { type: "llm_start"; iteration: number }
   | { type: "session.message.created"; message: AgentMessageSnapshot }
   | { type: "session.message.updated"; message: AgentMessageSnapshot }
-  | { type: "message.snapshot"; message: AgentMessageSnapshot; resources: AgentResourceSnapshot[]; version?: number }
+  | {
+      type: "message.snapshot";
+      message: AgentMessageSnapshot;
+      resources: AgentResourceSnapshot[];
+      processSteps?: AgentProcessStepSnapshot[];
+      version?: number;
+    }
   | { type: "message.part.created"; messageId: string; partIndex: number; part: MessagePart; version?: number }
   | { type: "message.part.delta"; messageId: string; partIndex: number; delta: string; version?: number }
   | { type: "message.part.updated"; messageId: string; partIndex: number; part: MessagePart; version?: number }
   | { type: "resource.created"; resource: AgentResourceSnapshot }
   | { type: "resource.updated"; resource: AgentResourceSnapshot }
+  | { type: "process.step.created"; step: AgentProcessStepSnapshot }
+  | { type: "process.step.updated"; step: AgentProcessStepSnapshot }
   | {
       type: "summary_start";
       sessionId: string;

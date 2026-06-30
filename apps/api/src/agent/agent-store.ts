@@ -8,6 +8,8 @@ export type AgentRunStatus = "running" | "completed" | "failed" | "cancelled";
 export type AgentRunPhase = "compressing" | "answering" | "completed" | "failed" | "cancelled";
 export type AgentToolCallStatus = "pending" | "running" | "succeeded" | "failed";
 export type AgentResourceStatus = "pending" | "succeeded" | "failed";
+export type AgentProcessStepKind = "thinking" | "tool" | "resource" | "summary" | "error";
+export type AgentProcessStepStatus = "running" | "succeeded" | "failed" | "cancelled";
 
 export interface AgentSessionRecord {
   id: string;
@@ -40,16 +42,25 @@ export interface AgentSessionSummaryRecord {
   updatedAt: string;
 }
 
-export interface AgentMessagePageInfo {
+export interface AgentPageInfo {
   hasMore: boolean;
-  oldestCursor?: string;
+  nextCursor?: string;
   limit: number;
 }
+
+export type AgentMessagePageInfo = AgentPageInfo;
 
 export interface AgentMessagePage {
   messages: AgentMessageRecord[];
   pageInfo: AgentMessagePageInfo;
 }
+
+export interface ListAgentSessionsOptions {
+  after?: string;
+  limit?: number;
+}
+
+export type AgentSessionPageInfo = AgentPageInfo;
 
 export interface AgentMessageRecord {
   id: string;
@@ -146,6 +157,24 @@ export interface AgentResourceRecord {
   metadata?: JsonObject;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface AgentProcessStepRecord {
+  id: string;
+  sessionId: string;
+  runId?: string;
+  messageId: string;
+  toolCallRowId?: string;
+  toolCallId?: string;
+  kind: AgentProcessStepKind;
+  title: string;
+  summary?: string;
+  status: AgentProcessStepStatus;
+  orderIndex: number;
+  metadata?: JsonObject;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
 }
 
 export interface CreateAgentMessageInput {
@@ -251,10 +280,35 @@ export interface UpdateAgentResourceInput {
   metadata?: JsonObject;
 }
 
+export interface CreateAgentProcessStepInput {
+  sessionId: string;
+  runId?: string;
+  messageId: string;
+  toolCallRowId?: string;
+  toolCallId?: string;
+  kind: AgentProcessStepKind;
+  title: string;
+  summary?: string;
+  status?: AgentProcessStepStatus;
+  orderIndex: number;
+  metadata?: JsonObject;
+}
+
+export interface UpdateAgentProcessStepInput {
+  toolCallRowId?: string;
+  toolCallId?: string;
+  title?: string;
+  summary?: string;
+  status?: AgentProcessStepStatus;
+  metadata?: JsonObject;
+  completedAt?: string;
+}
+
 export interface AgentStore {
   createSession(title?: string): AgentSessionRecord;
-  listSessions(): AgentSessionRecord[];
+  listSessions(options?: ListAgentSessionsOptions): AgentSessionRecord[];
   getSession(sessionId: string): AgentSessionRecord | undefined;
+  deleteSession(sessionId: string): boolean;
   getSessionSummary(sessionId: string): AgentSessionSummaryRecord | undefined;
   getSessionSummaryBeforeMessage(sessionId: string, messageId: string): AgentSessionSummaryRecord | undefined;
   listSessionSummaries(sessionId: string): AgentSessionSummaryRecord[];
@@ -298,6 +352,9 @@ export interface AgentStore {
   createResource(input: CreateAgentResourceInput): AgentResourceRecord;
   updateResource(resourceId: string, input: UpdateAgentResourceInput): AgentResourceRecord | undefined;
   getResourcesByMessages(messageIds: string[]): AgentResourceRecord[];
+  createProcessStep(input: CreateAgentProcessStepInput): AgentProcessStepRecord;
+  updateProcessStep(stepId: string, input: UpdateAgentProcessStepInput): AgentProcessStepRecord | undefined;
+  getProcessStepsByMessages(messageIds: string[]): AgentProcessStepRecord[];
   appendEvent(messageId: string, event: AgentStreamEvent): StoredAgentEvent | undefined;
   publishTransientEvent(messageId: string, event: AgentStreamEvent): StoredAgentEvent | undefined;
   getEvents(messageId: string, after?: number): StoredAgentEvent[];

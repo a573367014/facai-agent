@@ -12,6 +12,7 @@ import { AgentContextBuilder } from "./agent/context-builder.js";
 import { InMemoryRunningMessageStateStore, type RunningMessageStateStore } from "./agent/running-message-state-store.js";
 import { RedisRunningMessageStateStore } from "./agent/redis-running-message-state-store.js";
 import { SqliteAgentStore } from "./agent/sqlite-agent-store.js";
+import { LocalToolResourceStorage, type ToolResourceStorage } from "./agent/tool-resource-storage.js";
 import { createCorsOriginChecker } from "./config/cors.js";
 import { loadEnv } from "./config/env.js";
 import { AppError } from "./errors/app-error.js";
@@ -31,6 +32,7 @@ export interface BuildAppOptions {
   eventCleanupBatchSize?: number;
   eventCleanupMaxBatches?: number;
   runningStateStore?: RunningMessageStateStore;
+  toolResourceStorage?: ToolResourceStorage;
   uploadDirectory?: string;
 }
 
@@ -57,6 +59,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
   });
 
   const uploadDirectory = resolve(options.uploadDirectory ?? env.AGENT_UPLOAD_DIR);
+  const publicBaseUrl = env.AGENT_PUBLIC_BASE_URL ?? `http://127.0.0.1:${env.PORT}`;
   await mkdir(uploadDirectory, { recursive: true });
 
   await app.register(multipart, {
@@ -120,6 +123,21 @@ export async function buildApp(options: BuildAppOptions = {}) {
       pollIntervalMs: env.VOLCENGINE_IMAGE_POLL_INTERVAL_MS,
       maxPollAttempts: env.VOLCENGINE_IMAGE_MAX_POLL_ATTEMPTS,
       timeoutMs: env.VOLCENGINE_IMAGE_TOOL_TIMEOUT_MS
+    },
+    jimengVideo: {
+      accessKeyId: env.VOLCENGINE_ACCESS_KEY_ID,
+      secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY,
+      uploadDirectory,
+      endpoint: env.VOLCENGINE_VIDEO_ENDPOINT,
+      region: env.VOLCENGINE_VIDEO_REGION,
+      service: env.VOLCENGINE_VIDEO_SERVICE,
+      version: env.VOLCENGINE_VIDEO_VERSION,
+      reqKey: env.VOLCENGINE_VIDEO_REQ_KEY,
+      firstFrameReqKey: env.VOLCENGINE_VIDEO_FIRST_FRAME_REQ_KEY,
+      firstLastFrameReqKey: env.VOLCENGINE_VIDEO_FIRST_LAST_FRAME_REQ_KEY,
+      pollIntervalMs: env.VOLCENGINE_VIDEO_POLL_INTERVAL_MS,
+      maxPollAttempts: env.VOLCENGINE_VIDEO_MAX_POLL_ATTEMPTS,
+      timeoutMs: env.VOLCENGINE_VIDEO_TOOL_TIMEOUT_MS
     }
   });
   // 当前先用 allow-list 做最小权限控制。未配置时 demo 仍开放所有默认工具；
@@ -177,6 +195,14 @@ export async function buildApp(options: BuildAppOptions = {}) {
           ttlSeconds: env.AGENT_RUNNING_STATE_TTL_SECONDS
         });
       })();
+    const toolResourceStorage =
+      options.toolResourceStorage ??
+      new LocalToolResourceStorage({
+        uploadDirectory,
+        publicBaseUrl,
+        maxBytes: env.AGENT_TOOL_RESOURCE_MAX_BYTES,
+        timeoutMs: env.AGENT_TOOL_RESOURCE_DOWNLOAD_TIMEOUT_MS
+      });
     const cleanupExpiredEvents = () => {
       const nowIso = new Date().toISOString();
 
@@ -216,16 +242,6 @@ export async function buildApp(options: BuildAppOptions = {}) {
     };
     scheduleNextEventCleanup();
 
-    app.addHook("onClose", async () => {
-      if (eventCleanupTimer) {
-        clearTimeout(eventCleanupTimer);
-      }
-      if (redisClient) {
-        redisClient.disconnect();
-      }
-      agentStore.close();
-    });
-
     coordinator = new AgentMessageCoordinator(
       agentService,
       agentStore,
@@ -241,8 +257,32 @@ export async function buildApp(options: BuildAppOptions = {}) {
             keepRecentMessages: env.AGENT_SUMMARY_KEEP_RECENT_MESSAGES,
             triggerCharacterCount: env.AGENT_SUMMARY_TRIGGER_CHARS
           }),
-      runningStateStore
+      runningStateStore,
+      toolResourceStorage
     );
+
+    app.addHook("onClose", async () => {
+      await coordinator?.shutdown("服务关闭");
+      if (eventCleanupTimer) {
+        clearTimeout(eventCleanupTimer);
+      }
+      if (redisClient) {
+        redisClient.disconnect();
+      }
+      agentStore.close();
+    });
+  }
+
+  const staleCleanup = await coordinator.cleanupStaleRunningExecutions();
+
+  if (
+    staleCleanup.runs > 0 ||
+    staleCleanup.messages > 0 ||
+    staleCleanup.toolCalls > 0 ||
+    staleCleanup.resources > 0 ||
+    staleCleanup.processSteps > 0
+  ) {
+    app.log.warn(staleCleanup, "stale agent running executions marked failed");
   }
 
   await registerHealthRoutes(app);

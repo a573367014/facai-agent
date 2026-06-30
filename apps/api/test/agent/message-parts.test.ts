@@ -86,8 +86,10 @@ describe("message parts", () => {
     expect(pending).toEqual([
       {
         type: "media",
+        mime: "image/png",
         extra: {
           placeholder: { type: "image", label: "图片生成中" },
+          lifecycle: { state: "pending" },
           resource: { id: "res_1" },
           tool: { name: "generate_image", toolCallId: "call_1", toolCallRowId: "tool_call_1", outputIndex: 0 }
         }
@@ -101,15 +103,58 @@ describe("message parts", () => {
       toolCallId: "call_1",
       toolCallRowId: "tool_call_1",
       outputIndex: 0,
-      mime: "image/png"
-    });
-
-    expect(completed[0]).toMatchObject({
-      type: "media",
-      extra: {
-        resource: { id: "res_1" },
-        tool: { name: "generate_image", toolCallId: "call_1", toolCallRowId: "tool_call_1", outputIndex: 0 }
+      mime: "image/png",
+      url: "https://example.com/generated-pig.png",
+      name: "温馨田园小猪",
+      width: 1024,
+      height: 768,
+      generation: {
+        prompt: "温馨田园小猪",
+        provider: "test"
       }
     });
+
+    expect(completed[0]).toEqual({
+      type: "media",
+      mime: "image/png",
+      url: "https://example.com/generated-pig.png",
+      name: "温馨田园小猪",
+      width: 1024,
+      height: 768,
+      extra: {
+        lifecycle: { state: "succeeded" },
+        resource: { id: "res_1" },
+        tool: { name: "generate_image", toolCallId: "call_1", toolCallRowId: "tool_call_1", outputIndex: 0 },
+        generation: {
+          prompt: "温馨田园小猪",
+          provider: "test"
+        }
+      }
+    });
+  });
+
+  it("creates generated video parts with video placeholder", () => {
+    const pending = upsertGeneratedImageParts([], {
+      state: "pending",
+      resourceId: "res_video",
+      toolName: "generate_video",
+      toolCallId: "call_video",
+      toolCallRowId: "tool_call_video",
+      outputIndex: 0,
+      mime: "video/mp4"
+    });
+
+    expect(pending).toEqual([
+      {
+        type: "media",
+        mime: "video/mp4",
+        extra: {
+          placeholder: { type: "video", label: "视频生成中" },
+          lifecycle: { state: "pending" },
+          resource: { id: "res_video" },
+          tool: { name: "generate_video", toolCallId: "call_video", toolCallRowId: "tool_call_video", outputIndex: 0 }
+        }
+      }
+    ]);
   });
 });

@@ -1,5 +1,5 @@
-import { Alert, Box, Chip, CircularProgress, IconButton, Paper, Tooltip, Typography, type TooltipProps } from "@mui/material";
-import { CircleAlert, CircleStop, Copy, Pencil, RefreshCw } from "lucide-react";
+import { Accordion, AccordionDetails, AccordionSummary, Alert, Box, Chip, CircularProgress, IconButton, Paper, Tooltip, Typography, type TooltipProps } from "@mui/material";
+import { CheckCircle2, ChevronDown, CircleAlert, CircleStop, Clock3, Copy, Loader2, Pencil, RefreshCw, XCircle } from "lucide-react";
 import {
   useEffect,
   useLayoutEffect,
@@ -8,10 +8,10 @@ import {
   type UIEvent,
   type WheelEvent
 } from "react";
-import type { AgentResourceRecord, AgentState, AgentStreamEvent, MessagePart } from "../api/agent-client";
+import type { AgentProcessStepRecord, AgentResourceRecord, AgentState, AgentStreamEvent, MessagePart } from "../api/agent-client";
 import type { ToolImageActionPayload } from "./ToolResultPreview";
-import { ToolTraceList } from "./ToolTraceList";
 import { MessagePartRenderer } from "./MessagePartRenderer";
+import type { UserPartSurfaceHandle } from "./UserPartSurface";
 
 export type ChatMessageStatus = "running" | "completed" | "failed" | "cancelled";
 
@@ -21,6 +21,7 @@ export interface ChatMessage {
   parts: MessagePart[];
   status?: ChatMessageStatus;
   version?: number;
+  processSteps?: AgentProcessStepRecord[];
   events?: AgentStreamEvent[];
   error?: string;
   createdAt?: string;
@@ -38,6 +39,7 @@ interface AgentConversationProps {
   onImageAction?: (payload: ToolImageActionPayload) => void;
   onLoadOlderMessages?: () => void;
   onEditUserMessage?: (text: string) => void;
+  onReuseUserMessage?: (parts: MessagePart[]) => void;
   onRegenerateMessage?: (messageId: string) => void;
   onSuggestionSelect?: (suggestion: string) => void;
 }
@@ -87,6 +89,74 @@ function getLatestState(events: AgentStreamEvent[] = []) {
   return [...events].reverse().find((event) => event.type === "agent_state");
 }
 
+function ProcessStepIcon({ status }: { status: AgentProcessStepRecord["status"] }) {
+  switch (status) {
+    case "succeeded":
+      return <CheckCircle2 size={14} />;
+    case "failed":
+      return <XCircle size={14} />;
+    case "cancelled":
+      return <CircleStop size={14} />;
+    case "running":
+      return <Loader2 className="spin" size={14} />;
+  }
+}
+
+function getProcessSummaryLabel(steps: AgentProcessStepRecord[]) {
+  if (steps.some((step) => step.status === "running")) {
+    return "进行中";
+  }
+
+  if (steps.some((step) => step.status === "failed")) {
+    return "有失败步骤";
+  }
+
+  if (steps.some((step) => step.status === "cancelled")) {
+    return "已中断";
+  }
+
+  return `已完成 ${steps.length} 步`;
+}
+
+function AgentThinkingProcess({ message }: { message: ChatMessage }) {
+  const steps = [...(message.processSteps ?? [])].sort(
+    (leftStep, rightStep) => leftStep.orderIndex - rightStep.orderIndex || leftStep.startedAt.localeCompare(rightStep.startedAt)
+  );
+
+  if (steps.length === 0) {
+    return null;
+  }
+
+  const isRunning = message.status === "running";
+
+  return (
+    <Accordion className="thinking-process" defaultExpanded={isRunning} disableGutters elevation={0}>
+      <AccordionSummary className="thinking-process-summary" expandIcon={<ChevronDown size={16} />}>
+        <Box className="thinking-process-heading">
+          <Clock3 size={15} />
+          <span>任务进度</span>
+        </Box>
+        <Chip className="thinking-process-chip" size="small" label={getProcessSummaryLabel(steps)} />
+      </AccordionSummary>
+      <AccordionDetails className="thinking-process-details">
+        <ol className="thinking-step-list">
+          {steps.map((step) => (
+            <li className={`thinking-step thinking-step-${step.status}`} key={step.id}>
+              <span className="thinking-step-icon" aria-hidden="true">
+                <ProcessStepIcon status={step.status} />
+              </span>
+              <span className="thinking-step-content">
+                <span className="thinking-step-title">{step.title}</span>
+                {step.summary ? <span className="thinking-step-summary">{step.summary}</span> : null}
+              </span>
+            </li>
+          ))}
+        </ol>
+      </AccordionDetails>
+    </Accordion>
+  );
+}
+
 function AssistantStatus({ message, isActive }: { message: ChatMessage; isActive: boolean }) {
   const latestState = getLatestState(message.events);
 
@@ -128,6 +198,10 @@ function getTextContent(parts: MessagePart[]) {
     .map((part) => part.value.trim())
     .filter(Boolean)
     .join("\n");
+}
+
+function hasReusableUserParts(parts: MessagePart[]) {
+  return parts.some((part) => part.type === "media" || (part.type === "text" && part.value.trim().length > 0));
 }
 
 function copyText(value: string) {
@@ -200,6 +274,7 @@ export function AgentConversation({
   onImageAction,
   onLoadOlderMessages,
   onEditUserMessage,
+  onReuseUserMessage,
   onRegenerateMessage,
   onSuggestionSelect
 }: AgentConversationProps) {
@@ -209,6 +284,7 @@ export function AgentConversation({
   const loadOlderRequestLockedRef = useRef(false);
   const userScrollIntentRef = useRef(false);
   const userScrollIntentTimerRef = useRef<number>();
+  const userPartSurfaceRefs = useRef(new Map<string, UserPartSurfaceHandle>());
   const isEmpty = messages.length === 0;
 
   function clearUserScrollIntentTimer() {
@@ -283,6 +359,45 @@ export function AgentConversation({
     if (event.currentTarget.scrollTop <= LOAD_OLDER_SCROLL_THRESHOLD) {
       requestLoadOlderMessages();
     }
+  }
+
+  function setUserPartSurfaceRef(messageId: string) {
+    return (handle: UserPartSurfaceHandle | null) => {
+      if (handle) {
+        userPartSurfaceRefs.current.set(messageId, handle);
+        return;
+      }
+
+      userPartSurfaceRefs.current.delete(messageId);
+    };
+  }
+
+  function getReusableUserMessageParts(message: ChatMessage) {
+    return userPartSurfaceRefs.current.get(message.id)?.getSelectedParts() ?? message.parts;
+  }
+
+  function reuseUserMessageParts(message: ChatMessage) {
+    const parts = getReusableUserMessageParts(message);
+    onReuseUserMessage?.(parts);
+    return parts;
+  }
+
+  function handleCopyUserMessage(message: ChatMessage) {
+    const parts = reuseUserMessageParts(message);
+    const text = getTextContent(parts);
+
+    if (text) {
+      copyText(text);
+    }
+  }
+
+  function handleEditUserMessage(message: ChatMessage) {
+    if (onReuseUserMessage) {
+      reuseUserMessageParts(message);
+      return;
+    }
+
+    onEditUserMessage?.(getTextContent(message.parts));
   }
 
   useEffect(() => {
@@ -411,25 +526,28 @@ export function AgentConversation({
 
                 const showCursor = message.role === "assistant" && message.status === "running";
                 const messageBodyClassName = message.role === "assistant" ? "chat-answer assistant" : "chat-bubble user";
-                const userMessageText = message.role === "user" ? getTextContent(message.parts) : "";
-                const canCopyUserMessage = message.role === "user" && userMessageText.length > 0;
-                const canEditUserMessage = canCopyUserMessage && typeof onEditUserMessage === "function";
+                const canCopyUserMessage = message.role === "user" && hasReusableUserParts(message.parts);
+                const canEditUserMessage =
+                  canCopyUserMessage && (typeof onReuseUserMessage === "function" || typeof onEditUserMessage === "function");
                 const canRegenerate =
                   message.role === "assistant" && message.status !== "running" && typeof onRegenerateMessage === "function";
                 const messageTimestamp = formatMessageTimestamp(message.createdAt);
                 const hasMessageMeta = Boolean(messageTimestamp || canCopyUserMessage || canRegenerate);
+                const hasProcessSteps = message.role === "assistant" && Boolean(message.processSteps?.length);
 
                 return (
                   <Box component="article" className={`chat-row ${message.role}`} key={message.id}>
                     <div className={`chat-content ${message.role}`}>
                       <div className={messageBodyClassName}>
-                        {message.role === "assistant" ? <AssistantStatus message={message} isActive={isActive} /> : null}
+                        {message.role === "assistant" && !hasProcessSteps ? <AssistantStatus message={message} isActive={isActive} /> : null}
 
                         {message.error ? (
                           <Alert className="error-box inline-error" severity="error">
                             {message.error}
                           </Alert>
                         ) : null}
+
+                        {message.role === "assistant" ? <AgentThinkingProcess message={message} /> : null}
 
                         {message.parts.length ? (
                           <MessagePartRenderer
@@ -438,6 +556,7 @@ export function AgentConversation({
                             resourcesById={resourcesById}
                             showCursor={showCursor}
                             onImageAction={onImageAction}
+                            userPartSurfaceRef={message.role === "user" ? setUserPartSurfaceRef(message.id) : undefined}
                           />
                         ) : message.role === "assistant" && message.status === "running" ? (
                           <p className="chat-text muted-live">
@@ -445,8 +564,6 @@ export function AgentConversation({
                             <span className="typing-cursor" aria-hidden="true" />
                           </p>
                         ) : null}
-
-                        {message.role === "assistant" ? <ToolTraceList events={message.events} onImageAction={onImageAction} /> : null}
 
                         {hasMessageMeta ? (
                           <Box className={`message-meta-row ${message.role}`}>
@@ -478,7 +595,7 @@ export function AgentConversation({
                                   <IconButton
                                     aria-label="复制消息"
                                     className="message-action-button"
-                                    onClick={() => copyText(userMessageText)}
+                                    onClick={() => handleCopyUserMessage(message)}
                                     size="small"
                                     type="button"
                                   >
@@ -491,7 +608,7 @@ export function AgentConversation({
                                     <IconButton
                                       aria-label="修改消息"
                                       className="message-action-button"
-                                      onClick={() => onEditUserMessage(userMessageText)}
+                                      onClick={() => handleEditUserMessage(message)}
                                       size="small"
                                       type="button"
                                     >

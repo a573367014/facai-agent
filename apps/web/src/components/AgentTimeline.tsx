@@ -37,6 +37,10 @@ function getEventTitle(event: VisibleTimelineEvent): string {
       return "资源已创建";
     case "resource.updated":
       return "资源已更新";
+    case "process.step.created":
+      return "过程步骤已创建";
+    case "process.step.updated":
+      return "过程步骤已更新";
     case "summary_start":
       return "开始压缩上下文";
     case "summary_completed":
@@ -65,6 +69,8 @@ function getEventTitle(event: VisibleTimelineEvent): string {
       return "运行已中断";
     case "error":
       return `错误：${event.code}`;
+    default:
+      return "事件";
   }
 }
 
@@ -83,6 +89,9 @@ function getEventSummary(event: VisibleTimelineEvent): string {
     case "resource.created":
     case "resource.updated":
       return `${event.resource.type} · ${event.resource.status}`;
+    case "process.step.created":
+    case "process.step.updated":
+      return `${event.step.title} · ${event.step.status}`;
     case "summary_start":
       return `待整理 ${event.uncoveredMessageCount} 条，压缩 ${event.summarizedMessageCount} 条`;
     case "summary_completed":

@@ -1,6 +1,6 @@
 # facai-agent
 
-一个基于 Node.js Fastify 和 React 的工具调用型 Agent 本地开发版。当前默认使用 SQLite 和内存运行态，也可以通过配置切到 Redis 保存运行中 draft；架构边界按后续替换 MySQL / Redis 的产品化方向设计。
+一个基于 Node.js Fastify 和 React 的工具调用型 Agent 本地开发版。当前默认使用 SQLite 保存会话、消息、工具调用、资源索引和短期事件日志；运行中 assistant draft 默认走内存，也可以通过配置切到 Redis。消息渲染以 `message.parts` 快照为准，`agent_resources` 负责资源索引、审计和聚合查询；工具生成的图片 / 视频会先转储到本地 uploads，避免供应商临时 URL 短时间失效。架构边界按后续替换 MySQL / Redis / OSS 的产品化方向设计。
 
 ## 结构
 
@@ -11,8 +11,13 @@
 
 复制 `.env.example` 为 `.env`，并填写：
 
+- `PORT`：API 服务端口，默认 `4001`
+- `HOST`：API 监听地址，默认 `0.0.0.0`
+- `CORS_ORIGINS`：允许跨域访问的 Origin，逗号分隔；留空时允许本地和局域网开发地址
 - `OPENAI_API_KEY`
+- `OPENAI_BASE_URL`：OpenAI 兼容接口地址，默认 `https://api.openai.com/v1`
 - `OPENAI_MODEL`
+- `AGENT_MAX_ITERATIONS`：单次 Agent 最多循环调用 LLM / 工具的轮数，默认 `4`
 - `AGENT_CONTEXT_MAX_MESSAGES`：新消息最多携带多少条历史上下文，默认 `12`
 - `AGENT_CONTEXT_MAX_HISTORY_CHARS`：历史上下文的近似字符预算，默认 `12000`
 - `AGENT_SUMMARY_TRIGGER_MESSAGES`：会话可投影消息超过该数量后触发结构化摘要，默认 `16`；设为 `0` 可关闭摘要更新
@@ -21,8 +26,12 @@
 - `AGENT_TOOL_TIMEOUT_MS`：工具调用超时时间，默认 `10000`
 - `AGENT_EVENT_RETENTION_DAYS`：事件时间线保留天数，默认 `3`
 - `AGENT_EVENT_CLEANUP_HOUR`：每天几点清理过期事件，使用服务本地时区，默认 `3`
-- `AGENT_EVENT_CLEANUP_BATCH_SIZE`：每轮每张事件表最多删除多少条，默认 `2000`
+- `AGENT_EVENT_CLEANUP_BATCH_SIZE`：每轮在统一事件表中分别最多删除多少条 message 事件和 run 事件，默认 `2000`
 - `AGENT_EVENT_CLEANUP_MAX_BATCHES`：每次清理最多执行多少轮，默认 `20`
+- `AGENT_PUBLIC_BASE_URL`：后端生成资源 URL 时使用的公开 API 地址，默认按当前 API 地址推导
+- `AGENT_UPLOAD_DIR`：用户上传和工具资源转储目录，默认 `./data/uploads`
+- `AGENT_TOOL_RESOURCE_MAX_BYTES`：工具生成资源转储的最大文件大小，默认 `209715200`
+- `AGENT_TOOL_RESOURCE_DOWNLOAD_TIMEOUT_MS`：工具生成资源下载超时时间，默认 `60000`
 - `AGENT_RUNNING_STATE_STORE`：运行中消息 draft 存储，`memory` 或 `redis`，默认 `memory`
 - `REDIS_URL`：Redis 连接地址，仅 `AGENT_RUNNING_STATE_STORE=redis` 时使用，默认 `redis://localhost:6379`
 - `AGENT_RUNNING_STATE_TTL_SECONDS`：运行中 draft 的 Redis TTL，默认 `7200`
@@ -42,7 +51,18 @@
 - `VOLCENGINE_IMAGE_MAX_POLL_ATTEMPTS`：最大轮询次数，默认 `40`
 - `VOLCENGINE_IMAGE_TOOL_TIMEOUT_MS`：生图工具独立超时时间，默认 `90000`
 - `VOLCENGINE_IMAGE_BATCH_CONCURRENCY`：批量生图内部并发数，默认 `2`，范围 `1-5`
+- `VOLCENGINE_VIDEO_ENDPOINT`：火山视觉视频 OpenAPI 地址，默认 `https://visual.volcengineapi.com`
+- `VOLCENGINE_VIDEO_REGION`：视频工具签名 Region，默认 `cn-north-1`
+- `VOLCENGINE_VIDEO_SERVICE`：视频工具签名 Service，默认 `cv`
+- `VOLCENGINE_VIDEO_VERSION`：视频工具 OpenAPI 版本，默认 `2022-08-31`
+- `VOLCENGINE_VIDEO_REQ_KEY`：即梦文生视频服务标识，默认 `jimeng_t2v_v30`
+- `VOLCENGINE_VIDEO_FIRST_FRAME_REQ_KEY`：即梦首帧图生视频服务标识，默认 `jimeng_i2v_first_v30`
+- `VOLCENGINE_VIDEO_FIRST_LAST_FRAME_REQ_KEY`：即梦首尾帧图生视频服务标识，默认 `jimeng_i2v_first_tail_v30`
+- `VOLCENGINE_VIDEO_POLL_INTERVAL_MS`：视频任务轮询间隔，默认 `1500`
+- `VOLCENGINE_VIDEO_MAX_POLL_ATTEMPTS`：视频任务最大轮询次数，默认 `80`
+- `VOLCENGINE_VIDEO_TOOL_TIMEOUT_MS`：视频工具独立超时时间，默认 `600000`
 - `AGENT_SQLITE_PATH`：SQLite 文件路径，默认 `./data/agent.sqlite`
+- `VITE_API_BASE_URL`：前端 API 地址；留空时自动按当前 Web host 推导到 `4001`
 
 ## 安装
 
@@ -77,6 +97,25 @@ npm run dev:web
 
 如果用局域网 IP 访问 Web，例如 `http://10.1.65.46:4000`，前端会自动把 API 推导为 `http://10.1.65.46:4001`。`VITE_API_BASE_URL` 留空即可自动推导；后端默认允许 `localhost`、`127.0.0.1` 和局域网 IP 的 Origin，方便本地联调。只有部署到独立 API 域名时才需要显式配置 `VITE_API_BASE_URL`，同时用 `CORS_ORIGINS=https://your-web.example.com` 收紧后端 CORS 白名单。
 
+## 接口分页约定
+
+普通列表接口统一返回：
+
+```json
+{
+  "pageInfo": {
+    "hasMore": true,
+    "nextCursor": "cursor_id",
+    "limit": 30
+  }
+}
+```
+
+- `hasMore` 是是否还能继续加载的权威字段。
+- `nextCursor` 只在 `hasMore: true` 时返回，表示下一页请求要带的游标。
+- 请求参数可以按读取方向命名，例如会话列表使用 `after=pageInfo.nextCursor`，历史消息向上翻页使用 `before=pageInfo.nextCursor`；但响应结构始终保持 `pageInfo.hasMore / pageInfo.nextCursor / pageInfo.limit`。
+- SSE 事件流里的 `after` 是事件序号续传游标，不按列表分页协议处理。
+
 ## 开发约定
 
 - 每次做结构性改造时，都要给核心代码补充“阅读理解型”注释。
@@ -87,7 +126,7 @@ npm run dev:web
 
 ## 演进路线 / TODO
 
-当前项目已经具备 Agent 本地开发版的基础能力：Fastify API、React 工作台、SSE 流式事件、session/message、SQLite 持久化、运行中 draft、资源表、工具调用表、事件压缩、断线恢复和上下文续聊。后续建议按产品化顺序演进，优先把 Agent Runtime、数据层和资源体系打稳。
+当前项目已经具备 Agent 本地开发版的基础能力：Fastify API、React 工作台、SSE 流式事件、session/message、SQLite 持久化、运行中 draft、资源索引表、工具调用表、事件压缩、断线恢复、上下文续聊、图片 / 视频生成、资源转储和图片引用。后续建议按产品化顺序演进，优先把 Agent Runtime、数据层和资源体系打稳。
 
 ### 1. Agent Runtime 稳定化
 
@@ -101,9 +140,8 @@ npm run dev:web
 - [x] Redis append / setParts 使用 Lua 脚本原子更新 version、updatedAt 和 TTL。
 - [x] 给 snapshot / delta 增加 version，前端可判断乱序或重复事件。
 - [x] 收紧 run/message 状态机，明确 running、completed、failed、cancelled 的合法流转。
-- [ ] 支持重试生成：`POST /agents/messages/:messageId/retry`。
-- [ ] 支持重新生成当前 assistant message 的回答。
-- [ ] 支持删除 session 和 message。
+- [x] 支持重新生成当前 assistant message 的回答。
+- [x] 支持删除 session。
 
 为什么先做它：Agent 产品最核心的是“生成中不断、刷新不丢、失败可解释、用户可控制”。运行态和状态机稳定后，接工具、资源、RAG、队列都会更稳。
 
@@ -132,7 +170,7 @@ npm run dev:web
 - [x] 用 `AgentStore` 隔离业务层和具体数据库实现。
 - [x] message 使用 `parts` 保存结构化内容，支持文本、图片和后续附件。
 - [x] 增加 `agent_tool_calls`，支持按工具调用做审计和聚合查询。
-- [x] 增加 `agent_resources`，资源独立成表，message part 只引用 `resourceId`。
+- [x] 增加 `agent_resources`，作为资源索引、审计和聚合表；`message.parts` 保留渲染快照，例如 `url`、`mime`、`name`、`extra.resourceId`。
 - [x] event 表增加 `expires_at`，默认保留 3 天，并按批清理。
 - [ ] 设计 MySQL / PostgreSQL schema 和 migration 方案。
 - [ ] 增加数据库连接池、事务边界和索引设计。
@@ -164,11 +202,14 @@ npm run dev:web
 目标：让图片、文件、链接等资源成为一等对象，而不是散落在 Markdown 或工具结果里。
 
 - [x] 图片生成结果写入 `agent_resources`。
-- [x] assistant message 的 media part 通过 `resourceId` 引用资源。
-- [x] 前端图片预览支持资源交互。
-- [ ] 支持用户上传文件和图片。
-- [ ] 支持资源引用，例如“用这张图继续生成”。
-- [ ] 接入对象存储，避免长期依赖供应商临时 URL。
+- [x] 视频生成结果写入 `agent_resources`。
+- [x] assistant message 的 media part 保留 `url`、`mime`、`name` 等渲染快照，并通过 `extra.resourceId` 关联资源索引。
+- [x] 工具生成图片 / 视频转储到本地 uploads/resources，避免长期依赖供应商临时 URL。
+- [x] 前端图片预览支持下载、复制、引用、删除等资源交互。
+- [x] 支持用户上传图片。
+- [x] 支持前端引用图片到输入框，并按 message parts 提交。
+- [ ] 支持用户上传通用文件。
+- [ ] 接入对象存储 / CDN，替换本地 uploads 转储。
 - [ ] 增加资源库视图，按 session、类型、工具、时间筛选资源。
 
 为什么做它：资源是 Agent 产品从聊天走向创作和工作流的关键。资源独立后，工具调用、上下文引用、审计和 UI 交互都会更清晰。
@@ -180,6 +221,7 @@ npm run dev:web
 - [ ] 文件上传和文档问答。
 - [x] 网页搜索工具。
 - [x] 图片生成工具。
+- [x] 视频生成工具。
 - [ ] 数据库查询工具。
 - [ ] 本地知识库 RAG。
 - [ ] 多步骤任务计划。

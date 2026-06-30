@@ -24,7 +24,13 @@ describe("part prosemirror serialization", () => {
         mime: "image/png",
         url: "http://localhost:4001/uploads/images/a.png",
         name: "a.png",
-        size: 123
+        size: 123,
+        width: 640,
+        height: 480,
+        extra: {
+          lifecycle: { state: "succeeded" },
+          generation: { prompt: "截图", provider: "upload" }
+        }
       },
       { type: "text", value: "这张" }
     ];
