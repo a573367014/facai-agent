@@ -17,4 +17,14 @@ describe("SYSTEM_INSTRUCTIONS", () => {
     expect(SYSTEM_INSTRUCTIONS).toContain("调用 edit_image");
     expect(SYSTEM_INSTRUCTIONS).toContain("源图 imageUrl");
   });
+
+  it("要求视频生成需求调用 generate_video", () => {
+    expect(SYSTEM_INSTRUCTIONS).toContain("调用 generate_video");
+    expect(SYSTEM_INSTRUCTIONS).toContain("不要输出视频链接");
+  });
+
+  it("要求基于已有图片生成视频时传入首帧或首尾帧参数", () => {
+    expect(SYSTEM_INSTRUCTIONS).toContain("firstFrameImageUrl");
+    expect(SYSTEM_INSTRUCTIONS).toContain("lastFrameImageUrl");
+  });
 });

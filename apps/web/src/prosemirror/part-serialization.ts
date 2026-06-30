@@ -1,4 +1,5 @@
 import type { Node as ProseMirrorNode } from "prosemirror-model";
+import type { Selection } from "prosemirror-state";
 import type { MessagePart } from "../api/agent-client";
 import { partSchema } from "./part-schema";
 
@@ -19,7 +20,10 @@ export function partsToDoc(parts: RuntimePart[]): ProseMirrorNode {
         mime: part.mime,
         url: part.url,
         name: part.name ?? "",
-        size: part.size ?? null
+        size: part.size ?? null,
+        width: part.width ?? null,
+        height: part.height ?? null,
+        extra: part.extra ?? null
       })
     ];
   });
@@ -56,7 +60,10 @@ export function docToParts(doc: ProseMirrorNode): MessagePart[] {
         mime: String(node.attrs.mime ?? ""),
         url: String(node.attrs.url ?? ""),
         ...(node.attrs.name ? { name: String(node.attrs.name) } : {}),
-        ...(typeof node.attrs.size === "number" ? { size: node.attrs.size } : {})
+        ...(typeof node.attrs.size === "number" ? { size: node.attrs.size } : {}),
+        ...(typeof node.attrs.width === "number" ? { width: node.attrs.width } : {}),
+        ...(typeof node.attrs.height === "number" ? { height: node.attrs.height } : {}),
+        ...(isPartExtra(node.attrs.extra) ? { extra: node.attrs.extra } : {})
       });
       return false;
     }
@@ -66,6 +73,79 @@ export function docToParts(doc: ProseMirrorNode): MessagePart[] {
 
   flushText();
   return parts;
+}
+
+export function getSelectedParts(doc: ProseMirrorNode, selection: Selection): MessagePart[] | undefined {
+  if (selection.empty) {
+    return undefined;
+  }
+
+  const parts: MessagePart[] = [];
+  let textBuffer = "";
+
+  function flushText() {
+    if (textBuffer) {
+      parts.push({ type: "text", value: textBuffer });
+      textBuffer = "";
+    }
+  }
+
+  doc.nodesBetween(selection.from, selection.to, (node, position) => {
+    if (node.isText) {
+      const from = Math.max(selection.from, position);
+      const to = Math.min(selection.to, position + node.nodeSize);
+      const selectedText = (node.text ?? "").slice(from - position, to - position);
+
+      if (selectedText) {
+        textBuffer += selectedText;
+      }
+
+      return false;
+    }
+
+    if (node.type.name === "hard_break") {
+      const nodeTo = position + node.nodeSize;
+
+      if (selection.from < nodeTo && selection.to > position) {
+        textBuffer += "\n";
+      }
+
+      return false;
+    }
+
+    if (node.type.name === "media_part") {
+      const nodeTo = position + node.nodeSize;
+
+      if (selection.from < nodeTo && selection.to > position) {
+        flushText();
+        parts.push(mediaNodeToPart(node));
+      }
+
+      return false;
+    }
+
+    return true;
+  });
+
+  flushText();
+  return parts.length > 0 ? parts : undefined;
+}
+
+function mediaNodeToPart(node: ProseMirrorNode): MessagePart {
+  return {
+    type: "media",
+    mime: String(node.attrs.mime ?? ""),
+    url: String(node.attrs.url ?? ""),
+    ...(node.attrs.name ? { name: String(node.attrs.name) } : {}),
+    ...(typeof node.attrs.size === "number" ? { size: node.attrs.size } : {}),
+    ...(typeof node.attrs.width === "number" ? { width: node.attrs.width } : {}),
+    ...(typeof node.attrs.height === "number" ? { height: node.attrs.height } : {}),
+    ...(isPartExtra(node.attrs.extra) ? { extra: node.attrs.extra } : {})
+  };
+}
+
+function isPartExtra(value: unknown): value is NonNullable<MessagePart["extra"]> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function textToInlineNodes(value: string): ProseMirrorNode[] {

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   apiBaseUrl,
   cancelAgentRun,
+  deleteAgentSession,
   getAgentRun,
   getAgentSession,
   getAgentSessionMessages,
@@ -14,8 +15,10 @@ import {
   uploadAgentImage,
   type AgentMessagePageInfo,
   type AgentMessageRecord,
+  type AgentProcessStepRecord,
   type AgentResourceRecord,
   type AgentRunRecord,
+  type AgentSessionPageInfo,
   type MessagePart,
   type AgentSessionRecord,
   type AgentStreamEvent,
@@ -25,6 +28,7 @@ import { AgentConversation, type ChatMessage } from "./components/AgentConversat
 import { AgentTimeline } from "./components/AgentTimeline";
 import { AgentComposer } from "./components/AgentComposer";
 import { SessionSidebar, type SessionHistoryItem } from "./components/SessionSidebar";
+import type { ToolImageActionPayload } from "./components/ToolResultPreview";
 import { stripRuntimeFields, type RuntimePart } from "./prosemirror/part-serialization";
 import "./styles.css";
 
@@ -32,6 +36,7 @@ const activeRunIdKey = "agent.activeRunId";
 const activeEventSeqKey = "agent.activeEventSeq";
 const sessionIdQueryKey = "sessionId";
 const defaultMessagePageLimit = 30;
+const defaultSessionPageLimit = 30;
 
 type ResourceMap = Record<string, AgentResourceRecord>;
 
@@ -43,7 +48,10 @@ function toChatMessageStatus(status: AgentMessageRecord["status"]): ChatMessage[
   return status;
 }
 
-function createMessageFromRecord(message: AgentMessageRecord, options: { version?: number } = {}): ChatMessage {
+function createMessageFromRecord(
+  message: AgentMessageRecord,
+  options: { version?: number; processSteps?: AgentProcessStepRecord[] } = {}
+): ChatMessage {
   const error = message.error ? `${message.error.code}: ${message.error.message}` : undefined;
 
   return {
@@ -52,6 +60,7 @@ function createMessageFromRecord(message: AgentMessageRecord, options: { version
     parts: normalizeMessagePartsForDisplay(message),
     status: toChatMessageStatus(message.status),
     version: options.version,
+    processSteps: options.processSteps ?? [],
     events: [],
     error,
     createdAt: message.createdAt,
@@ -118,10 +127,32 @@ function normalizeVisibleMessages(messages: ChatMessage[], options: { showRunnin
   });
 }
 
-function buildMessagesFromRecords(messages: AgentMessageRecord[]): ChatMessage[] {
+function groupProcessStepsByMessage(processSteps: AgentProcessStepRecord[] = []) {
+  const stepsByMessage = new Map<string, AgentProcessStepRecord[]>();
+
+  for (const step of processSteps) {
+    stepsByMessage.set(step.messageId, [...(stepsByMessage.get(step.messageId) ?? []), step]);
+  }
+
+  return stepsByMessage;
+}
+
+function sortProcessSteps(processSteps: AgentProcessStepRecord[] = []) {
+  return [...processSteps].sort(
+    (leftStep, rightStep) => leftStep.orderIndex - rightStep.orderIndex || leftStep.startedAt.localeCompare(rightStep.startedAt)
+  );
+}
+
+function upsertProcessStep(processSteps: AgentProcessStepRecord[] = [], step: AgentProcessStepRecord): AgentProcessStepRecord[] {
+  const withoutStep = processSteps.filter((candidate) => candidate.id !== step.id);
+  return sortProcessSteps([...withoutStep, step]);
+}
+
+function buildMessagesFromRecords(messages: AgentMessageRecord[], processSteps: AgentProcessStepRecord[] = []): ChatMessage[] {
+  const stepsByMessage = groupProcessStepsByMessage(processSteps);
   const chatMessages = [...messages]
     .sort((leftMessage, rightMessage) => leftMessage.createdAt.localeCompare(rightMessage.createdAt))
-    .map((message) => createMessageFromRecord(message));
+    .map((message) => createMessageFromRecord(message, { processSteps: sortProcessSteps(stepsByMessage.get(message.id)) }));
 
   return normalizeVisibleMessages(chatMessages);
 }
@@ -135,6 +166,17 @@ function createDefaultMessagePageInfo(): AgentMessagePageInfo {
 
 function normalizeMessagePageInfo(pageInfo?: AgentMessagePageInfo): AgentMessagePageInfo {
   return pageInfo ?? createDefaultMessagePageInfo();
+}
+
+function createDefaultSessionPageInfo(): AgentSessionPageInfo {
+  return {
+    hasMore: false,
+    limit: defaultSessionPageLimit
+  };
+}
+
+function normalizeSessionPageInfo(pageInfo?: AgentSessionPageInfo): AgentSessionPageInfo {
+  return pageInfo ?? createDefaultSessionPageInfo();
 }
 
 function resourcesToMap(resources: AgentResourceRecord[] = []): ResourceMap {
@@ -152,8 +194,12 @@ function mergeResources(currentResources: ResourceMap, resources: AgentResourceR
   };
 }
 
-function prependMessagesFromRecords(currentMessages: ChatMessage[], olderMessages: AgentMessageRecord[]): ChatMessage[] {
-  const prependedMessages = buildMessagesFromRecords(olderMessages);
+function prependMessagesFromRecords(
+  currentMessages: ChatMessage[],
+  olderMessages: AgentMessageRecord[],
+  processSteps: AgentProcessStepRecord[] = []
+): ChatMessage[] {
+  const prependedMessages = buildMessagesFromRecords(olderMessages, processSteps);
   const prependedIds = new Set(prependedMessages.map((message) => message.id));
 
   return normalizeVisibleMessages([...prependedMessages, ...currentMessages.filter((message) => !prependedIds.has(message.id))], {
@@ -175,7 +221,10 @@ function upsertMessageRecord(currentMessages: ChatMessage[], message: AgentMessa
   const existingMessage = currentMessages.find((currentMessage) => currentMessage.id === message.id);
   const version = options.version ?? existingMessage?.version;
 
-  return normalizeVisibleMessages(replaceMessage(currentMessages, createMessageFromRecord(message, { version })), {
+  return normalizeVisibleMessages(replaceMessage(currentMessages, createMessageFromRecord(message, {
+    version,
+    processSteps: existingMessage?.processSteps
+  })), {
     showRunningSummary: true
   });
 }
@@ -187,7 +236,12 @@ function upsertMessageSnapshot(currentMessages: ChatMessage[], event: Extract<Ag
     return currentMessages;
   }
 
-  return upsertMessageRecord(currentMessages, event.message, { version: event.version });
+  return normalizeVisibleMessages(replaceMessage(currentMessages, createMessageFromRecord(event.message, {
+    version: event.version,
+    processSteps: sortProcessSteps(event.processSteps)
+  })), {
+    showRunningSummary: true
+  });
 }
 
 function isOlderSnapshotVersion(message: ChatMessage | undefined, eventVersion: number | undefined) {
@@ -320,6 +374,71 @@ function buildHistoryItems(sessions: AgentSessionRecord[]): SessionHistoryItem[]
   }));
 }
 
+function appendQuotedImagePart(currentParts: RuntimePart[], quotedImagePart: RuntimePart): RuntimePart[] {
+  const meaningfulParts = currentParts.filter((part) => part.type === "media" || (part.type === "text" && part.value.trim()));
+
+  if (meaningfulParts.length === 0) {
+    return [quotedImagePart];
+  }
+
+  return [...currentParts, quotedImagePart];
+}
+
+function createQuotedImagePart(payload: ToolImageActionPayload): RuntimePart {
+  const prompt = payload.prompt.trim();
+  const name = prompt || `图片 ${payload.index + 1}`;
+  const tool =
+    payload.trace.toolName === "media"
+      ? undefined
+      : {
+          name: payload.trace.toolName,
+          toolCallId: payload.trace.id,
+          ...(payload.toolCallRowId ? { toolCallRowId: payload.toolCallRowId } : {}),
+          outputIndex: payload.outputIndex ?? payload.index
+        };
+
+  return {
+    type: "media",
+    mime: payload.mime ?? inferImageMimeFromUrl(payload.url),
+    url: payload.url,
+    name,
+    ...(typeof payload.width === "number" ? { width: payload.width } : {}),
+    ...(typeof payload.height === "number" ? { height: payload.height } : {}),
+    extra: {
+      lifecycle: { state: "succeeded" },
+      ...(payload.resourceId ? { resource: { id: payload.resourceId } } : {}),
+      ...(tool ? { tool } : {}),
+      ...(prompt ? { generation: { prompt } } : {})
+    }
+  };
+}
+
+function inferImageMimeFromUrl(url: string) {
+  const pathname = safeUrlPathname(url).toLowerCase();
+
+  if (pathname.endsWith(".jpg") || pathname.endsWith(".jpeg")) {
+    return "image/jpeg";
+  }
+
+  if (pathname.endsWith(".webp")) {
+    return "image/webp";
+  }
+
+  if (pathname.endsWith(".gif")) {
+    return "image/gif";
+  }
+
+  return "image/png";
+}
+
+function safeUrlPathname(url: string) {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return url;
+  }
+}
+
 export default function App() {
   const [composerParts, setComposerParts] = useState<RuntimePart[]>([{ type: "text", value: "" }]);
   const [composerFocusToken, setComposerFocusToken] = useState(0);
@@ -334,6 +453,9 @@ export default function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | undefined>(() => readSessionIdFromUrl());
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<AgentSessionRecord[]>([]);
+  const [sessionPageInfo, setSessionPageInfo] = useState<AgentSessionPageInfo>(() => createDefaultSessionPageInfo());
+  const [isLoadingMoreSessions, setIsLoadingMoreSessions] = useState(false);
+  const [deletingSessionIds, setDeletingSessionIds] = useState<Set<string>>(() => new Set());
   const [isSessionSidebarCollapsed, setIsSessionSidebarCollapsed] = useState(false);
   const [isTracePanelCollapsed, setIsTracePanelCollapsed] = useState(false);
   const activeStreamControllerRef = useRef<AbortController | null>(null);
@@ -361,14 +483,16 @@ export default function App() {
     let cancelled = false;
 
     listAgentSessions()
-      .then(({ sessions }) => {
+      .then(({ sessions, pageInfo }) => {
         if (!cancelled) {
           setSessions(sessions);
+          setSessionPageInfo(normalizeSessionPageInfo(pageInfo));
         }
       })
       .catch(() => {
         if (!cancelled) {
           setSessions([]);
+          setSessionPageInfo(createDefaultSessionPageInfo());
         }
       });
 
@@ -390,10 +514,10 @@ export default function App() {
     let cancelled = false;
 
     getAgentSession(sessionId)
-      .then(({ session, messages, resources, pageInfo }) => {
+      .then(({ session, messages, resources, processSteps, pageInfo }) => {
         if (!cancelled) {
           upsertSession(session);
-          setMessages(buildMessagesFromRecords(messages));
+          setMessages(buildMessagesFromRecords(messages, processSteps));
           setResourcesById(resourcesToMap(resources));
           setMessagePageInfo(normalizeMessagePageInfo(pageInfo));
         }
@@ -443,7 +567,7 @@ export default function App() {
           return;
         }
 
-        setMessages(buildMessagesFromRecords(sessionSnapshot.messages));
+        setMessages(buildMessagesFromRecords(sessionSnapshot.messages, sessionSnapshot.processSteps));
         setResourcesById(resourcesToMap(sessionSnapshot.resources));
         setMessagePageInfo(normalizeMessagePageInfo(sessionSnapshot.pageInfo));
         setEvents([]);
@@ -529,6 +653,7 @@ export default function App() {
   async function refreshSessions() {
     const response = await listAgentSessions();
     setSessions(response.sessions);
+    setSessionPageInfo(normalizeSessionPageInfo(response.pageInfo));
   }
 
   function rememberSession(sessionId: string) {
@@ -560,13 +685,26 @@ export default function App() {
       }));
     }
 
-    if (messageId) {
-      updateAssistantMessage(messageId, (message) => {
+    const targetMessageId =
+      event.type === "process.step.created" || event.type === "process.step.updated"
+        ? messageId ?? event.step.messageId
+        : messageId;
+
+    if (targetMessageId) {
+      updateAssistantMessage(targetMessageId, (message) => {
         if (isDuplicateOrOlderPartVersion(message, event)) {
           return message;
         }
 
         const nextEvents = [...(message.events ?? []), event];
+
+        if (event.type === "process.step.created" || event.type === "process.step.updated") {
+          return {
+            ...message,
+            processSteps: upsertProcessStep(message.processSteps, event.step),
+            events: nextEvents
+          };
+        }
 
         if (
           event.type === "message.part.created" ||
@@ -685,7 +823,7 @@ export default function App() {
 
       if (sessionId) {
         const sessionSnapshot = await getAgentSession(sessionId);
-        setMessages(buildMessagesFromRecords(sessionSnapshot.messages));
+        setMessages(buildMessagesFromRecords(sessionSnapshot.messages, sessionSnapshot.processSteps));
         setResourcesById(resourcesToMap(sessionSnapshot.resources));
         setMessagePageInfo(normalizeMessagePageInfo(sessionSnapshot.pageInfo));
       }
@@ -802,6 +940,20 @@ export default function App() {
     setComposerFocusToken((currentToken) => currentToken + 1);
   }
 
+  function handleReuseUserMessage(parts: MessagePart[]) {
+    setComposerParts(parts.map((part) => ({ ...part })));
+    setComposerFocusToken((currentToken) => currentToken + 1);
+  }
+
+  function handleImageAction(payload: ToolImageActionPayload) {
+    if (payload.action !== "quote") {
+      return;
+    }
+
+    setComposerParts((currentParts) => appendQuotedImagePart(currentParts, createQuotedImagePart(payload)));
+    setComposerFocusToken((currentToken) => currentToken + 1);
+  }
+
   async function handleSelectSession(sessionId: string) {
     if (sessionId === activeSessionId) {
       return;
@@ -812,10 +964,10 @@ export default function App() {
     setEvents([]);
 
     try {
-      const { session, messages, resources, pageInfo } = await getAgentSession(sessionId);
+      const { session, messages, resources, processSteps, pageInfo } = await getAgentSession(sessionId);
       upsertSession(session);
       rememberSession(session.id);
-      setMessages(buildMessagesFromRecords(messages));
+      setMessages(buildMessagesFromRecords(messages, processSteps));
       setResourcesById(resourcesToMap(resources));
       setMessagePageInfo(normalizeMessagePageInfo(pageInfo));
     } catch (sessionError) {
@@ -823,9 +975,63 @@ export default function App() {
     }
   }
 
+  async function handleLoadMoreSessions() {
+    const after = sessionPageInfo.nextCursor;
+
+    if (!after || !sessionPageInfo.hasMore || isLoadingMoreSessions) {
+      return;
+    }
+
+    setIsLoadingMoreSessions(true);
+    setError(null);
+
+    try {
+      const response = await listAgentSessions({
+        after,
+        limit: sessionPageInfo.limit || defaultSessionPageLimit
+      });
+      const incomingIds = new Set(response.sessions.map((session) => session.id));
+
+      setSessions((currentSessions) => [...currentSessions.filter((session) => !incomingIds.has(session.id)), ...response.sessions]);
+      setSessionPageInfo(normalizeSessionPageInfo(response.pageInfo));
+    } catch (sessionError) {
+      setError(sessionError instanceof Error ? sessionError.message : "加载更多会话失败");
+    } finally {
+      setIsLoadingMoreSessions(false);
+    }
+  }
+
+  async function handleDeleteSession(sessionId: string) {
+    setDeletingSessionIds((currentIds) => new Set(currentIds).add(sessionId));
+    setError(null);
+
+    if (sessionId === activeSessionId && activeRunId) {
+      activeStreamControllerRef.current?.abort();
+      clearActiveRun();
+      setIsStreaming(false);
+    }
+
+    try {
+      await deleteAgentSession(sessionId);
+      setSessions((currentSessions) => currentSessions.filter((session) => session.id !== sessionId));
+
+      if (sessionId === activeSessionId) {
+        handleNewSession();
+      }
+    } catch (sessionError) {
+      setError(sessionError instanceof Error ? sessionError.message : "删除会话失败");
+    } finally {
+      setDeletingSessionIds((currentIds) => {
+        const nextIds = new Set(currentIds);
+        nextIds.delete(sessionId);
+        return nextIds;
+      });
+    }
+  }
+
   async function handleLoadOlderMessages() {
     const sessionId = activeSessionId ?? readSessionIdFromUrl();
-    const before = messagePageInfo.oldestCursor;
+    const before = messagePageInfo.nextCursor;
 
     if (!sessionId || !before || !messagePageInfo.hasMore || isLoadingOlderMessages) {
       return;
@@ -840,7 +1046,7 @@ export default function App() {
         limit: messagePageInfo.limit || defaultMessagePageLimit
       });
 
-      setMessages((currentMessages) => prependMessagesFromRecords(currentMessages, response.messages));
+      setMessages((currentMessages) => prependMessagesFromRecords(currentMessages, response.messages, response.processSteps));
       setResourcesById((currentResources) => mergeResources(currentResources, response.resources));
       setMessagePageInfo(response.pageInfo);
     } catch (sessionError) {
@@ -868,8 +1074,13 @@ export default function App() {
           historyItems={historyItems}
           isCollapsed={isSessionSidebarCollapsed}
           isBusy={isStreaming}
+          hasMoreSessions={sessionPageInfo.hasMore}
+          isLoadingMoreSessions={isLoadingMoreSessions}
+          deletingSessionIds={deletingSessionIds}
           onNewSession={handleNewSession}
           onSelectSession={handleSelectSession}
+          onLoadMoreSessions={handleLoadMoreSessions}
+          onDeleteSession={handleDeleteSession}
         />
 
         <Box component="section" className="chat-main response-column">
@@ -919,7 +1130,8 @@ export default function App() {
             hasMoreMessages={messagePageInfo.hasMore}
             isLoadingOlderMessages={isLoadingOlderMessages}
             onLoadOlderMessages={handleLoadOlderMessages}
-            onEditUserMessage={handleSuggestionSelect}
+            onImageAction={handleImageAction}
+            onReuseUserMessage={handleReuseUserMessage}
             onRegenerateMessage={handleRegenerateMessage}
             onSuggestionSelect={handleSuggestionSelect}
           />

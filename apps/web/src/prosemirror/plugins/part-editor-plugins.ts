@@ -3,6 +3,8 @@ import { NodeSelection, Plugin, Selection, TextSelection } from "prosemirror-sta
 import { dropPoint } from "prosemirror-transform";
 import { Decoration, DecorationSet } from "prosemirror-view";
 import type { EditorView } from "prosemirror-view";
+import type { MessagePart } from "../../api/agent-client";
+import { AGENT_MESSAGE_PARTS_MIME, parseMessagePartsFromClipboard } from "../../utils/message-part-clipboard";
 
 export interface InlineBoundaryCaretPluginOptions {
   beforeNodeNames?: string[];
@@ -19,6 +21,7 @@ export interface InlineAtomArrowNavigationPluginOptions {
 export interface InlineAtomSelectionHighlightPluginOptions {
   nodeNames?: string[];
   className?: string;
+  domSelector?: string;
 }
 
 export interface ImageUploadEntryPluginOptions {
@@ -169,6 +172,7 @@ export function createInlineAtomArrowNavigationPlugin(options: InlineAtomArrowNa
 
 export function createInlineAtomSelectionHighlightPlugin(options: InlineAtomSelectionHighlightPluginOptions = {}) {
   const className = options.className ?? "is-range-selected";
+  const domSelector = options.domSelector ?? ".pm-part--media";
 
   return new Plugin({
     props: {
@@ -196,6 +200,147 @@ export function createInlineAtomSelectionHighlightPlugin(options: InlineAtomSele
 
         return decorations.length > 0 ? DecorationSet.create(doc, decorations) : DecorationSet.empty;
       }
+    },
+    view(view) {
+      const ownerDocument = view.dom.ownerDocument;
+      const refreshDomSelectionState = () => {
+        syncInlineAtomDomRangeSelection(view, {
+          className,
+          domSelector,
+          nodeNames: options.nodeNames
+        });
+      };
+
+      ownerDocument.addEventListener("selectionchange", refreshDomSelectionState);
+      refreshDomSelectionState();
+
+      return {
+        update() {
+          refreshDomSelectionState();
+        },
+        destroy() {
+          ownerDocument.removeEventListener("selectionchange", refreshDomSelectionState);
+          clearInlineAtomDomRangeSelection(view.dom, domSelector, className);
+        }
+      };
+    }
+  });
+}
+
+function syncInlineAtomDomRangeSelection(
+  view: EditorView,
+  options: Required<Pick<InlineAtomSelectionHighlightPluginOptions, "className" | "domSelector">> &
+    Pick<InlineAtomSelectionHighlightPluginOptions, "nodeNames">
+) {
+  const domSelection = view.dom.ownerDocument.getSelection();
+
+  view.dom.querySelectorAll<HTMLElement>(options.domSelector).forEach((element) => {
+    const isSelected =
+      isDomRangeSelectionIntersectingNode(domSelection, element) ||
+      isInlineAtomElementSelectedByState(view, element, options.nodeNames);
+
+    element.classList.toggle(options.className, isSelected);
+  });
+}
+
+function clearInlineAtomDomRangeSelection(root: HTMLElement, selector: string, className: string) {
+  root.querySelectorAll<HTMLElement>(selector).forEach((element) => {
+    element.classList.remove(className);
+  });
+}
+
+function isDomRangeSelectionIntersectingNode(selection: globalThis.Selection | null, node: Node) {
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+    return false;
+  }
+
+  if (
+    selection.anchorNode &&
+    selection.focusNode &&
+    node.contains(selection.anchorNode) &&
+    node.contains(selection.focusNode)
+  ) {
+    return false;
+  }
+
+  for (let index = 0; index < selection.rangeCount; index += 1) {
+    if (selection.getRangeAt(index).intersectsNode(node)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isInlineAtomElementSelectedByState(view: EditorView, element: HTMLElement, nodeNames?: string[]) {
+  const { selection } = view.state;
+
+  if (selection.empty) {
+    return false;
+  }
+
+  const position = resolveInlineAtomElementPosition(view, element, nodeNames);
+
+  if (typeof position !== "number") {
+    return false;
+  }
+
+  const node = view.state.doc.nodeAt(position);
+
+  if (!isTargetAtomNode(node, nodeNames)) {
+    return false;
+  }
+
+  return selection.from < position + node.nodeSize && selection.to > position;
+}
+
+function resolveInlineAtomElementPosition(view: EditorView, element: HTMLElement, nodeNames?: string[]) {
+  const candidates = [view.posAtDOM(element, 0), Math.max(0, view.posAtDOM(element, 0) - 1)];
+
+  for (const position of new Set(candidates)) {
+    const node = view.state.doc.nodeAt(position);
+
+    if (isTargetAtomNode(node, nodeNames)) {
+      return position;
+    }
+  }
+
+  return undefined;
+}
+
+export function createClearSelectionOnOutsidePointerPlugin() {
+  return new Plugin({
+    view(view) {
+      const ownerDocument = view.dom.ownerDocument;
+      const handleClick = (event: MouseEvent) => {
+        const target = event.target;
+
+        if (!(target instanceof Node) || view.dom.contains(target) || view.state.selection.empty) {
+          return;
+        }
+
+        const position = Math.min(view.state.selection.to, view.state.doc.content.size);
+        const nextSelection = TextSelection.near(view.state.doc.resolve(position), -1);
+
+        if (view.state.selection.eq(nextSelection)) {
+          return;
+        }
+
+        view.dispatch(
+          view.state.tr
+            .setSelection(nextSelection)
+            .setMeta("addToHistory", false)
+            .setMeta("actionType", "selection.clear.outside-pointer")
+        );
+      };
+
+      ownerDocument.addEventListener("click", handleClick);
+
+      return {
+        destroy() {
+          ownerDocument.removeEventListener("click", handleClick);
+        }
+      };
     }
   });
 }
@@ -247,7 +392,25 @@ export function createPlainTextPastePlugin() {
         paste(view, event) {
           const clipboard = (event as ClipboardEvent).clipboardData;
 
-          if (!clipboard || hasClipboardFiles(clipboard) || hasCustomClipboardTypes(clipboard) || hasProseMirrorClipboardHtml(clipboard)) {
+          if (!clipboard) {
+            return false;
+          }
+
+          const messageParts = parseMessagePartsFromClipboard(clipboard.getData(AGENT_MESSAGE_PARTS_MIME));
+
+          if (messageParts?.length) {
+            const slice = createMessagePartsSlice(view, messageParts);
+
+            if (!slice.content.size) {
+              return false;
+            }
+
+            event.preventDefault();
+            view.dispatch(view.state.tr.replaceSelection(slice).scrollIntoView().setMeta("actionType", "clipboard.paste.message-parts"));
+            return true;
+          }
+
+          if (hasClipboardFiles(clipboard) || hasCustomClipboardTypes(clipboard) || hasProseMirrorClipboardHtml(clipboard)) {
             return false;
           }
 
@@ -419,6 +582,44 @@ function createPlainTextSlice(view: EditorView, text: string) {
   });
 
   return new Slice(Fragment.fromArray(nodes), 0, 0);
+}
+
+function createMessagePartsSlice(view: EditorView, parts: MessagePart[]) {
+  const nodes = parts.flatMap((part) => {
+    if (part.type === "text") {
+      return createTextInlineNodes(view, part.value);
+    }
+
+    return [
+      view.state.schema.nodes.media_part.create({
+        mime: part.mime ?? "",
+        url: part.url ?? "",
+        name: part.name ?? "",
+        size: part.size ?? null,
+        width: part.width ?? null,
+        height: part.height ?? null,
+        extra: part.extra ?? null
+      })
+    ];
+  });
+
+  return new Slice(Fragment.fromArray(nodes), 0, 0);
+}
+
+function createTextInlineNodes(view: EditorView, text: string) {
+  return text.split("\n").flatMap((line, index) => {
+    const inlineNodes: ProseMirrorNode[] = [];
+
+    if (index > 0) {
+      inlineNodes.push(view.state.schema.nodes.hard_break.create());
+    }
+
+    if (line) {
+      inlineNodes.push(view.state.schema.text(line));
+    }
+
+    return inlineNodes;
+  });
 }
 
 function syncSelectionToDropPoint(view: EditorView, event: DragEvent) {

@@ -1,6 +1,6 @@
 import type { JsonObject } from "../tools/types.js";
 
-export type PlaceholderType = "text" | "input" | "select" | "image" | "skill";
+export type PlaceholderType = "text" | "input" | "select" | "image" | "video" | "skill";
 export type LifecycleState = "pending" | "succeeded" | "failed";
 
 export interface PlaceholderOption {
@@ -123,15 +123,25 @@ export function upsertGeneratedImageParts(parts: MessagePart[], input: Generated
   );
   const mediaPart: MediaPart = removeUndefinedDeep({
     type: "media",
+    mime: input.mime,
+    url: input.url,
+    name: input.name,
+    width: input.width,
+    height: input.height,
     extra: {
-      placeholder: input.state === "pending" ? { type: "image", label: "图片生成中" } : undefined,
+      placeholder: input.state === "pending" ? getGeneratedMediaPlaceholder(input.mime) : undefined,
+      lifecycle: {
+        state: input.state,
+        error: input.error
+      },
       resource: { id: input.resourceId },
       tool: {
         name: input.toolName,
         toolCallId: input.toolCallId,
         toolCallRowId: input.toolCallRowId,
         outputIndex: input.outputIndex
-      }
+      },
+      generation: input.generation
     }
   }) as MediaPart;
 
@@ -140,6 +150,14 @@ export function upsertGeneratedImageParts(parts: MessagePart[], input: Generated
   }
 
   return parts.map((part, index) => (index === existingIndex ? mediaPart : part));
+}
+
+function getGeneratedMediaPlaceholder(mime?: string) {
+  if (mime?.startsWith("video/")) {
+    return { type: "video" as const, label: "视频生成中" };
+  }
+
+  return { type: "image" as const, label: "图片生成中" };
 }
 
 function projectParts(parts: MessagePart[], options: { includePendingMedia: boolean }): string[] {
@@ -182,8 +200,7 @@ function projectMediaPart(part: MediaPart, options: { includePendingMedia: boole
     return `${label}：${mediaUrl}`;
   }
 
-  const resourceId = part.extra?.resource?.id;
-  return resourceId ? `${label}：${resourceId}` : label;
+  return label;
 }
 
 function toProjectableMediaUrl(url?: string): string | undefined {

@@ -104,6 +104,175 @@ function createAgentService(provider: LlmProvider, registry: ToolRegistry) {
 }
 
 describe("AgentMessageCoordinator", () => {
+  it("启动恢复会把上次进程遗留的 running run 收敛为 failed", async () => {
+    const registry = new ToolRegistry();
+    const provider: LlmProvider = {
+      complete: async () => ({ content: "不会执行" })
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const session = store.createSession("遗留运行");
+    const userMessage = store.createMessage({
+      sessionId: session.id,
+      role: "user",
+      status: "completed",
+      parts: [{ type: "text", value: "再生产" }]
+    });
+    const assistantMessage = store.createMessage({
+      sessionId: session.id,
+      role: "assistant",
+      status: "running",
+      parts: [{ type: "text", value: "" }]
+    });
+    const run = store.createRun({
+      sessionId: session.id,
+      userMessageId: userMessage.id,
+      assistantMessageId: assistantMessage.id,
+      status: "running",
+      phase: "answering"
+    });
+    const toolCall = store.createToolCall({
+      sessionId: session.id,
+      runId: run.id,
+      messageId: assistantMessage.id,
+      iteration: 0,
+      toolCallId: "call_video",
+      toolName: "generate_video",
+      arguments: { prompt: "生成视频" },
+      status: "running"
+    });
+    const resource = store.createResource({
+      sessionId: session.id,
+      messageId: assistantMessage.id,
+      toolCallRowId: toolCall.id,
+      toolCallId: "call_video",
+      type: "video",
+      mime: "video/mp4",
+      status: "pending",
+      metadata: { prompt: "生成视频" }
+    });
+    const step = store.createProcessStep({
+      sessionId: session.id,
+      runId: run.id,
+      messageId: assistantMessage.id,
+      toolCallRowId: toolCall.id,
+      toolCallId: "call_video",
+      kind: "tool",
+      title: "正在生成视频",
+      status: "running",
+      orderIndex: 0
+    });
+    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+
+    const result = await coordinator.cleanupStaleRunningExecutions("服务重启后清理遗留运行");
+
+    expect(result).toEqual({
+      runs: 1,
+      messages: 1,
+      toolCalls: 1,
+      resources: 1,
+      processSteps: 1
+    });
+    expect(store.getRun(run.id)).toMatchObject({
+      status: "failed",
+      phase: "failed",
+      error: {
+        code: "RUN_INTERRUPTED",
+        message: "服务重启后清理遗留运行"
+      },
+      completedAt: expect.any(String)
+    });
+    expect(store.getMessage(assistantMessage.id)).toMatchObject({
+      status: "failed",
+      parts: [{ type: "text", value: "本轮运行因服务重启中断，请重新生成。" }],
+      error: {
+        code: "RUN_INTERRUPTED",
+        message: "服务重启后清理遗留运行"
+      },
+      completedAt: expect.any(String)
+    });
+    expect(store.getToolCallsBySession(session.id)).toEqual([
+      expect.objectContaining({
+        id: toolCall.id,
+        status: "failed",
+        error: {
+          code: "RUN_INTERRUPTED",
+          message: "服务重启后清理遗留运行"
+        },
+        completedAt: expect.any(String)
+      })
+    ]);
+    expect(store.getResourcesByMessages([assistantMessage.id])).toEqual([
+      expect.objectContaining({
+        id: resource.id,
+        status: "failed",
+        metadata: {
+          prompt: "生成视频",
+          error: {
+            code: "RUN_INTERRUPTED",
+            message: "服务重启后清理遗留运行"
+          }
+        }
+      })
+    ]);
+    expect(store.getProcessStepsByMessages([assistantMessage.id])).toEqual([
+      expect.objectContaining({
+        id: step.id,
+        status: "failed",
+        completedAt: expect.any(String)
+      })
+    ]);
+    expect(store.getRunEvents(run.id).map((event) => event.event.type)).toEqual(
+      expect.arrayContaining(["process.step.updated", "error", "session.message.updated"])
+    );
+    store.close();
+  });
+
+  it("shutdown 会取消当前进程内的 running run", async () => {
+    const registry = new ToolRegistry();
+    const provider: LlmProvider = {
+      complete: async ({ signal }) => {
+        await new Promise((_resolve, reject) => {
+          signal?.addEventListener("abort", () => {
+            reject(new DOMException("Aborted", "AbortError"));
+          });
+        });
+
+        return { content: "不会完成" };
+      }
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+    const started = await coordinator.startRun({ input: "生成长任务" });
+
+    await coordinator.shutdown("服务关闭");
+
+    const snapshot = coordinator.getRun(started.run.id);
+    expect(snapshot.run).toMatchObject({
+      status: "cancelled",
+      phase: "cancelled",
+      completedAt: expect.any(String)
+    });
+    expect(snapshot.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: {
+            type: "session.message.created",
+            message: expect.objectContaining({
+              id: started.userMessage.id
+            })
+          }
+        }),
+        expect.objectContaining({
+          event: {
+            type: "cancelled",
+            reason: "服务关闭"
+          }
+        })
+      ])
+    );
+    store.close();
+  });
+
   it("run 会在本轮回答前执行上下文压缩，并用 system message 展示压缩状态", async () => {
     const answerCalls: string[][] = [];
     const summaryCalls: string[][] = [];
@@ -777,20 +946,20 @@ describe("AgentMessageCoordinator", () => {
     try {
       const snapshot = coordinator.getSession(session.id, { messageLimit: 2 });
       const previousPage = coordinator.getSessionMessages(session.id, {
-        before: snapshot.pageInfo.oldestCursor,
+        before: snapshot.pageInfo.nextCursor,
         messageLimit: 2
       });
 
       expect(snapshot.messages.map((message) => message.id)).toEqual([messages[3].id, messages[4].id]);
       expect(snapshot.pageInfo).toEqual({
         hasMore: true,
-        oldestCursor: messages[3].id,
+        nextCursor: messages[3].id,
         limit: 2
       });
       expect(previousPage.messages.map((message) => message.id)).toEqual([messages[1].id, messages[2].id]);
       expect(previousPage.pageInfo).toEqual({
         hasMore: true,
-        oldestCursor: messages[1].id,
+        nextCursor: messages[1].id,
         limit: 2
       });
     } finally {
@@ -840,7 +1009,23 @@ describe("AgentMessageCoordinator", () => {
       }
     };
     const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
-    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+    const resourceStorage = {
+      storeRemoteResource: async () => ({
+        url: "http://127.0.0.1:4001/uploads/resources/images/local-pig.png",
+        mime: "image/png",
+        name: "local-pig.png",
+        size: 123,
+        relativePath: "resources/images/local-pig.png"
+      })
+    };
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService(provider, registry),
+      store,
+      undefined,
+      undefined,
+      undefined,
+      resourceStorage
+    );
 
     try {
       const started = await coordinator.startMessage({ input: "生成一张小猪图片" });
@@ -852,7 +1037,15 @@ describe("AgentMessageCoordinator", () => {
       const resourceId = mediaPart?.extra?.resource?.id;
 
       expect(resourceId).toMatch(/^res_/);
-      expect(mediaPart).not.toHaveProperty("url");
+      expect(mediaPart).toMatchObject({
+        type: "media",
+        mime: "image/png",
+        url: "http://127.0.0.1:4001/uploads/resources/images/local-pig.png",
+        extra: {
+          lifecycle: { state: "succeeded" },
+          generation: { prompt: "小猪", provider: "test_image" }
+        }
+      });
       expect(session.messages).toEqual([
         expect.objectContaining({
           role: "user",
@@ -885,8 +1078,135 @@ describe("AgentMessageCoordinator", () => {
           type: "image",
           mime: "image/png",
           status: "succeeded",
-          url: "https://example.com/pig.png",
+          url: "http://127.0.0.1:4001/uploads/resources/images/local-pig.png",
           metadata: { prompt: "小猪", provider: "test_image" }
+        })
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("视频工具结果写入资源表，并让 assistant media part 引用资源", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "generate_video",
+      description: "生成视频",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string" }
+        },
+        required: ["prompt"]
+      },
+      argumentSchema: z.object({
+        prompt: z.string()
+      }),
+      execute: ({ prompt }) => ({
+        provider: "test_video",
+        prompt,
+        videoUrls: ["https://example.com/pig.mp4"],
+        frames: 121,
+        aspectRatio: "16:9"
+      })
+    });
+    let callCount = 0;
+    const provider: LlmProvider = {
+      complete: async () => {
+        callCount += 1;
+
+        if (callCount === 1) {
+          return {
+            toolCalls: [
+              {
+                id: "call_video",
+                name: "generate_video",
+                arguments: { prompt: "小猪在草地奔跑" }
+              }
+            ]
+          };
+        }
+
+        return { content: "视频已生成。" };
+      }
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const resourceStorage = {
+      storeRemoteResource: async () => ({
+        url: "http://127.0.0.1:4001/uploads/resources/videos/local-pig.mp4",
+        mime: "video/mp4",
+        name: "local-pig.mp4",
+        size: 456,
+        relativePath: "resources/videos/local-pig.mp4"
+      })
+    };
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService(provider, registry),
+      store,
+      undefined,
+      undefined,
+      undefined,
+      resourceStorage
+    );
+
+    try {
+      const started = await coordinator.startMessage({ input: "生成一段小猪视频" });
+
+      await waitForMessage(coordinator, started.assistantMessage.id);
+      const session = coordinator.getSession(started.session.id);
+      const assistant = session.messages.find((message) => message.id === started.assistantMessage.id);
+      const mediaPart = assistant?.parts.find((part) => part.type === "media");
+      const resourceId = mediaPart?.extra?.resource?.id;
+
+      expect(resourceId).toMatch(/^res_/);
+      expect(mediaPart).toMatchObject({
+        type: "media",
+        mime: "video/mp4",
+        url: "http://127.0.0.1:4001/uploads/resources/videos/local-pig.mp4",
+        extra: {
+          lifecycle: { state: "succeeded" },
+          generation: { prompt: "小猪在草地奔跑", provider: "test_video" }
+        }
+      });
+      expect(session.messages).toEqual([
+        expect.objectContaining({
+          role: "user",
+          parts: [{ type: "text", value: "生成一段小猪视频" }]
+        }),
+        expect.objectContaining({
+          role: "assistant",
+          parts: [
+            { type: "text", value: "视频已生成。" },
+            expect.objectContaining({
+              type: "media",
+              extra: expect.objectContaining({
+                resource: { id: resourceId },
+                tool: expect.objectContaining({
+                  name: "generate_video",
+                  toolCallId: "call_video",
+                  toolCallRowId: expect.stringMatching(/^tool_call_/),
+                  outputIndex: 0
+                })
+              })
+            })
+          ]
+        })
+      ]);
+      expect(session.resources).toEqual([
+        expect.objectContaining({
+          id: resourceId,
+          messageId: started.assistantMessage.id,
+          toolCallId: "call_video",
+          type: "video",
+          mime: "video/mp4",
+          status: "succeeded",
+          url: "http://127.0.0.1:4001/uploads/resources/videos/local-pig.mp4",
+          metadata: {
+            prompt: "小猪在草地奔跑",
+            provider: "test_video",
+            frames: 121,
+            aspectRatio: "16:9"
+          }
         })
       ]);
     } finally {
@@ -954,17 +1274,20 @@ describe("AgentMessageCoordinator", () => {
       const resourceId = mediaPart?.extra?.resource?.id;
 
       expect(resourceId).toMatch(/^res_/);
-      expect(mediaPart).not.toHaveProperty("url");
       expect(mediaPart).toMatchObject({
         type: "media",
+        mime: "image/png",
+        url: "https://example.com/edited-pig.png",
         extra: {
+          lifecycle: { state: "succeeded" },
           resource: { id: resourceId },
           tool: {
             name: "edit_image",
             toolCallId: "call_edit_image",
             toolCallRowId: expect.stringMatching(/^tool_call_/),
             outputIndex: 0
-          }
+          },
+          generation: { prompt: "把小猪改成水彩风格", provider: "test_seededit" }
         }
       });
       expect(session.resources).toEqual([
@@ -1113,7 +1436,15 @@ describe("AgentMessageCoordinator", () => {
       const resourceId = mediaPart?.extra?.resource?.id;
 
       expect(resourceId).toMatch(/^res_/);
-      expect(mediaPart).not.toHaveProperty("url");
+      expect(mediaPart).toMatchObject({
+        type: "media",
+        mime: "image/png",
+        url: "https://example.com/pig.png",
+        extra: {
+          lifecycle: { state: "succeeded" },
+          generation: { prompt: "小猪", provider: "test_image" }
+        }
+      });
       expect(message.parts).toEqual([
         { type: "text", value: "图片已生成。" },
         expect.objectContaining({
@@ -1133,6 +1464,116 @@ describe("AgentMessageCoordinator", () => {
       expect(events.map((event) => event.event.type)).toContain("message.part.updated");
       expect(events.map((event) => event.event.type)).toContain("resource.created");
       expect(events.map((event) => event.event.type)).toContain("resource.updated");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("运行过程会投影成可持久化的产品化任务进度步骤", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "generate_image",
+      description: "生成图片",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string" }
+        },
+        required: ["prompt"]
+      },
+      argumentSchema: z.object({
+        prompt: z.string()
+      }),
+      execute: ({ prompt }) => ({
+        provider: "test_image",
+        prompt,
+        imageUrls: ["https://example.com/pig.png"]
+      })
+    });
+    let callCount = 0;
+    const provider: LlmProvider = {
+      complete: async () => {
+        callCount += 1;
+
+        if (callCount === 1) {
+          return {
+            toolCalls: [
+              {
+                id: "call_image",
+                name: "generate_image",
+                arguments: { prompt: "小猪" }
+              }
+            ]
+          };
+        }
+
+        return { content: "图片已生成。" };
+      }
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+
+    try {
+      const started = await coordinator.startMessage({ input: "生成一张小猪图片" });
+
+      await waitForMessage(coordinator, started.assistantMessage.id);
+      const detail = coordinator.getMessage(started.assistantMessage.id);
+
+      expect(detail.processSteps).toEqual([
+        expect.objectContaining({
+          kind: "thinking",
+          title: "已理解需求",
+          status: "succeeded",
+          orderIndex: 0
+        }),
+        expect.objectContaining({
+          kind: "tool",
+          title: "图片已生成",
+          status: "succeeded",
+          orderIndex: 1,
+          toolCallId: "call_image",
+          metadata: expect.objectContaining({
+            toolName: "generate_image",
+            prompt: "小猪"
+          })
+        }),
+        expect.objectContaining({
+          kind: "summary",
+          title: "已整理回答",
+          status: "succeeded",
+          orderIndex: 2
+        })
+      ]);
+      expect(detail.events.map((event) => event.event.type)).toEqual(expect.arrayContaining(["process.step.created", "process.step.updated"]));
+    } finally {
+      store.close();
+    }
+  });
+
+  it("纯文本回答的过程步骤不暴露模型内部文案", async () => {
+    const registry = new ToolRegistry();
+    const provider: LlmProvider = {
+      complete: async () => ({ content: "Agent 会先理解用户需求，再决定是否调用工具。" })
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+
+    try {
+      const started = await coordinator.startMessage({ input: "解释一下 Agent 流程" });
+
+      await waitForMessage(coordinator, started.assistantMessage.id);
+      const detail = coordinator.getMessage(started.assistantMessage.id);
+
+      expect(detail.processSteps).toEqual([
+        expect.objectContaining({
+          kind: "thinking",
+          title: "已生成回答",
+          summary: "回答已生成",
+          status: "succeeded",
+          orderIndex: 0
+        })
+      ]);
+      expect(detail.processSteps.map((step) => step.title).join("\n")).not.toContain("模型");
     } finally {
       store.close();
     }
@@ -1264,6 +1705,10 @@ describe("AgentMessageCoordinator", () => {
         "狗狗"
       ]);
       expect(mediaParts.map((part) => resourcesById.get(part.extra?.resource?.id ?? "")?.url)).toEqual([
+        "https://example.com/baby.png",
+        "https://example.com/dog.png"
+      ]);
+      expect(mediaParts.map((part) => (part.type === "media" ? part.url : undefined))).toEqual([
         "https://example.com/baby.png",
         "https://example.com/dog.png"
       ]);

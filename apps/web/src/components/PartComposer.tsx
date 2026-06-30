@@ -9,6 +9,7 @@ import { docToParts, partsToDoc, stripRuntimeFields, type RuntimePart } from "..
 import { partSchema } from "../prosemirror/part-schema";
 import {
   createAtomicMediaDeletePlugin,
+  createClearSelectionOnOutsidePointerPlugin,
   createDropSelectionPlugin,
   createImageUploadEntryPlugin,
   createInlineAtomSelectionHighlightPlugin,
@@ -264,6 +265,7 @@ function createEditorState(input: {
       }),
       createInlineBoundaryCaretPlugin({ beforeNodeNames: ["media_part"] }),
       createInlineAtomSelectionHighlightPlugin({ nodeNames: ["media_part"] }),
+      createClearSelectionOnOutsidePointerPlugin(),
       createDropSelectionPlugin(),
       createAtomicMediaDeletePlugin({ nodeNames: ["media_part"] }),
       createInlineAtomArrowNavigationPlugin({ nodeNames: ["media_part"] }),

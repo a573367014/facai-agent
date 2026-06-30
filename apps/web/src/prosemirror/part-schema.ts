@@ -25,7 +25,10 @@ export const partSchema = new Schema({
         mime: { default: "" },
         url: { default: "" },
         name: { default: "" },
-        size: { default: null }
+        size: { default: null },
+        width: { default: null },
+        height: { default: null },
+        extra: { default: null }
       },
       parseDOM: [
         {
@@ -37,7 +40,10 @@ export const partSchema = new Schema({
               mime: element.dataset.mime ?? "",
               url: element.dataset.url ?? "",
               name: element.dataset.name ?? "",
-              size: element.dataset.size ? Number(element.dataset.size) : null
+              size: element.dataset.size ? Number(element.dataset.size) : null,
+              width: element.dataset.width ? Number(element.dataset.width) : null,
+              height: element.dataset.height ? Number(element.dataset.height) : null,
+              extra: parseJsonDataAttribute(element.dataset.extra)
             };
           }
         }
@@ -55,6 +61,15 @@ export const partSchema = new Schema({
 
         if (node.attrs.size !== null && node.attrs.size !== undefined) {
           attrs["data-size"] = String(node.attrs.size);
+        }
+        if (node.attrs.width !== null && node.attrs.width !== undefined) {
+          attrs["data-width"] = String(node.attrs.width);
+        }
+        if (node.attrs.height !== null && node.attrs.height !== undefined) {
+          attrs["data-height"] = String(node.attrs.height);
+        }
+        if (node.attrs.extra !== null && node.attrs.extra !== undefined) {
+          attrs["data-extra"] = JSON.stringify(node.attrs.extra);
         }
 
         return [
@@ -81,3 +96,16 @@ export const partSchema = new Schema({
     }
   }
 });
+
+function parseJsonDataAttribute(value?: string) {
+  if (!value) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}

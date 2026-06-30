@@ -45,6 +45,10 @@ const messageStartRequestSchema = messageRequestSchema.extend({
 const sessionRequestSchema = z.object({
   title: z.string().trim().min(1).optional()
 });
+const sessionsQuerySchema = z.object({
+  after: z.string().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional()
+});
 const messageParamsSchema = z.object({
   messageId: z.string().min(1)
 });
@@ -152,6 +156,16 @@ function parseSessionParams(params: unknown) {
   return parsed.data;
 }
 
+function parseSessionsQuery(query: unknown) {
+  const parsed = sessionsQuerySchema.safeParse(query);
+
+  if (!parsed.success) {
+    throw new AppError("VALIDATION_ERROR", "after 必须是非空字符串，limit 必须是 1 到 100 之间的整数", 400);
+  }
+
+  return parsed.data;
+}
+
 function parseEventsQuery(query: unknown) {
   const parsed = eventsQuerySchema.safeParse(query);
 
@@ -247,8 +261,14 @@ export async function registerAgentRoutes(
     reply.status(201).send({ session: coordinator.createSession(title) });
   });
 
-  app.get("/agents/sessions", async () => {
-    return coordinator.listSessions();
+  app.get("/agents/sessions", async (request) => {
+    return coordinator.listSessions(parseSessionsQuery(request.query));
+  });
+
+  app.delete("/agents/sessions/:sessionId", async (request, reply) => {
+    const { sessionId } = parseSessionParams(request.params);
+    await coordinator.deleteSession(sessionId);
+    reply.status(204).send();
   });
 
   app.get("/agents/sessions/:sessionId", async (request) => {
@@ -404,11 +424,11 @@ export async function registerAgentRoutes(
       }
     });
 
-    const { message, resources, version } = await coordinator.getMessageSnapshot(messageId);
+    const { message, resources, processSteps, version } = await coordinator.getMessageSnapshot(messageId);
     writeStoredEvent(
       createLiveSseEvent({
         messageId,
-        event: { type: "message.snapshot", message, resources, version }
+        event: { type: "message.snapshot", message, resources, processSteps, version }
       })
     );
 
@@ -466,12 +486,12 @@ export async function registerAgentRoutes(
 
     const { run } = coordinator.getRun(runId);
     if (run.assistantMessageId) {
-      const { message, resources, version } = await coordinator.getMessageSnapshot(run.assistantMessageId);
+      const { message, resources, processSteps, version } = await coordinator.getMessageSnapshot(run.assistantMessageId);
       writeStoredEvent(
         createLiveSseEvent({
           runId,
           messageId: message.id,
-          event: { type: "message.snapshot", message, resources, version }
+          event: { type: "message.snapshot", message, resources, processSteps, version }
         })
       );
     }

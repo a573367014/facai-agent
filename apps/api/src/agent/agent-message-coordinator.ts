@@ -14,21 +14,32 @@ import {
   type RunningMessageState,
   type RunningMessageStateStore
 } from "./running-message-state-store.js";
+import {
+  PassthroughToolResourceStorage,
+  type StoredToolResource,
+  type ToolResourceStorage,
+  type ToolResourceType
+} from "./tool-resource-storage.js";
 import type { AgentErrorDetail, AgentMessage, AgentExecutionInput, AgentStreamEvent, JsonObject } from "./types.js";
 import type {
   AgentEventListener,
   AgentMessagePage,
   AgentMessageRecord,
+  AgentProcessStepRecord,
   AgentResourceRecord,
   AgentRunRecord,
+  AgentSessionPageInfo,
   AgentStore,
   AgentToolCallRecord,
   StoredAgentEvent
 } from "./agent-store.js";
 
 const DEFAULT_SESSION_MESSAGE_LIMIT = 30;
+const DEFAULT_SESSION_PAGE_LIMIT = 30;
 const MAX_SESSION_MESSAGE_LIMIT = 100;
+const MAX_SESSION_PAGE_LIMIT = 100;
 const IMAGE_OUTPUT_TOOL_NAMES = new Set(["generate_image", "edit_image"]);
+const VIDEO_OUTPUT_TOOL_NAMES = new Set(["generate_video"]);
 
 interface ExtractedImageResult {
   url: string;
@@ -58,8 +69,23 @@ interface ImageRequestSlot {
   isBatch: boolean;
 }
 
+interface VideoRequestSlot {
+  outputIndex: number;
+  prompt?: string;
+  frames?: number;
+  aspectRatio?: string;
+}
+
+interface ExtractedVideoResult {
+  url: string;
+  prompt?: string;
+  index: number;
+  metadata: JsonObject;
+}
+
 type AgentMessagePageWithResources = AgentMessagePage & {
   resources: AgentResourceRecord[];
+  processSteps: AgentProcessStepRecord[];
 };
 
 interface RunningDraftSnapshot {
@@ -70,6 +96,14 @@ interface RunningDraftSnapshot {
 interface DraftPartsUpdate {
   parts: MessagePart[];
   version?: number;
+}
+
+export interface StaleRunningCleanupResult {
+  runs: number;
+  messages: number;
+  toolCalls: number;
+  resources: number;
+  processSteps: number;
 }
 
 function toErrorDetail(error: unknown): AgentErrorDetail {
@@ -94,23 +128,107 @@ function now() {
 export class AgentMessageCoordinator {
   private readonly runningMessages = new Map<string, AbortController>();
   private readonly runningRuns = new Map<string, AbortController>();
+  private readonly runningMessageExecutions = new Map<string, Promise<void>>();
+  private readonly runningRunExecutions = new Map<string, Promise<void>>();
 
   constructor(
     private readonly agentService: AgentService,
     private readonly store: AgentStore,
     private readonly contextBuilder = new AgentContextBuilder(),
     private readonly summaryService?: AgentSummaryService,
-    private readonly runningStateStore: RunningMessageStateStore = new InMemoryRunningMessageStateStore()
+    private readonly runningStateStore: RunningMessageStateStore = new InMemoryRunningMessageStateStore(),
+    private readonly resourceStorage: ToolResourceStorage = new PassthroughToolResourceStorage()
   ) {}
 
   createSession(title?: string) {
     return this.store.createSession(title);
   }
 
-  listSessions() {
+  listSessions(options: { after?: string; limit?: number } = {}) {
+    const limit = this.normalizeSessionLimit(options.limit);
+    const sessionsWithOverflow = this.store.listSessions({
+      after: options.after,
+      limit: limit + 1
+    });
+    const hasMore = sessionsWithOverflow.length > limit;
+    const sessions = hasMore ? sessionsWithOverflow.slice(0, limit) : sessionsWithOverflow;
+
     return {
-      sessions: this.store.listSessions()
+      sessions,
+      pageInfo: this.createSessionPageInfo(sessions, hasMore, limit)
     };
+  }
+
+  async cleanupStaleRunningExecutions(reason = "服务重启后清理遗留运行"): Promise<StaleRunningCleanupResult> {
+    const detail: AgentErrorDetail = {
+      code: "RUN_INTERRUPTED",
+      message: reason
+    };
+    const result = this.createEmptyCleanupResult();
+    const cleanedMessageIds = new Set<string>();
+
+    for (const run of this.getAllRunningRuns()) {
+      if (this.runningRuns.has(run.id)) {
+        continue;
+      }
+
+      const runResult = await this.failInterruptedRun(run, detail);
+      this.addCleanupResult(result, runResult);
+
+      if (run.systemMessageId) {
+        cleanedMessageIds.add(run.systemMessageId);
+      }
+
+      if (run.assistantMessageId) {
+        cleanedMessageIds.add(run.assistantMessageId);
+      }
+    }
+
+    for (const message of this.getAllRunningMessages()) {
+      if (cleanedMessageIds.has(message.id) || this.runningMessages.has(message.id) || this.hasRunningRunForMessage(message.id)) {
+        continue;
+      }
+
+      const messageResult = await this.failInterruptedMessage(message, undefined, detail);
+      this.addCleanupResult(result, messageResult);
+    }
+
+    return result;
+  }
+
+  async shutdown(reason = "服务关闭") {
+    const runIds = [...this.runningRuns.keys()];
+    const messageIds = [...this.runningMessages.keys()];
+
+    for (const runId of runIds) {
+      await this.cancelRun(runId, reason);
+    }
+
+    for (const messageId of messageIds) {
+      await this.cancelMessage(messageId, reason);
+    }
+
+    await Promise.allSettled([
+      ...runIds.map((runId) => this.runningRunExecutions.get(runId)).filter((execution): execution is Promise<void> => Boolean(execution)),
+      ...messageIds
+        .map((messageId) => this.runningMessageExecutions.get(messageId))
+        .filter((execution): execution is Promise<void> => Boolean(execution))
+    ]);
+  }
+
+  async deleteSession(sessionId: string) {
+    const session = this.store.getSession(sessionId);
+
+    if (!session) {
+      throw new AppError("VALIDATION_ERROR", `未找到会话：${sessionId}`, 404);
+    }
+
+    for (const run of this.getSessionRunningRuns(sessionId)) {
+      await this.cancelRun(run.id);
+    }
+
+    this.store.deleteSession(sessionId);
+    return { session };
   }
 
   getSession(sessionId: string, options: { messageLimit?: number } = {}) {
@@ -126,6 +244,7 @@ export class AgentMessageCoordinator {
       session,
       messages: messagePage.messages,
       resources: this.getResourcesForMessages(messagePage.messages),
+      processSteps: this.getProcessStepsForMessages(messagePage.messages),
       pageInfo: messagePage.pageInfo,
       summary: this.store.getSessionSummary(sessionId)
     };
@@ -172,13 +291,18 @@ export class AgentMessageCoordinator {
 
     await this.initRunningMessageState(assistantMessage);
     this.runningMessages.set(assistantMessage.id, controller);
-    void this.executeMessage(assistantMessage.id, {
+    const execution = this.executeMessage(assistantMessage.id, {
       ...input,
       sessionId: session.id,
       messageId: assistantMessage.id,
       history,
       signal: controller.signal
+    }).finally(() => {
+      this.runningMessageExecutions.delete(assistantMessage.id);
     });
+
+    this.runningMessageExecutions.set(assistantMessage.id, execution);
+    void execution;
 
     return {
       session,
@@ -207,13 +331,18 @@ export class AgentMessageCoordinator {
 
     this.runningRuns.set(run.id, controller);
     this.store.appendRunEvent(run.id, { type: "session.message.created", message: userMessage }, userMessage.id);
-    void this.executeRun(run.id, {
+    const execution = this.executeRun(run.id, {
       ...input,
       input: userText,
       parts: userParts,
       sessionId: session.id,
       signal: controller.signal
+    }).finally(() => {
+      this.runningRunExecutions.delete(run.id);
     });
+
+    this.runningRunExecutions.set(run.id, execution);
+    void execution;
 
     return {
       run,
@@ -247,7 +376,7 @@ export class AgentMessageCoordinator {
     const history = this.buildConversationHistoryBefore(session.id, userMessage.id);
 
     this.runningRuns.set(run.id, controller);
-    void this.executeRun(
+    const execution = this.executeRun(
       run.id,
       {
         input: userText,
@@ -260,7 +389,12 @@ export class AgentMessageCoordinator {
         history,
         skipSummaryRefresh: true
       }
-    );
+    ).finally(() => {
+      this.runningRunExecutions.delete(run.id);
+    });
+
+    this.runningRunExecutions.set(run.id, execution);
+    void execution;
 
     return {
       run,
@@ -269,7 +403,7 @@ export class AgentMessageCoordinator {
     };
   }
 
-  async cancelRun(runId: string) {
+  async cancelRun(runId: string, reason = "用户中断") {
     const run = this.ensureRun(runId);
 
     if (run.status !== "running") {
@@ -298,6 +432,7 @@ export class AgentMessageCoordinator {
 
       if (assistantMessage?.status === "running") {
         const draftMessage = await this.withRunningDraft(assistantMessage);
+        this.completeRunningProcessSteps(assistantMessage.id, runId, "cancelled");
         this.store.appendRunEvent(runId, {
           type: "agent_state",
           iteration: 0,
@@ -319,7 +454,7 @@ export class AgentMessageCoordinator {
       }
     }
 
-    this.store.appendRunEvent(runId, { type: "cancelled", reason: "用户中断" }, run.assistantMessageId ?? run.systemMessageId);
+    this.store.appendRunEvent(runId, { type: "cancelled", reason }, run.assistantMessageId ?? run.systemMessageId);
     const cancelledRun =
       this.store.updateRun(runId, {
         status: "cancelled",
@@ -351,7 +486,7 @@ export class AgentMessageCoordinator {
       runs,
       messageEvents,
       runEvents,
-      events: sortStoredEvents([...messageEvents, ...runEvents])
+      events: uniqueStoredEvents([...messageEvents, ...runEvents])
     };
   }
 
@@ -365,7 +500,7 @@ export class AgentMessageCoordinator {
     return this.store.subscribeRun(runId, listener);
   }
 
-  async cancelMessage(messageId: string) {
+  async cancelMessage(messageId: string, reason = "用户中断") {
     const message = this.ensureAssistantMessage(messageId);
 
     if (message.status !== "running") {
@@ -373,6 +508,7 @@ export class AgentMessageCoordinator {
     }
 
     this.runningMessages.get(messageId)?.abort();
+    this.completeRunningProcessSteps(messageId, undefined, "cancelled");
     this.store.appendEvent(messageId, {
       type: "agent_state",
       iteration: 0,
@@ -381,7 +517,7 @@ export class AgentMessageCoordinator {
     });
     this.store.appendEvent(messageId, {
       type: "cancelled",
-      reason: "用户中断"
+      reason
     });
     const draftMessage = await this.withRunningDraft(message);
     const cancelledMessage =
@@ -402,6 +538,7 @@ export class AgentMessageCoordinator {
     return {
       message,
       resources: this.getResourcesForMessages([message]),
+      processSteps: this.getProcessStepsForMessages([message]),
       events: this.store.getEvents(messageId)
     };
   }
@@ -412,6 +549,7 @@ export class AgentMessageCoordinator {
     return {
       message,
       resources: this.getResourcesForMessages([message]),
+      processSteps: this.getProcessStepsForMessages([message]),
       events: this.store.getEvents(messageId),
       version
     };
@@ -489,6 +627,7 @@ export class AgentMessageCoordinator {
       }
 
       const finalParts = await this.setAssistantTextAndEmitUpdate(assistantMessage.id, result.answer, runId);
+      this.completeRunningProcessSteps(assistantMessage.id, runId, "succeeded");
       this.store.appendRunEvent(runId, finalAnswerEvent ?? { type: "final_answer", answer: result.answer }, assistantMessage.id);
       const completedAssistantMessage =
         this.store.updateMessage(assistantMessage.id, {
@@ -526,6 +665,7 @@ export class AgentMessageCoordinator {
       );
 
       if (messageId) {
+        this.completeRunningProcessSteps(messageId, runId, "failed");
         const failedMessage =
           this.store.updateMessage(messageId, {
             status: "failed",
@@ -659,6 +799,7 @@ export class AgentMessageCoordinator {
       }
 
       const finalParts = await this.setAssistantTextAndEmitUpdate(messageId, result.answer);
+      this.completeRunningProcessSteps(messageId, undefined, "succeeded");
       this.store.appendEvent(messageId, finalAnswerEvent ?? { type: "final_answer", answer: result.answer });
       this.store.updateMessage(messageId, {
         status: "completed",
@@ -673,6 +814,7 @@ export class AgentMessageCoordinator {
       }
 
       const detail = toErrorDetail(error);
+      this.completeRunningProcessSteps(messageId, undefined, "failed");
       this.store.appendEvent(messageId, {
         type: "error",
         code: detail.code,
@@ -769,15 +911,53 @@ export class AgentMessageCoordinator {
           toolCallId: event.toolCallId,
           toolCallRowId: toolCall?.id,
           outputIndex: slot.outputIndex,
-          mime: "image/png"
+          mime: "image/png",
+          name: slot.prompt,
+          width: slot.width,
+          height: slot.height,
+          generation: compactJsonObject({
+            prompt: slot.prompt
+          })
         }, runId);
       }
+    } else if (event.type === "tool_start" && isVideoOutputToolName(event.toolName) && event.toolCallId) {
+      const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
+      const videoSlot = extractVideoRequestSlot(event.arguments);
+      const resource = this.upsertImageResource(messageId, {
+        type: "video",
+        status: "pending",
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: videoSlot.outputIndex,
+        mime: "video/mp4",
+        metadata: buildVideoMetadata({
+          prompt: videoSlot.prompt,
+          frames: videoSlot.frames,
+          aspectRatio: videoSlot.aspectRatio
+        })
+      }, runId);
+
+      await this.upsertImagePart(messageId, {
+        state: "pending",
+        resourceId: resource.id,
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: videoSlot.outputIndex,
+        mime: "video/mp4",
+        name: videoSlot.prompt,
+        generation: compactJsonObject({
+          prompt: videoSlot.prompt
+        })
+      }, runId);
     } else if (event.type === "tool_start" && event.toolCallId) {
       this.ensureToolCallRecord(messageId, event, runId, "running");
     }
 
     if (isImageToolResultWithId(event)) {
       await this.upsertImageResultParts(messageId, event, runId);
+    } else if (isVideoToolResultWithId(event)) {
+      await this.upsertVideoResultParts(messageId, event, runId);
     } else if (event.type === "tool_result" && event.toolCallId) {
       const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
       if (toolCall) {
@@ -831,6 +1011,50 @@ export class AgentMessageCoordinator {
           message: event.error.message
         }
       }, runId);
+    } else if (event.type === "tool_error" && isVideoOutputToolName(event.toolName) && event.toolCallId) {
+      const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
+      const resource = this.upsertImageResource(messageId, {
+        type: "video",
+        status: "failed",
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: 0,
+        mime: "video/mp4",
+        metadata: compactJsonObject({
+          prompt: toOptionalString(toolCall?.arguments.prompt),
+          frames: toOptionalNumber(toolCall?.arguments.frames),
+          aspectRatio: toOptionalString(toolCall?.arguments.aspectRatio),
+          error: {
+            code: event.error.code,
+            message: event.error.message
+          }
+        })
+      }, runId);
+
+      if (toolCall) {
+        this.store.updateToolCall(toolCall.id, {
+          status: "failed",
+          durationMs: event.durationMs,
+          error: {
+            code: event.error.code,
+            message: event.error.message
+          }
+        });
+      }
+
+      await this.upsertImagePart(messageId, {
+        state: "failed",
+        resourceId: resource.id,
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: 0,
+        mime: "video/mp4",
+        error: {
+          code: event.error.code,
+          message: event.error.message
+        }
+      }, runId);
     } else if (event.type === "tool_error" && event.toolCallId) {
       const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
       if (toolCall) {
@@ -845,7 +1069,231 @@ export class AgentMessageCoordinator {
       }
     }
 
+    this.projectProcessStep(messageId, event, runId);
     this.appendEvent(messageId, event, runId);
+  }
+
+  private projectProcessStep(messageId: string, event: AgentStreamEvent, runId?: string) {
+    if (event.type === "agent_state" && event.state === "thinking") {
+      if (!this.findProcessStep(messageId, (step) => step.kind === "thinking" && step.metadata?.phase === "thinking")) {
+        this.createProcessStep(messageId, runId, {
+          kind: "thinking",
+          title: "正在理解需求",
+          summary: event.label,
+          status: "running",
+          metadata: { phase: "thinking", iteration: event.iteration }
+        });
+      }
+      return;
+    }
+
+    if (event.type === "llm_response") {
+      const thinkingStep = this.findProcessStep(messageId, (step) => step.kind === "thinking" && step.metadata?.phase === "thinking");
+
+      if (thinkingStep?.status === "running") {
+        const toolCallCount = event.toolCalls?.length ?? 0;
+        this.updateProcessStep(messageId, thinkingStep.id, runId, {
+          title: toolCallCount > 0 ? "已理解需求" : "已生成回答",
+          summary: toolCallCount > 0 ? `需要执行 ${toolCallCount} 项任务` : "回答已生成",
+          status: "succeeded",
+          metadata: compactJsonObject({
+            ...thinkingStep.metadata,
+            toolCallCount
+          })
+        });
+      }
+      return;
+    }
+
+    if (event.type === "agent_state" && event.state === "answering") {
+      const hasToolStep = Boolean(this.findProcessStep(messageId, (step) => step.kind === "tool"));
+
+      if (!hasToolStep) {
+        return;
+      }
+
+      if (!this.findProcessStep(messageId, (step) => step.kind === "summary" && step.metadata?.phase === "answering")) {
+        this.createProcessStep(messageId, runId, {
+          kind: "summary",
+          title: "正在整理回答",
+          summary: "整合执行结果",
+          status: "running",
+          metadata: { phase: "answering", iteration: event.iteration }
+        });
+      }
+      return;
+    }
+
+    if (event.type === "tool_start") {
+      const toolCall = event.toolCallId ? this.store.getToolCallByMessageToolCall(messageId, event.toolCallId) : undefined;
+      const existingStep = event.toolCallId
+        ? this.findProcessStep(messageId, (step) => step.kind === "tool" && step.toolCallId === event.toolCallId)
+        : undefined;
+      const summary = getPrimaryToolArgumentSummary(event.arguments);
+      const labels = getToolProcessLabels(event.toolName);
+      const metadata = compactJsonObject({
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        ...event.arguments
+      });
+
+      if (existingStep) {
+        this.updateProcessStep(messageId, existingStep.id, runId, {
+          toolCallRowId: toolCall?.id,
+          toolCallId: event.toolCallId,
+          title: labels.running,
+          summary,
+          status: "running",
+          metadata
+        });
+        return;
+      }
+
+      this.createProcessStep(messageId, runId, {
+        kind: "tool",
+        toolCallRowId: toolCall?.id,
+        toolCallId: event.toolCallId,
+        title: labels.running,
+        summary,
+        status: "running",
+        metadata
+      });
+      return;
+    }
+
+    if (event.type === "tool_result" && event.toolCallId) {
+      const toolCall = this.store.getToolCallByMessageToolCall(messageId, event.toolCallId);
+      const existingStep = this.findProcessStep(messageId, (step) => step.kind === "tool" && step.toolCallId === event.toolCallId);
+      const labels = getToolProcessLabels(event.toolName);
+
+      if (existingStep) {
+        this.updateProcessStep(messageId, existingStep.id, runId, {
+          toolCallRowId: toolCall?.id,
+          title: labels.succeeded,
+          summary: event.durationMs !== undefined ? `耗时 ${formatDuration(event.durationMs)}` : existingStep.summary,
+          status: "succeeded",
+          metadata: compactJsonObject({
+            ...existingStep.metadata,
+            durationMs: event.durationMs,
+            result: summarizeToolResult(event.result)
+          })
+        });
+      }
+      return;
+    }
+
+    if (event.type === "tool_error" && event.toolCallId) {
+      const toolCall = this.store.getToolCallByMessageToolCall(messageId, event.toolCallId);
+      const existingStep = this.findProcessStep(messageId, (step) => step.kind === "tool" && step.toolCallId === event.toolCallId);
+      const labels = getToolProcessLabels(event.toolName);
+
+      if (existingStep) {
+        this.updateProcessStep(messageId, existingStep.id, runId, {
+          toolCallRowId: toolCall?.id,
+          title: labels.failed,
+          summary: event.error.message,
+          status: "failed",
+          metadata: compactJsonObject({
+            ...existingStep.metadata,
+            durationMs: event.durationMs,
+            error: event.error
+          })
+        });
+      }
+      return;
+    }
+
+    if (event.type === "error") {
+      this.completeRunningProcessSteps(messageId, runId, "failed");
+      return;
+    }
+
+    if (event.type === "cancelled") {
+      this.completeRunningProcessSteps(messageId, runId, "cancelled");
+    }
+  }
+
+  private createProcessStep(
+    messageId: string,
+    runId: string | undefined,
+    input: {
+      kind: AgentProcessStepRecord["kind"];
+      toolCallRowId?: string;
+      toolCallId?: string;
+      title: string;
+      summary?: string;
+      status: AgentProcessStepRecord["status"];
+      metadata?: JsonObject;
+    }
+  ): AgentProcessStepRecord | undefined {
+    const message = this.store.getMessage(messageId);
+
+    if (!message) {
+      return undefined;
+    }
+
+    const step = this.store.createProcessStep({
+      sessionId: message.sessionId,
+      runId,
+      messageId,
+      toolCallRowId: input.toolCallRowId,
+      toolCallId: input.toolCallId,
+      kind: input.kind,
+      title: input.title,
+      summary: input.summary,
+      status: input.status,
+      orderIndex: this.getNextProcessStepOrderIndex(messageId),
+      metadata: input.metadata
+    });
+    this.appendEvent(messageId, { type: "process.step.created", step }, runId);
+    return step;
+  }
+
+  private updateProcessStep(
+    messageId: string,
+    stepId: string,
+    runId: string | undefined,
+    input: {
+      toolCallRowId?: string;
+      toolCallId?: string;
+      title?: string;
+      summary?: string;
+      status?: AgentProcessStepRecord["status"];
+      metadata?: JsonObject;
+    }
+  ): AgentProcessStepRecord | undefined {
+    const step = this.store.updateProcessStep(stepId, input);
+
+    if (!step) {
+      return undefined;
+    }
+
+    this.appendEvent(messageId, { type: "process.step.updated", step }, runId);
+    return step;
+  }
+
+  private completeRunningProcessSteps(messageId: string, runId: string | undefined, status: AgentProcessStepRecord["status"]) {
+    for (const step of this.store.getProcessStepsByMessages([messageId])) {
+      if (step.status !== "running") {
+        continue;
+      }
+
+      this.updateProcessStep(messageId, step.id, runId, {
+        ...getProcessStepCompletionPatch(step, status),
+        status
+      });
+    }
+  }
+
+  private findProcessStep(messageId: string, predicate: (step: AgentProcessStepRecord) => boolean): AgentProcessStepRecord | undefined {
+    return this.store.getProcessStepsByMessages([messageId]).find(predicate);
+  }
+
+  private getNextProcessStepOrderIndex(messageId: string) {
+    const steps = this.store.getProcessStepsByMessages([messageId]);
+    const maxOrderIndex = Math.max(-1, ...steps.map((step) => step.orderIndex));
+    return maxOrderIndex + 1;
   }
 
   private ensureToolCallRecord(
@@ -985,8 +1433,13 @@ export class AgentMessageCoordinator {
         toolCallRowId: toolCall?.id,
         outputIndex: asset.index,
         mime: "image/png",
+        name: asset.prompt,
         width: asset.width,
         height: asset.height,
+        generation: compactJsonObject({
+          prompt: asset.prompt,
+          provider: asset.metadata.provider
+        }),
         error: asset.error
           ? {
               code: "IMAGE_GENERATION_FAILED",
@@ -997,13 +1450,44 @@ export class AgentMessageCoordinator {
     }
 
     for (const asset of assets) {
+      const storedAsset = await this.storeToolResource(messageId, runId, {
+        type: "image",
+        url: asset.url,
+        mime: asset.mimeType ?? "image/png",
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: asset.index ?? 0,
+        prompt: asset.prompt,
+        width: asset.width,
+        height: asset.height,
+        generation: compactJsonObject({
+          prompt: asset.prompt,
+          provider: asset.metadata.provider
+        }),
+        metadata: buildImageMetadata({
+          prompt: asset.prompt,
+          width: asset.width,
+          height: asset.height,
+          sourceImageUrl: toOptionalString(asset.metadata.sourceImageUrl),
+          outputIndex: asset.index ?? 0,
+          includeOutputIndex: (asset.index ?? 0) > 0,
+          provider: asset.metadata.provider
+        })
+      });
+
+      if (!storedAsset) {
+        continue;
+      }
+
       const resource = this.upsertImageResource(messageId, {
         status: "succeeded",
         toolCallId: event.toolCallId,
         toolCallRowId: toolCall?.id,
         outputIndex: asset.index ?? 0,
-        mime: asset.mimeType ?? "image/png",
-        url: asset.url,
+        mime: storedAsset.mime ?? asset.mimeType ?? "image/png",
+        url: storedAsset.url,
+        name: storedAsset.name,
         width: asset.width,
         height: asset.height,
         metadata: buildImageMetadata({
@@ -1024,8 +1508,165 @@ export class AgentMessageCoordinator {
         toolCallId: event.toolCallId,
         toolCallRowId: toolCall?.id,
         outputIndex: asset.index ?? 0,
-        mime: asset.mimeType ?? "image/png"
+        mime: storedAsset.mime ?? asset.mimeType ?? "image/png",
+        url: storedAsset.url,
+        name: asset.prompt,
+        width: asset.width,
+        height: asset.height,
+        generation: compactJsonObject({
+          prompt: asset.prompt,
+          provider: asset.metadata.provider
+        })
       }, runId);
+    }
+  }
+
+  private async upsertVideoResultParts(
+    messageId: string,
+    event: Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: string; toolCallId: string },
+    runId?: string
+  ) {
+    const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
+    const assets = extractVideoAssets(event.result, 0);
+
+    if (toolCall) {
+      this.store.updateToolCall(toolCall.id, {
+        status: "succeeded",
+        durationMs: event.durationMs,
+        resultSummary: compactJsonObject({
+          outputCount: assets.length,
+          provider: isRecord(event.result) ? event.result.provider : undefined
+        })
+      });
+    }
+
+    for (const asset of assets) {
+      const storedAsset = await this.storeToolResource(messageId, runId, {
+        type: "video",
+        url: asset.url,
+        mime: "video/mp4",
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: asset.index,
+        prompt: asset.prompt,
+        generation: compactJsonObject({
+          prompt: asset.prompt,
+          provider: asset.metadata.provider
+        }),
+        metadata: buildVideoMetadata({
+          prompt: asset.prompt,
+          frames: toOptionalNumber(asset.metadata.frames),
+          aspectRatio: toOptionalString(asset.metadata.aspectRatio),
+          provider: asset.metadata.provider,
+          taskId: asset.metadata.taskId
+        })
+      });
+
+      if (!storedAsset) {
+        continue;
+      }
+
+      const resource = this.upsertImageResource(messageId, {
+        type: "video",
+        status: "succeeded",
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: asset.index,
+        mime: storedAsset.mime ?? "video/mp4",
+        url: storedAsset.url,
+        name: storedAsset.name,
+        metadata: buildVideoMetadata({
+          prompt: asset.prompt,
+          frames: toOptionalNumber(asset.metadata.frames),
+          aspectRatio: toOptionalString(asset.metadata.aspectRatio),
+          provider: asset.metadata.provider,
+          taskId: asset.metadata.taskId
+        })
+      }, runId);
+
+      await this.upsertImagePart(messageId, {
+        state: "succeeded",
+        resourceId: resource.id,
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: asset.index,
+        mime: storedAsset.mime ?? "video/mp4",
+        url: storedAsset.url,
+        name: asset.prompt,
+        generation: compactJsonObject({
+          prompt: asset.prompt,
+          provider: asset.metadata.provider
+        })
+      }, runId);
+    }
+  }
+
+  private async storeToolResource(
+    messageId: string,
+    runId: string | undefined,
+    input: {
+      type: ToolResourceType;
+      url: string;
+      mime?: string;
+      toolName: string;
+      toolCallId: string;
+      toolCallRowId?: string;
+      outputIndex: number;
+      prompt?: string;
+      width?: number;
+      height?: number;
+      generation?: JsonObject;
+      metadata: JsonObject;
+    }
+  ): Promise<StoredToolResource | undefined> {
+    try {
+      return await this.resourceStorage.storeRemoteResource({
+        url: input.url,
+        type: input.type,
+        mime: input.mime
+      });
+    } catch (error) {
+      const detail = toErrorDetail(error);
+      const mime = input.mime ?? (input.type === "video" ? "video/mp4" : "image/png");
+      const resource = this.upsertImageResource(messageId, {
+        type: input.type,
+        status: "failed",
+        toolCallId: input.toolCallId,
+        toolCallRowId: input.toolCallRowId,
+        outputIndex: input.outputIndex,
+        mime,
+        width: input.width,
+        height: input.height,
+        metadata: compactJsonObject({
+          ...input.metadata,
+          error: {
+            code: detail.code,
+            message: `资源转储失败：${detail.message}`
+          }
+        })
+      }, runId);
+
+      await this.upsertImagePart(messageId, {
+        state: "failed",
+        resourceId: resource.id,
+        toolName: input.toolName,
+        toolCallId: input.toolCallId,
+        toolCallRowId: input.toolCallRowId,
+        outputIndex: input.outputIndex,
+        mime,
+        name: input.prompt,
+        width: input.width,
+        height: input.height,
+        generation: input.generation,
+        error: {
+          code: detail.code,
+          message: `资源转储失败：${detail.message}`
+        }
+      }, runId);
+
+      return undefined;
     }
   }
 
@@ -1059,6 +1700,7 @@ export class AgentMessageCoordinator {
   private upsertImageResource(
     messageId: string,
     input: {
+      type?: "image" | "video";
       status: AgentResourceRecord["status"];
       toolCallId: string;
       toolCallRowId?: string;
@@ -1078,7 +1720,8 @@ export class AgentMessageCoordinator {
       throw new AppError("VALIDATION_ERROR", `未找到助手消息：${messageId}`, 404);
     }
 
-    const existingResource = this.findImageResource(messageId, input.toolCallId, input.outputIndex);
+    const resourceType = input.type ?? "image";
+    const existingResource = this.findImageResource(messageId, input.toolCallId, input.outputIndex, resourceType);
 
     if (existingResource) {
       const resource =
@@ -1097,7 +1740,8 @@ export class AgentMessageCoordinator {
       return resource;
     }
 
-    const reusableFailedResource = this.findReusableFailedImageResource(messageId, input.metadata);
+    const reusableFailedResource =
+      resourceType === "image" ? this.findReusableFailedImageResource(messageId, input.metadata) : undefined;
 
     if (reusableFailedResource) {
       const resource =
@@ -1121,7 +1765,7 @@ export class AgentMessageCoordinator {
       messageId,
       toolCallId: input.toolCallId,
       toolCallRowId: input.toolCallRowId,
-      type: "image",
+      type: resourceType,
       mime: input.mime,
       url: input.url,
       name: input.name,
@@ -1134,10 +1778,15 @@ export class AgentMessageCoordinator {
     return resource;
   }
 
-  private findImageResource(messageId: string, toolCallId: string, outputIndex: number): AgentResourceRecord | undefined {
+  private findImageResource(
+    messageId: string,
+    toolCallId: string,
+    outputIndex: number,
+    resourceType = "image"
+  ): AgentResourceRecord | undefined {
     const resources = this.store
       .getResourcesByMessages([messageId])
-      .filter((resource) => resource.type === "image" && resource.toolCallId === toolCallId);
+      .filter((resource) => resource.type === resourceType && resource.toolCallId === toolCallId);
     const resourceWithOutputIndex = resources.find(
       (resource) => toOptionalNumber(resource.metadata?.outputIndex) === outputIndex
     );
@@ -1409,12 +2058,17 @@ export class AgentMessageCoordinator {
   private withResources(messagePage: AgentMessagePage): AgentMessagePageWithResources {
     return {
       ...messagePage,
-      resources: this.getResourcesForMessages(messagePage.messages)
+      resources: this.getResourcesForMessages(messagePage.messages),
+      processSteps: this.getProcessStepsForMessages(messagePage.messages)
     };
   }
 
   private getResourcesForMessages(messages: AgentMessageRecord[]): AgentResourceRecord[] {
     return this.store.getResourcesByMessages(messages.map((message) => message.id));
+  }
+
+  private getProcessStepsForMessages(messages: AgentMessageRecord[]): AgentProcessStepRecord[] {
+    return this.store.getProcessStepsByMessages(messages.map((message) => message.id));
   }
 
   private trimOldestOverflow(messages: AgentMessageRecord[], limit: number): AgentMessagePage {
@@ -1425,7 +2079,7 @@ export class AgentMessageCoordinator {
       messages: pageMessages,
       pageInfo: {
         hasMore,
-        oldestCursor: pageMessages[0]?.id,
+        ...(hasMore ? { nextCursor: pageMessages[0]?.id } : {}),
         limit
       }
     };
@@ -1437,6 +2091,196 @@ export class AgentMessageCoordinator {
     }
 
     return Math.min(MAX_SESSION_MESSAGE_LIMIT, Math.max(1, Math.floor(messageLimit)));
+  }
+
+  private normalizeSessionLimit(sessionLimit?: number): number {
+    if (sessionLimit === undefined || !Number.isFinite(sessionLimit)) {
+      return DEFAULT_SESSION_PAGE_LIMIT;
+    }
+
+    return Math.min(MAX_SESSION_PAGE_LIMIT, Math.max(1, Math.floor(sessionLimit)));
+  }
+
+  private createSessionPageInfo(
+    sessions: Array<{ id: string }>,
+    hasMore: boolean,
+    limit: number
+  ): AgentSessionPageInfo {
+    return {
+      hasMore,
+      ...(hasMore ? { nextCursor: sessions.at(-1)?.id } : {}),
+      limit
+    };
+  }
+
+  private async failInterruptedRun(run: AgentRunRecord, detail: AgentErrorDetail): Promise<StaleRunningCleanupResult> {
+    const result = this.createEmptyCleanupResult();
+    const messageIds = [run.systemMessageId, run.assistantMessageId].filter((messageId): messageId is string => Boolean(messageId));
+
+    for (const messageId of messageIds) {
+      const message = this.store.getMessage(messageId);
+
+      if (message?.status !== "running") {
+        continue;
+      }
+
+      const messageResult = await this.failInterruptedMessage(message, run.id, detail);
+      this.addCleanupResult(result, messageResult);
+    }
+
+    this.store.appendRunEvent(
+      run.id,
+      {
+        type: "error",
+        code: detail.code,
+        message: detail.message
+      },
+      run.assistantMessageId ?? run.systemMessageId
+    );
+    this.store.updateRun(run.id, {
+      status: "failed",
+      phase: "failed",
+      error: detail,
+      completedAt: now()
+    });
+    result.runs += 1;
+    return result;
+  }
+
+  private async failInterruptedMessage(
+    message: AgentMessageRecord,
+    runId: string | undefined,
+    detail: AgentErrorDetail
+  ): Promise<StaleRunningCleanupResult> {
+    const result = this.createEmptyCleanupResult();
+    const runningSteps = this.store
+      .getProcessStepsByMessages([message.id])
+      .filter((step) => step.status === "running" && (!runId || step.runId === runId));
+
+    this.completeRunningProcessSteps(message.id, runId, "failed");
+    result.processSteps += runningSteps.length;
+    result.toolCalls += this.failInterruptedToolCalls(message, runId, detail);
+    result.resources += this.failInterruptedResources(message, detail);
+
+    const failedMessage =
+      this.store.updateMessage(message.id, {
+        status: "failed",
+        parts: [createTextPart("本轮运行因服务重启中断，请重新生成。")],
+        error: detail,
+        completedAt: now()
+      }) ?? message;
+
+    if (runId) {
+      this.store.appendRunEvent(runId, { type: "session.message.updated", message: failedMessage }, message.id);
+    } else {
+      this.store.appendEvent(message.id, {
+        type: "error",
+        code: detail.code,
+        message: detail.message
+      });
+    }
+
+    await this.runningStateStore.remove(message.id);
+    result.messages += 1;
+    return result;
+  }
+
+  private failInterruptedToolCalls(message: AgentMessageRecord, runId: string | undefined, detail: AgentErrorDetail): number {
+    const toolCalls = this.store
+      .getToolCallsBySession(message.sessionId)
+      .filter(
+        (toolCall) =>
+          toolCall.messageId === message.id &&
+          (!runId || toolCall.runId === runId) &&
+          (toolCall.status === "pending" || toolCall.status === "running")
+      );
+
+    for (const toolCall of toolCalls) {
+      this.store.updateToolCall(toolCall.id, {
+        status: "failed",
+        error: detail,
+        completedAt: now()
+      });
+    }
+
+    return toolCalls.length;
+  }
+
+  private failInterruptedResources(message: AgentMessageRecord, detail: AgentErrorDetail): number {
+    const resources = this.store
+      .getResourcesByMessages([message.id])
+      .filter((resource) => resource.status === "pending");
+
+    for (const resource of resources) {
+      this.store.updateResource(resource.id, {
+        status: "failed",
+        metadata: compactJsonObject({
+          ...(resource.metadata ?? {}),
+          error: detail
+        })
+      });
+    }
+
+    return resources.length;
+  }
+
+  private getAllRunningRuns(): AgentRunRecord[] {
+    const runsById = new Map<string, AgentRunRecord>();
+
+    for (const session of this.store.listSessions()) {
+      for (const message of this.store.getMessagesBySession(session.id)) {
+        for (const run of this.store.getRunsByMessageId(message.id)) {
+          if (run.status === "running") {
+            runsById.set(run.id, run);
+          }
+        }
+      }
+    }
+
+    return [...runsById.values()];
+  }
+
+  private getAllRunningMessages(): AgentMessageRecord[] {
+    return this.store
+      .listSessions()
+      .flatMap((session) => this.store.getMessagesBySession(session.id))
+      .filter((message) => message.status === "running");
+  }
+
+  private hasRunningRunForMessage(messageId: string): boolean {
+    return this.store.getRunsByMessageId(messageId).some((run) => run.status === "running");
+  }
+
+  private createEmptyCleanupResult(): StaleRunningCleanupResult {
+    return {
+      runs: 0,
+      messages: 0,
+      toolCalls: 0,
+      resources: 0,
+      processSteps: 0
+    };
+  }
+
+  private addCleanupResult(target: StaleRunningCleanupResult, source: StaleRunningCleanupResult) {
+    target.runs += source.runs;
+    target.messages += source.messages;
+    target.toolCalls += source.toolCalls;
+    target.resources += source.resources;
+    target.processSteps += source.processSteps;
+  }
+
+  private getSessionRunningRuns(sessionId: string): AgentRunRecord[] {
+    const runsById = new Map<string, AgentRunRecord>();
+
+    for (const message of this.store.getMessagesBySession(sessionId)) {
+      for (const run of this.store.getRunsByMessageId(message.id)) {
+        if (run.status === "running") {
+          runsById.set(run.id, run);
+        }
+      }
+    }
+
+    return [...runsById.values()];
   }
 }
 
@@ -1460,16 +2304,107 @@ function compactJsonObject(value: Record<string, unknown>): JsonObject {
   return Object.fromEntries(Object.entries(value).filter(([, entryValue]) => entryValue !== undefined)) as JsonObject;
 }
 
+function getToolProcessLabels(toolName: string) {
+  switch (toolName) {
+    case "generate_image":
+      return {
+        running: "正在生成图片",
+        succeeded: "图片已生成",
+        failed: "图片生成失败"
+      };
+    case "edit_image":
+      return {
+        running: "正在编辑图片",
+        succeeded: "图片已编辑",
+        failed: "图片编辑失败"
+      };
+    case "generate_video":
+      return {
+        running: "正在生成视频",
+        succeeded: "视频已生成",
+        failed: "视频生成失败"
+      };
+    case "web_search":
+      return {
+        running: "正在查找资料",
+        succeeded: "资料已查找",
+        failed: "资料查找失败"
+      };
+    case "current_time":
+      return {
+        running: "正在查询时间",
+        succeeded: "时间已查询",
+        failed: "时间查询失败"
+      };
+    case "calculator":
+      return {
+        running: "正在计算",
+        succeeded: "计算完成",
+        failed: "计算失败"
+      };
+    default:
+      return {
+        running: "正在执行任务",
+        succeeded: "任务已完成",
+        failed: "任务失败"
+      };
+  }
+}
+
+function getProcessStepCompletionPatch(
+  step: AgentProcessStepRecord,
+  status: AgentProcessStepRecord["status"]
+): Pick<Parameters<AgentStore["updateProcessStep"]>[1], "title" | "summary"> {
+  if (step.metadata?.phase === "answering") {
+    if (status === "succeeded") {
+      return { title: "已整理回答", summary: "回答已生成" };
+    }
+
+    if (status === "failed") {
+      return { title: "整理回答失败" };
+    }
+
+    if (status === "cancelled") {
+      return { title: "已中断整理回答" };
+    }
+  }
+
+  return {};
+}
+
+function getPrimaryToolArgumentSummary(argumentsValue: JsonObject = {}): string | undefined {
+  const candidates = ["query", "prompt", "expression", "url"];
+
+  for (const key of candidates) {
+    const value = argumentsValue[key];
+
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  return undefined;
+}
+
+function formatDuration(durationMs: number) {
+  if (durationMs >= 1000) {
+    return `${(durationMs / 1000).toFixed(1)}s`;
+  }
+
+  return `${durationMs}ms`;
+}
+
 function summarizeToolResult(result: unknown): JsonObject {
   if (!isRecord(result)) {
     return { type: typeof result };
   }
 
   const imageUrls = toStringArray(result.imageUrls);
+  const videoUrls = toStringArray(result.videoUrls);
   const items = Array.isArray(result.items) ? result.items : undefined;
 
   return compactJsonObject({
-    outputCount: imageUrls.length || items?.length,
+    outputCount: imageUrls.length || videoUrls.length || items?.length,
     provider: result.provider,
     resultType: result.type
   });
@@ -1479,10 +2414,20 @@ function isImageOutputToolName(toolName: string): boolean {
   return IMAGE_OUTPUT_TOOL_NAMES.has(toolName);
 }
 
+function isVideoOutputToolName(toolName: string): boolean {
+  return VIDEO_OUTPUT_TOOL_NAMES.has(toolName);
+}
+
 function isImageToolResultWithId(
   event: AgentStreamEvent
 ): event is Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: string; toolCallId: string } {
   return event.type === "tool_result" && isImageOutputToolName(event.toolName) && typeof event.toolCallId === "string";
+}
+
+function isVideoToolResultWithId(
+  event: AgentStreamEvent
+): event is Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: string; toolCallId: string } {
+  return event.type === "tool_result" && isVideoOutputToolName(event.toolName) && typeof event.toolCallId === "string";
 }
 
 function ensureTextPart(parts: MessagePart[]): { parts: MessagePart[]; partIndex: number } {
@@ -1505,6 +2450,10 @@ function sortStoredEvents(events: StoredAgentEvent[]): StoredAgentEvent[] {
 
     return leftEvent.seq - rightEvent.seq;
   });
+}
+
+function uniqueStoredEvents(events: StoredAgentEvent[]): StoredAgentEvent[] {
+  return sortStoredEvents([...new Map(events.map((event) => [event.id, event])).values()]);
 }
 
 function extractImageRequestSlots(argumentsJson: JsonObject): ImageRequestSlot[] {
@@ -1533,6 +2482,15 @@ function extractImageRequestSlots(argumentsJson: JsonObject): ImageRequestSlot[]
   ];
 }
 
+function extractVideoRequestSlot(argumentsJson: JsonObject): VideoRequestSlot {
+  return {
+    outputIndex: 0,
+    prompt: toOptionalString(argumentsJson.prompt),
+    frames: toOptionalNumber(argumentsJson.frames),
+    aspectRatio: toOptionalString(argumentsJson.aspectRatio)
+  };
+}
+
 function buildImageMetadata(input: {
   prompt?: string;
   width?: number;
@@ -1550,6 +2508,24 @@ function buildImageMetadata(input: {
     sourceImageUrl: input.sourceImageUrl,
     outputIndex: input.includeOutputIndex ? input.outputIndex : undefined,
     provider: input.provider,
+    error: input.error
+  });
+}
+
+function buildVideoMetadata(input: {
+  prompt?: string;
+  frames?: number;
+  aspectRatio?: string;
+  provider?: unknown;
+  taskId?: unknown;
+  error?: unknown;
+}): JsonObject {
+  return compactJsonObject({
+    prompt: input.prompt,
+    frames: input.frames,
+    aspectRatio: input.aspectRatio,
+    provider: input.provider,
+    taskId: input.taskId,
     error: input.error
   });
 }
@@ -1659,6 +2635,32 @@ function extractImageAssets(result: unknown, startIndex: number): ExtractedImage
         sourceImageUrl: resultSourceImageUrl,
         size: result.size,
         revisedPrompts: result.revisedPrompts
+      })
+    };
+  });
+}
+
+function extractVideoAssets(result: unknown, startIndex: number): ExtractedVideoResult[] {
+  if (!isRecord(result)) {
+    return [];
+  }
+
+  let nextIndex = startIndex;
+
+  return toStringArray(result.videoUrls).map((url) => {
+    const index = nextIndex;
+    nextIndex += 1;
+
+    return {
+      url,
+      prompt: toOptionalString(result.prompt),
+      index,
+      metadata: compactJsonObject({
+        provider: result.provider,
+        frames: result.frames,
+        aspectRatio: result.aspectRatio,
+        seed: result.seed,
+        taskId: result.taskId
       })
     };
   });

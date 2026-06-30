@@ -48,6 +48,12 @@ export interface ToolImageActionPayload {
   url: string;
   index: number;
   prompt: string;
+  mime?: string;
+  width?: number;
+  height?: number;
+  resourceId?: string;
+  toolCallRowId?: string;
+  outputIndex?: number;
   trace: ToolTrace;
 }
 
@@ -249,8 +255,6 @@ export function ImagePreview({
   };
 
   const quoteImage = (url: string, index: number, itemPrompt?: string) => {
-    copyText(`![${itemPrompt || `生成图片 ${index + 1}`}](${url})`);
-    setCopiedUrl(url);
     setActionMenu(null);
     emitImageAction("quote", url, index, itemPrompt);
   };

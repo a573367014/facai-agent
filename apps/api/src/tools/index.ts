@@ -6,6 +6,7 @@ import {
   type JimengImageEditToolOptions,
   type JimengImageToolOptions
 } from "./jimeng-image.js";
+import { createJimengVideoTool, type JimengVideoToolOptions } from "./jimeng-video.js";
 import { ToolRegistry } from "./registry.js";
 import { createTavilySearchTool } from "./web-search.js";
 
@@ -14,6 +15,7 @@ export interface DefaultToolRegistryOptions {
   searchMaxResults?: number;
   jimengImage?: JimengImageToolOptions;
   jimengImageEdit?: JimengImageEditToolOptions;
+  jimengVideo?: JimengVideoToolOptions;
 }
 
 export function createDefaultToolRegistry(options: DefaultToolRegistryOptions = {}): ToolRegistry {
@@ -38,6 +40,10 @@ export function createDefaultToolRegistry(options: DefaultToolRegistryOptions = 
 
   if (options.jimengImageEdit?.accessKeyId?.trim() && options.jimengImageEdit.secretAccessKey?.trim()) {
     registry.register(createJimengImageEditTool(options.jimengImageEdit));
+  }
+
+  if (options.jimengVideo?.accessKeyId?.trim() && options.jimengVideo.secretAccessKey?.trim()) {
+    registry.register(createJimengVideoTool(options.jimengVideo));
   }
 
   return registry;

@@ -3,6 +3,7 @@ dist/
 coverage/
 .env
 .DS_Store
+.superpowers/
 *.tsbuildinfo
 data/
 *.sqlite

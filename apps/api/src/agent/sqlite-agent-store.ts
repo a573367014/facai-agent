@@ -16,15 +16,19 @@ import type {
   AgentSessionSummaryRecord,
   AgentStore,
   AgentToolCallRecord,
+  CreateAgentProcessStepInput,
   CreateAgentMessageInput,
   CreateAgentResourceInput,
   CreateAgentToolCallInput,
   CreateAgentRunInput,
+  AgentProcessStepRecord,
   AgentResourceRecord,
+  ListAgentSessionsOptions,
   PruneExpiredAgentEventsInput,
   PruneAgentEventsResult,
   StoredAgentEvent,
   UpdateAgentMessageInput,
+  UpdateAgentProcessStepInput,
   UpdateAgentResourceInput,
   UpdateAgentRunInput,
   UpdateAgentToolCallInput,
@@ -54,6 +58,11 @@ interface MessageCursor {
   rowid: number;
 }
 
+interface SessionCursor {
+  updatedAt: string;
+  rowid: number;
+}
+
 function createId(prefix: string) {
   return `${prefix}_${randomUUID()}`;
 }
@@ -80,6 +89,10 @@ const contextMessageFilter = "(role = 'user' OR (role = 'assistant' AND status I
 
 function isTerminalToolCallStatus(status: AgentToolCallRecord["status"]) {
   return status === "succeeded" || status === "failed";
+}
+
+function isTerminalProcessStepStatus(status: AgentProcessStepRecord["status"]) {
+  return status === "succeeded" || status === "failed" || status === "cancelled";
 }
 
 function requiredString(value: SqlValue | undefined, field: string): string {
@@ -162,12 +175,81 @@ export class SqliteAgentStore implements AgentStore {
     return row ? this.toSessionRecord(row) : undefined;
   }
 
-  listSessions(): AgentSessionRecord[] {
+  listSessions(options: ListAgentSessionsOptions = {}): AgentSessionRecord[] {
+    const cursor = options.after ? this.getSessionCursor(options.after) : undefined;
+    const normalizedLimit = options.limit === undefined ? undefined : normalizeLimit(options.limit);
+    const params: SqlValue[] = [];
+
+    if (options.after && !cursor) {
+      return [];
+    }
+
+    if (cursor) {
+      params.push(cursor.updatedAt, cursor.updatedAt, cursor.rowid);
+    }
+
+    if (normalizedLimit !== undefined) {
+      if (normalizedLimit === 0) {
+        return [];
+      }
+
+      params.push(normalizedLimit);
+    }
+
     return this.queryMany(
       `SELECT id, title, created_at, updated_at
        FROM agent_sessions
-       ORDER BY updated_at DESC`
+       ${cursor ? "WHERE updated_at < ? OR (updated_at = ? AND rowid < ?)" : ""}
+       ORDER BY updated_at DESC, rowid DESC
+       ${normalizedLimit !== undefined ? "LIMIT ?" : ""}`,
+      params
     ).map((row) => this.toSessionRecord(row));
+  }
+
+  deleteSession(sessionId: string): boolean {
+    const session = this.getSession(sessionId);
+
+    if (!session) {
+      return false;
+    }
+
+    const messageIds = this.queryMany(`SELECT id FROM agent_messages WHERE session_id = ?`, [sessionId]).map((row) =>
+      requiredString(row.id, "id")
+    );
+    const runIds = this.queryMany(`SELECT id FROM agent_runs WHERE session_id = ?`, [sessionId]).map((row) =>
+      requiredString(row.id, "id")
+    );
+
+    this.database.run("BEGIN TRANSACTION");
+    try {
+      this.database.run(
+        `DELETE FROM agent_events
+         WHERE run_id IN (SELECT id FROM agent_runs WHERE session_id = ?)
+            OR message_id IN (SELECT id FROM agent_messages WHERE session_id = ?)`,
+        [sessionId, sessionId]
+      );
+      this.database.run(`DELETE FROM agent_resources WHERE session_id = ?`, [sessionId]);
+      this.database.run(`DELETE FROM agent_tool_calls WHERE session_id = ?`, [sessionId]);
+      this.database.run(`DELETE FROM agent_session_summaries WHERE session_id = ?`, [sessionId]);
+      this.database.run(`DELETE FROM agent_runs WHERE session_id = ?`, [sessionId]);
+      this.database.run(`DELETE FROM agent_messages WHERE session_id = ?`, [sessionId]);
+      this.database.run(`DELETE FROM agent_sessions WHERE id = ?`, [sessionId]);
+      this.database.run("COMMIT");
+    } catch (error) {
+      this.database.run("ROLLBACK");
+      throw error;
+    }
+
+    for (const messageId of messageIds) {
+      this.subscribers.delete(messageId);
+    }
+
+    for (const runId of runIds) {
+      this.runSubscribers.delete(runId);
+    }
+
+    this.persist();
+    return true;
   }
 
   getSessionSummary(sessionId: string): AgentSessionSummaryRecord | undefined {
@@ -989,10 +1071,11 @@ export class SqliteAgentStore implements AgentStore {
     let batches = 0;
 
     while (batches < maxBatches) {
-      const deletedMessageEvents = this.deleteExpiredEventBatch("agent_events", input.nowIso, batchSize);
-      const deletedRunEvents = this.deleteExpiredEventBatch("agent_run_events", input.nowIso, batchSize);
+      const deletedEvents = this.deleteExpiredEventBatch(input.nowIso, batchSize);
+      const deletedMessageEvents = deletedEvents.messageEvents;
+      const deletedRunEvents = deletedEvents.runEvents;
 
-      if (deletedMessageEvents === 0 && deletedRunEvents === 0) {
+      if (deletedEvents.total === 0) {
         break;
       }
 
@@ -1000,7 +1083,7 @@ export class SqliteAgentStore implements AgentStore {
       runEvents += deletedRunEvents;
       batches += 1;
 
-      if (deletedMessageEvents < batchSize && deletedRunEvents < batchSize) {
+      if (deletedEvents.total < batchSize) {
         break;
       }
     }
@@ -1290,8 +1373,140 @@ export class SqliteAgentStore implements AgentStore {
     ).map((row) => this.toResourceRecord(row));
   }
 
+  createProcessStep(input: CreateAgentProcessStepInput): AgentProcessStepRecord {
+    const timestamp = now();
+    const processStep: AgentProcessStepRecord = {
+      id: createId("step"),
+      sessionId: input.sessionId,
+      runId: input.runId,
+      messageId: input.messageId,
+      toolCallRowId: input.toolCallRowId,
+      toolCallId: input.toolCallId,
+      kind: input.kind,
+      title: input.title,
+      summary: input.summary,
+      status: input.status ?? "running",
+      orderIndex: input.orderIndex,
+      metadata: input.metadata,
+      startedAt: timestamp,
+      updatedAt: timestamp,
+      completedAt: input.status && isTerminalProcessStepStatus(input.status) ? timestamp : undefined
+    };
+
+    this.database.run(
+      `INSERT INTO agent_process_steps (
+         id,
+         session_id,
+         run_id,
+         message_id,
+         tool_call_row_id,
+         tool_call_id,
+         kind,
+         title,
+         summary,
+         status,
+         order_index,
+         metadata_json,
+         started_at,
+         updated_at,
+         completed_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        processStep.id,
+        processStep.sessionId,
+        processStep.runId ?? null,
+        processStep.messageId,
+        processStep.toolCallRowId ?? null,
+        processStep.toolCallId ?? null,
+        processStep.kind,
+        processStep.title,
+        processStep.summary ?? null,
+        processStep.status,
+        processStep.orderIndex,
+        processStep.metadata ? JSON.stringify(processStep.metadata) : null,
+        processStep.startedAt,
+        processStep.updatedAt,
+        processStep.completedAt ?? null
+      ]
+    );
+    this.touchSession(processStep.sessionId, timestamp);
+    this.persist();
+    return processStep;
+  }
+
+  updateProcessStep(stepId: string, input: UpdateAgentProcessStepInput): AgentProcessStepRecord | undefined {
+    const existingStep = this.getProcessStep(stepId);
+
+    if (!existingStep) {
+      return undefined;
+    }
+
+    const timestamp = now();
+    const status = input.status ?? existingStep.status;
+    const completedAt = input.completedAt ?? (isTerminalProcessStepStatus(status) ? existingStep.completedAt ?? timestamp : existingStep.completedAt);
+
+    this.database.run(
+      `UPDATE agent_process_steps
+       SET tool_call_row_id = ?,
+           tool_call_id = ?,
+           title = ?,
+           summary = ?,
+           status = ?,
+           metadata_json = ?,
+           updated_at = ?,
+           completed_at = ?
+       WHERE id = ?`,
+      [
+        input.toolCallRowId ?? existingStep.toolCallRowId ?? null,
+        input.toolCallId ?? existingStep.toolCallId ?? null,
+        input.title ?? existingStep.title,
+        input.summary !== undefined ? input.summary : existingStep.summary ?? null,
+        status,
+        input.metadata !== undefined ? JSON.stringify(input.metadata) : existingStep.metadata ? JSON.stringify(existingStep.metadata) : null,
+        timestamp,
+        completedAt ?? null,
+        stepId
+      ]
+    );
+    this.touchSession(existingStep.sessionId, timestamp);
+    this.persist();
+    return this.getProcessStep(stepId);
+  }
+
+  getProcessStepsByMessages(messageIds: string[]): AgentProcessStepRecord[] {
+    if (messageIds.length === 0) {
+      return [];
+    }
+
+    const placeholders = messageIds.map(() => "?").join(", ");
+
+    return this.queryMany(
+      `SELECT
+         id,
+         session_id,
+         run_id,
+         message_id,
+         tool_call_row_id,
+         tool_call_id,
+         kind,
+         title,
+         summary,
+         status,
+         order_index,
+         metadata_json,
+         started_at,
+         updated_at,
+         completed_at
+       FROM agent_process_steps
+       WHERE message_id IN (${placeholders})
+       ORDER BY message_id ASC, order_index ASC, started_at ASC, rowid ASC`,
+      messageIds
+    ).map((row) => this.toProcessStepRecord(row));
+  }
+
   appendEvent(messageId: string, event: AgentStreamEvent): StoredAgentEvent | undefined {
-    return this.appendStoredEvent(messageId, event);
+    return this.appendStoredEvent({ messageId, event });
   }
 
   publishTransientEvent(messageId: string, event: AgentStreamEvent): StoredAgentEvent | undefined {
@@ -1302,7 +1517,7 @@ export class SqliteAgentStore implements AgentStore {
 
   getEvents(messageId: string, after = 0): StoredAgentEvent[] {
     return this.queryMany(
-      `SELECT id, seq, message_id, payload_json, created_at
+      `SELECT id, seq, run_id, message_id, payload_json, created_at
        FROM agent_events
        WHERE message_id = ? AND seq > ?
        ORDER BY seq ASC`,
@@ -1324,7 +1539,7 @@ export class SqliteAgentStore implements AgentStore {
   }
 
   appendRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): StoredAgentEvent | undefined {
-    return this.appendStoredRunEvent(runId, event, messageId);
+    return this.appendStoredEvent({ runId, messageId, event });
   }
 
   publishTransientRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): StoredAgentEvent | undefined {
@@ -1336,7 +1551,7 @@ export class SqliteAgentStore implements AgentStore {
   getRunEvents(runId: string, after = 0): StoredAgentEvent[] {
     return this.queryMany(
       `SELECT id, seq, run_id, message_id, payload_json, created_at
-       FROM agent_run_events
+       FROM agent_events
        WHERE run_id = ? AND seq > ?
        ORDER BY seq ASC`,
       [runId, after]
@@ -1362,7 +1577,6 @@ export class SqliteAgentStore implements AgentStore {
   }
 
   private initializeSchema() {
-    this.resetLegacySchemaIfNeeded();
     this.database.run(`
       CREATE TABLE IF NOT EXISTS agent_sessions (
         id TEXT PRIMARY KEY,
@@ -1386,13 +1600,14 @@ export class SqliteAgentStore implements AgentStore {
 
       CREATE TABLE IF NOT EXISTS agent_events (
         id TEXT PRIMARY KEY,
-        message_id TEXT NOT NULL,
+        run_id TEXT,
+        message_id TEXT,
         seq INTEGER NOT NULL,
         type TEXT NOT NULL,
         payload_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         expires_at TEXT NOT NULL,
-        UNIQUE (message_id, seq)
+        CHECK (run_id IS NOT NULL OR message_id IS NOT NULL)
       );
 
       CREATE TABLE IF NOT EXISTS agent_runs (
@@ -1407,18 +1622,6 @@ export class SqliteAgentStore implements AgentStore {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         completed_at TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS agent_run_events (
-        id TEXT PRIMARY KEY,
-        run_id TEXT NOT NULL,
-        message_id TEXT,
-        seq INTEGER NOT NULL,
-        type TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        expires_at TEXT NOT NULL,
-        UNIQUE (run_id, seq)
       );
 
       CREATE TABLE IF NOT EXISTS agent_session_summaries (
@@ -1469,6 +1672,24 @@ export class SqliteAgentStore implements AgentStore {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS agent_process_steps (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        run_id TEXT,
+        message_id TEXT NOT NULL,
+        tool_call_row_id TEXT,
+        tool_call_id TEXT,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        summary TEXT,
+        status TEXT NOT NULL,
+        order_index INTEGER NOT NULL,
+        metadata_json TEXT,
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+
       CREATE INDEX IF NOT EXISTS idx_agent_messages_session_id_created_at
         ON agent_messages (session_id, created_at);
 
@@ -1477,9 +1698,6 @@ export class SqliteAgentStore implements AgentStore {
 
       CREATE INDEX IF NOT EXISTS idx_agent_runs_session_id_created_at
         ON agent_runs (session_id, created_at);
-
-      CREATE INDEX IF NOT EXISTS idx_agent_run_events_run_id_seq
-        ON agent_run_events (run_id, seq);
 
       CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_session_id_started_at
         ON agent_tool_calls (session_id, started_at);
@@ -1492,147 +1710,60 @@ export class SqliteAgentStore implements AgentStore {
 
       CREATE INDEX IF NOT EXISTS idx_agent_resources_session_id_created_at
         ON agent_resources (session_id, created_at);
+
+      CREATE INDEX IF NOT EXISTS idx_agent_process_steps_message_order
+        ON agent_process_steps (message_id, order_index);
     `);
-    this.ensureSessionSummaryVersionSchema();
-    this.ensureEventExpirationColumns();
+    this.ensureUnifiedEventSchema();
+    this.ensureCurrentSchemaIndexes();
   }
 
-  private ensureSessionSummaryVersionSchema() {
-    const columns = this.database.exec("PRAGMA table_info(agent_session_summaries)")[0]?.values ?? [];
-    const hasVersionSchema = columns.some((row) => row[1] === "id") && columns.some((row) => row[1] === "version");
-
-    if (hasVersionSchema) {
-      this.database.run(`
-        CREATE INDEX IF NOT EXISTS idx_agent_session_summaries_session_version
-          ON agent_session_summaries (session_id, version);
-      `);
-      return;
-    }
-
-    const legacyRows = this.queryMany(
-      `SELECT
-         session_id,
-         summary_json,
-         covered_message_id,
-         schema_version,
-         created_at,
-         updated_at
-       FROM agent_session_summaries`
-    );
-
+  private ensureCurrentSchemaIndexes() {
     this.database.run(`
-      ALTER TABLE agent_session_summaries RENAME TO agent_session_summaries_legacy;
-
-      CREATE TABLE agent_session_summaries (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        version INTEGER NOT NULL,
-        summary_json TEXT NOT NULL,
-        covered_message_id TEXT NOT NULL,
-        covered_message_created_at TEXT NOT NULL,
-        source_summary_id TEXT,
-        schema_version INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-    `);
-
-    for (const row of legacyRows) {
-      const sessionId = requiredString(row.session_id, "session_id");
-      const coveredMessageId = requiredString(row.covered_message_id, "covered_message_id");
-      const coveredMessage = this.getMessage(coveredMessageId);
-      const createdAt = requiredString(row.created_at, "created_at");
-
-      this.database.run(
-        `INSERT INTO agent_session_summaries (
-           id,
-           session_id,
-           version,
-           summary_json,
-           covered_message_id,
-           covered_message_created_at,
-           source_summary_id,
-           schema_version,
-           created_at,
-           updated_at
-         )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          `summary_${randomUUID()}`,
-          sessionId,
-          1,
-          requiredString(row.summary_json, "summary_json"),
-          coveredMessageId,
-          coveredMessage?.createdAt ?? createdAt,
-          null,
-          optionalNumber(row.schema_version) ?? 1,
-          createdAt,
-          requiredString(row.updated_at, "updated_at")
-        ]
-      );
-    }
-
-    this.database.run(`
-      DROP TABLE agent_session_summaries_legacy;
+      DROP INDEX IF EXISTS idx_agent_run_events_run_id_seq;
+      DROP INDEX IF EXISTS idx_agent_run_events_expires_at;
 
       CREATE INDEX IF NOT EXISTS idx_agent_session_summaries_session_version
         ON agent_session_summaries (session_id, version);
-    `);
-  }
 
-  private ensureEventExpirationColumns() {
-    this.ensureColumn("agent_events", "expires_at", "TEXT");
-    this.ensureColumn("agent_run_events", "expires_at", "TEXT");
-    this.backfillEventExpiration("agent_events");
-    this.backfillEventExpiration("agent_run_events");
-    this.database.run(`
+      CREATE INDEX IF NOT EXISTS idx_agent_events_run_id_seq
+        ON agent_events (run_id, seq);
+
+      CREATE INDEX IF NOT EXISTS idx_agent_events_message_id_seq
+        ON agent_events (message_id, seq);
+
       CREATE INDEX IF NOT EXISTS idx_agent_events_expires_at
         ON agent_events (expires_at);
-
-      CREATE INDEX IF NOT EXISTS idx_agent_run_events_expires_at
-        ON agent_run_events (expires_at);
     `);
   }
 
-  private ensureColumn(tableName: "agent_events" | "agent_run_events", columnName: string, definition: string) {
-    const columns = this.database.exec(`PRAGMA table_info(${tableName})`)[0]?.values ?? [];
-    const hasColumn = columns.some((row) => row[1] === columnName);
+  private ensureUnifiedEventSchema() {
+    const eventColumns = this.getTableColumns("agent_events");
+    const isLegacyMessageEventTable = eventColumns.length > 0 && !eventColumns.includes("run_id");
 
-    if (!hasColumn) {
-      this.database.run(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+    if (isLegacyMessageEventTable) {
+      this.database.run(`DROP TABLE IF EXISTS agent_events`);
     }
+
+    this.database.run(`
+      DROP TABLE IF EXISTS agent_run_events;
+
+      CREATE TABLE IF NOT EXISTS agent_events (
+        id TEXT PRIMARY KEY,
+        run_id TEXT,
+        message_id TEXT,
+        seq INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        CHECK (run_id IS NOT NULL OR message_id IS NOT NULL)
+      );
+    `);
   }
 
-  private backfillEventExpiration(tableName: "agent_events" | "agent_run_events") {
-    this.database.run(
-      `UPDATE ${tableName}
-       SET expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', created_at, ?)
-       WHERE expires_at IS NULL OR expires_at = ''`,
-      [`+${this.eventRetentionDays} days`]
-    );
-  }
-
-  private resetLegacySchemaIfNeeded() {
-    const columns = this.database.exec(`PRAGMA table_info(agent_messages)`)[0]?.values ?? [];
-    const hasLegacyMessageColumns = columns.some((row) => row[1] === "content" || row[1] === "steps_json");
-    const hasLegacyAssetsTable = this.queryMany(
-      `SELECT name
-       FROM sqlite_master
-       WHERE type = 'table' AND name = 'agent_assets'`
-    ).length > 0;
-
-    if (hasLegacyMessageColumns || hasLegacyAssetsTable) {
-      this.database.run(`
-        DROP TABLE IF EXISTS agent_resources;
-        DROP TABLE IF EXISTS agent_tool_calls;
-        DROP TABLE IF EXISTS agent_run_events;
-        DROP TABLE IF EXISTS agent_runs;
-        DROP TABLE IF EXISTS agent_events;
-        DROP TABLE IF EXISTS agent_messages;
-        DROP TABLE IF EXISTS agent_assets;
-        DROP TABLE IF EXISTS agent_sessions;
-      `);
-    }
+  private getTableColumns(tableName: string): string[] {
+    return this.queryMany(`PRAGMA table_info(${tableName})`).map((row) => requiredString(row.name, "name"));
   }
 
   private getToolCall(toolCallRowId: string): AgentToolCallRecord | undefined {
@@ -1686,26 +1817,67 @@ export class SqliteAgentStore implements AgentStore {
     return row ? this.toResourceRecord(row) : undefined;
   }
 
-  private appendStoredEvent(messageId: string, event: AgentStreamEvent): StoredAgentEvent {
+  private getProcessStep(stepId: string): AgentProcessStepRecord | undefined {
+    const row = this.queryOne(
+      `SELECT
+         id,
+         session_id,
+         run_id,
+         message_id,
+         tool_call_row_id,
+         tool_call_id,
+         kind,
+         title,
+         summary,
+         status,
+         order_index,
+         metadata_json,
+         started_at,
+         updated_at,
+         completed_at
+       FROM agent_process_steps
+       WHERE id = ?`,
+      [stepId]
+    );
+
+    return row ? this.toProcessStepRecord(row) : undefined;
+  }
+
+  private appendStoredEvent(input: { event: AgentStreamEvent; messageId?: string; runId?: string }): StoredAgentEvent {
+    if (!input.messageId && !input.runId) {
+      throw new Error("SQLite 事件缺少 messageId 或 runId");
+    }
+
     const eventId = createId("event");
-    const eventSeq = this.nextEventSeq(messageId);
+    const eventSeq = input.runId ? this.nextRunEventSeq(input.runId) : this.nextMessageEventSeq(input.messageId!);
     const timestamp = now();
     const expiresAt = addDaysIso(timestamp, this.eventRetentionDays);
     const storedEvent: StoredAgentEvent = {
       id: eventId,
       seq: eventSeq,
-      messageId,
-      event,
+      messageId: input.messageId,
+      runId: input.runId,
+      event: input.event,
       createdAt: timestamp
     };
 
     this.database.run(
-      `INSERT INTO agent_events (id, message_id, seq, type, payload_json, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [eventId, messageId, eventSeq, event.type, JSON.stringify(event), timestamp, expiresAt]
+      `INSERT INTO agent_events (id, run_id, message_id, seq, type, payload_json, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        eventId,
+        input.runId ?? null,
+        input.messageId ?? null,
+        eventSeq,
+        input.event.type,
+        JSON.stringify(input.event),
+        timestamp,
+        expiresAt
+      ]
     );
     this.persist();
     this.publish(storedEvent);
+    this.publishRun(storedEvent);
     return storedEvent;
   }
 
@@ -1724,35 +1896,11 @@ export class SqliteAgentStore implements AgentStore {
     };
   }
 
-  private appendStoredRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): StoredAgentEvent {
-    const eventId = createId("event");
-    const eventSeq = this.nextRunEventSeq(runId);
-    const timestamp = now();
-    const expiresAt = addDaysIso(timestamp, this.eventRetentionDays);
-    const storedEvent: StoredAgentEvent = {
-      id: eventId,
-      seq: eventSeq,
-      runId,
-      messageId,
-      event,
-      createdAt: timestamp
-    };
-
-    this.database.run(
-      `INSERT INTO agent_run_events (id, run_id, message_id, seq, type, payload_json, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [eventId, runId, messageId ?? null, eventSeq, event.type, JSON.stringify(event), timestamp, expiresAt]
-    );
-    this.persist();
-    this.publishRun(storedEvent);
-    return storedEvent;
-  }
-
-  private nextEventSeq(messageId: string): number {
+  private nextMessageEventSeq(messageId: string): number {
     const row = this.queryOne(
       `SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
        FROM agent_events
-       WHERE message_id = ?`,
+       WHERE message_id = ? AND run_id IS NULL`,
       [messageId]
     );
 
@@ -1762,7 +1910,7 @@ export class SqliteAgentStore implements AgentStore {
   private nextRunEventSeq(runId: string): number {
     const row = this.queryOne(
       `SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
-       FROM agent_run_events
+       FROM agent_events
        WHERE run_id = ?`,
       [runId]
     );
@@ -1785,6 +1933,24 @@ export class SqliteAgentStore implements AgentStore {
     return {
       sessionId: requiredString(row.session_id, "session_id"),
       createdAt: requiredString(row.created_at, "created_at"),
+      rowid: optionalNumber(row.rowid) ?? 0
+    };
+  }
+
+  private getSessionCursor(sessionId: string): SessionCursor | undefined {
+    const row = this.queryOne(
+      `SELECT rowid, updated_at
+       FROM agent_sessions
+       WHERE id = ?`,
+      [sessionId]
+    );
+
+    if (!row) {
+      return undefined;
+    }
+
+    return {
+      updatedAt: requiredString(row.updated_at, "updated_at"),
       rowid: optionalNumber(row.rowid) ?? 0
     };
   }
@@ -1850,52 +2016,53 @@ export class SqliteAgentStore implements AgentStore {
     );
   }
 
-  private deleteExpiredEventBatch(tableName: "agent_events" | "agent_run_events", nowIso: string, limit: number): number {
-    const row = this.queryOne(
-      `SELECT COUNT(*) AS row_count
-       FROM (
-         SELECT id
-         FROM ${tableName}
-         WHERE expires_at <= ?
-         ORDER BY expires_at ASC, created_at ASC, seq ASC, id ASC
-         LIMIT ?
-       ) expired_events`,
+  private deleteExpiredEventBatch(nowIso: string, limit: number): { messageEvents: number; runEvents: number; total: number } {
+    const expiredMessageEvents = this.queryMany(
+      `SELECT id, run_id
+       FROM agent_events
+       WHERE expires_at <= ?
+         AND run_id IS NULL
+       ORDER BY expires_at ASC, created_at ASC, seq ASC, id ASC
+       LIMIT ?`,
       [nowIso, limit]
     );
-    const rowCount = optionalNumber(row?.row_count) ?? 0;
+    const expiredRunEvents = this.queryMany(
+      `SELECT id, run_id
+       FROM agent_events
+       WHERE expires_at <= ?
+         AND run_id IS NOT NULL
+       ORDER BY expires_at ASC, created_at ASC, seq ASC, id ASC
+       LIMIT ?`,
+      [nowIso, limit]
+    );
+    const expiredEvents = [...expiredMessageEvents, ...expiredRunEvents];
 
-    if (rowCount === 0) {
-      return 0;
+    if (expiredEvents.length === 0) {
+      return { messageEvents: 0, runEvents: 0, total: 0 };
     }
 
+    const ids = expiredEvents.map((row) => requiredString(row.id, "id"));
+    const placeholders = ids.map(() => "?").join(", ");
+
     this.database.run(
-      `DELETE FROM ${tableName}
-       WHERE id IN (
-         SELECT id
-         FROM (
-           SELECT id
-           FROM ${tableName}
-           WHERE expires_at <= ?
-           ORDER BY expires_at ASC, created_at ASC, seq ASC, id ASC
-           LIMIT ?
-         ) expired_events
-       )`,
-      [nowIso, limit]
+      `DELETE FROM agent_events
+       WHERE id IN (${placeholders})`,
+      ids
     );
-    return rowCount;
+
+    const runEvents = expiredEvents.filter((row) => optionalString(row.run_id)).length;
+
+    return {
+      messageEvents: expiredMessageEvents.length,
+      runEvents,
+      total: expiredEvents.length
+    };
   }
 
   private hasExpiredEvents(nowIso: string): boolean {
-    return (
-      this.hasExpiredEventsInTable("agent_events", nowIso) ||
-      this.hasExpiredEventsInTable("agent_run_events", nowIso)
-    );
-  }
-
-  private hasExpiredEventsInTable(tableName: "agent_events" | "agent_run_events", nowIso: string): boolean {
     const row = this.queryOne(
       `SELECT id
-       FROM ${tableName}
+       FROM agent_events
        WHERE expires_at <= ?
        LIMIT 1`,
       [nowIso]
@@ -2001,6 +2168,26 @@ export class SqliteAgentStore implements AgentStore {
       metadata: parseJson<AgentResourceRecord["metadata"]>(row.metadata_json),
       createdAt: requiredString(row.created_at, "created_at"),
       updatedAt: requiredString(row.updated_at, "updated_at")
+    };
+  }
+
+  private toProcessStepRecord(row: SqlRow): AgentProcessStepRecord {
+    return {
+      id: requiredString(row.id, "id"),
+      sessionId: requiredString(row.session_id, "session_id"),
+      runId: optionalString(row.run_id),
+      messageId: requiredString(row.message_id, "message_id"),
+      toolCallRowId: optionalString(row.tool_call_row_id),
+      toolCallId: optionalString(row.tool_call_id),
+      kind: requiredString(row.kind, "kind") as AgentProcessStepRecord["kind"],
+      title: requiredString(row.title, "title"),
+      summary: optionalString(row.summary),
+      status: requiredString(row.status, "status") as AgentProcessStepRecord["status"],
+      orderIndex: optionalNumber(row.order_index) ?? 0,
+      metadata: parseJson<AgentProcessStepRecord["metadata"]>(row.metadata_json),
+      startedAt: requiredString(row.started_at, "started_at"),
+      updatedAt: requiredString(row.updated_at, "updated_at"),
+      completedAt: optionalString(row.completed_at)
     };
   }
 

@@ -1,11 +1,13 @@
+import { fireEvent } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { AllSelection, EditorState, NodeSelection, TextSelection, type Transaction } from "prosemirror-state";
-import type { DecorationSet } from "prosemirror-view";
-import type { EditorView } from "prosemirror-view";
+import { EditorView, type DecorationSet } from "prosemirror-view";
 import { partSchema } from "../part-schema";
 import { docToParts, partsToDoc, type RuntimePart } from "../part-serialization";
+import { AGENT_MESSAGE_PARTS_MIME, serializeMessagePartsForClipboard } from "../../utils/message-part-clipboard";
 import {
   createAtomicMediaDeletePlugin,
+  createClearSelectionOnOutsidePointerPlugin,
   createDropSelectionPlugin,
   createInlineAtomSelectionHighlightPlugin,
   createInlineAtomArrowNavigationPlugin,
@@ -37,12 +39,16 @@ function handlePaste(plugin: ReturnType<typeof createPlainTextPastePlugin>, view
   return handlePaste?.(view, event);
 }
 
-function createPasteEvent(input: { text: string; html?: string; types?: string[]; files?: File[] }) {
+function createPasteEvent(input: { text: string; html?: string; types?: string[]; files?: File[]; data?: Record<string, string> }) {
   const event = new Event("paste", { cancelable: true }) as ClipboardEvent;
   const clipboardData = {
     files: input.files ?? [],
     types: input.types ?? ["text/plain"],
     getData: (type: string) => {
+      if (input.data?.[type]) {
+        return input.data[type];
+      }
+
       if (type === "text/plain") {
         return input.text;
       }
@@ -264,6 +270,71 @@ describe("part editor plugins", () => {
     expect((decorations?.find()[0] as any)?.type.attrs.class).toContain("is-range-selected");
   });
 
+  it("浏览器 DOM 选区经过 media part 时会同步保持 part 选中态", () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const view = new EditorView(host, {
+      state: EditorState.create({
+        schema: partSchema,
+        doc: partsToDoc([{ type: "text", value: "看" }, mediaPart("a.png"), { type: "text", value: "这张" }]),
+        plugins: [createInlineAtomSelectionHighlightPlugin({ nodeNames: ["media_part"] })]
+      })
+    });
+    const paragraph = view.dom.querySelector("p");
+    const mediaElement = view.dom.querySelector(".pm-part--media");
+    const firstTextNode = paragraph?.firstChild;
+
+    expect(mediaElement).toBeInstanceOf(HTMLElement);
+    expect(firstTextNode).toBeInstanceOf(Text);
+
+    const range = document.createRange();
+    range.setStart(firstTextNode as Text, 0);
+    range.setEndAfter(mediaElement as HTMLElement);
+    const selection = document.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+
+    document.dispatchEvent(new Event("selectionchange"));
+
+    expect(mediaElement).toHaveClass("is-range-selected");
+
+    selection?.removeAllRanges();
+    document.dispatchEvent(new Event("selectionchange"));
+
+    expect(mediaElement).not.toHaveClass("is-range-selected");
+
+    view.destroy();
+    host.remove();
+  });
+
+  it("点击编辑器外部会把非空选区收敛到光标，避免 media part 高亮残留", () => {
+    const host = document.createElement("div");
+    const outside = document.createElement("button");
+    document.body.append(host, outside);
+    const doc = partsToDoc([{ type: "text", value: "看" }, mediaPart("a.png"), { type: "text", value: "这张" }]);
+    const baseState = EditorState.create({ schema: partSchema, doc });
+    const mediaPosition = findFirstMediaPosition(baseState);
+    const view = new EditorView(host, {
+      state: EditorState.create({
+        schema: partSchema,
+        doc,
+        selection: TextSelection.create(doc, mediaPosition, mediaPosition + 1),
+        plugins: [createClearSelectionOnOutsidePointerPlugin()]
+      })
+    });
+
+    expect(view.state.selection.empty).toBe(false);
+
+    fireEvent.click(outside);
+
+    expect(view.state.selection.empty).toBe(true);
+    expect(view.state.selection.from).toBe(mediaPosition + 1);
+
+    view.destroy();
+    host.remove();
+    outside.remove();
+  });
+
   it("全选后粘贴纯文本时不会保留额外换行", () => {
     const plugin = createPlainTextPastePlugin();
     const state = createState([{ type: "text", value: "旧" }, mediaPart("a.png"), { type: "text", value: "内容" }]);
@@ -285,6 +356,35 @@ describe("part editor plugins", () => {
     expect(handled).toBe(true);
     expect(event.defaultPrevented).toBe(true);
     expect(docToParts(nextState?.doc ?? selectedState.doc)).toEqual([{ type: "text", value: "新内容" }]);
+  });
+
+  it("粘贴 agent message parts 剪贴板时会还原 media part，而不是粘成文件名文本", () => {
+    const plugin = createPlainTextPastePlugin();
+    const pastedParts = [{ type: "text" as const, value: "看这个 " }, mediaPart("a.png"), { type: "text" as const, value: " 继续" }];
+    const state = createState([{ type: "text", value: "" }]);
+    let nextState: EditorState | undefined;
+    const event = createPasteEvent({
+      text: "看这个  继续",
+      types: [AGENT_MESSAGE_PARTS_MIME, "text/plain"],
+      data: {
+        [AGENT_MESSAGE_PARTS_MIME]: serializeMessagePartsForClipboard(pastedParts)
+      }
+    });
+
+    const handled = handlePaste(
+      plugin,
+      {
+        state,
+        dispatch: (transaction: Transaction) => {
+          nextState = state.apply(transaction);
+        }
+      } as unknown as EditorView,
+      event
+    );
+
+    expect(handled).toBe(true);
+    expect(event.defaultPrevented).toBe(true);
+    expect(docToParts(nextState?.doc ?? state.doc)).toEqual(pastedParts);
   });
 
   it("粘贴纯文本时会归一化 CRLF，但不额外制造段落", () => {

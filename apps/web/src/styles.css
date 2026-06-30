@@ -441,6 +441,24 @@ button:not(:disabled):hover {
   overflow: auto;
 }
 
+.session-history-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  margin: 0 4px;
+  border-radius: 8px;
+}
+
+.session-history-row:hover {
+  background: #edf3e8;
+}
+
+.session-history-row.selected,
+.session-history-row.selected:hover {
+  background: #e7f1d9;
+  border-radius: 8px;
+}
+
 .session-history-item {
   gap: 8px;
   min-height: 36px;
@@ -452,7 +470,7 @@ button:not(:disabled):hover {
 .session-history-item.session-history-item.MuiListItemButton-root {
   gap: 8px;
   min-height: 36px;
-  margin: 0 4px;
+  margin: 0;
   border-radius: 8px;
   padding: 7px 10px;
   color: #3a3a37;
@@ -460,14 +478,13 @@ button:not(:disabled):hover {
 }
 
 .session-history-item.session-history-item.MuiListItemButton-root:hover {
-  background: #edf3e8;
+  background: transparent;
   color: var(--eye-primary-strong);
 }
 
 .session-history-item.session-history-item.Mui-selected,
 .session-history-item.session-history-item.Mui-selected:hover {
-  background: #e7f1d9;
-  border-radius: 8px;
+  background: transparent;
   color: var(--eye-primary-strong);
 }
 
@@ -486,6 +503,25 @@ button:not(:disabled):hover {
   font-size: 14px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.session-delete-button.session-delete-button.MuiIconButton-root {
+  width: 28px;
+  height: 28px;
+  margin-right: 4px;
+  color: #999990;
+  opacity: 0;
+  transition: opacity 0.16s ease, background 0.16s ease, color 0.16s ease;
+}
+
+.session-history-row:hover .session-delete-button.session-delete-button.MuiIconButton-root,
+.session-delete-button.session-delete-button.MuiIconButton-root:focus-visible {
+  opacity: 1;
+}
+
+.session-delete-button.session-delete-button.MuiIconButton-root:hover {
+  background: #f8dfd8;
+  color: #9b2f1f;
 }
 
 .session-status {
@@ -692,6 +728,40 @@ button:not(:disabled):hover {
   margin: 0;
 }
 
+.user-part-surface {
+  min-width: 0;
+}
+
+.user-part-surface-editor {
+  min-height: 0;
+  max-height: none;
+  overflow: visible;
+  padding: 0;
+}
+
+.user-part-text {
+  white-space: pre-wrap;
+}
+
+.user-part-surface-editor .pm-part--media,
+.user-part-surface-editor .pm-part--media:hover {
+  background: #e9f4ed;
+  color: var(--eye-primary);
+  cursor: default;
+}
+
+.user-part-surface-editor .pm-part-media-remove {
+  display: none;
+  cursor: default;
+}
+
+.user-part-surface-editor .pm-part--media.ProseMirror-selectednode {
+  border-radius: 8px;
+  background: #e9f4ed;
+  color: var(--eye-primary);
+  box-shadow: none;
+}
+
 .pm-part--media {
   display: inline-flex;
   align-items: center;
@@ -706,7 +776,6 @@ button:not(:disabled):hover {
   cursor: pointer;
   gap: 6px;
   vertical-align: top;
-  user-select: none;
   transition: background 0.16s ease, color 0.16s ease;
 }
 
@@ -1440,6 +1509,119 @@ textarea {
   overflow-wrap: anywhere;
   color: #6f2318;
   line-height: 1.5;
+}
+
+.thinking-process {
+  display: grid;
+  overflow: hidden;
+  border: 1px solid #d8dccb;
+  border-radius: 8px;
+  background: #f7f8f1;
+  box-shadow: none;
+}
+
+.thinking-process::before {
+  display: none;
+}
+
+.thinking-process-summary {
+  min-height: 38px;
+  padding: 8px 10px;
+  color: #55584f;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.thinking-process-summary.Mui-expanded {
+  min-height: 38px;
+}
+
+.thinking-process-summary .MuiAccordionSummary-content {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0;
+}
+
+.thinking-process-summary .MuiAccordionSummary-content.Mui-expanded {
+  margin: 0;
+}
+
+.thinking-process-heading {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.thinking-process-chip.thinking-process-chip.MuiChip-root {
+  height: 22px;
+  border-radius: 999px;
+  background: #ecefe4;
+  color: #62665b;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.thinking-process-details {
+  border-top: 1px solid #dfe3d4;
+  padding: 8px 10px 10px;
+}
+
+.thinking-step-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.thinking-step {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 8px;
+  color: #55584f;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.thinking-step-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 20px;
+  color: #7b806f;
+}
+
+.thinking-step-succeeded .thinking-step-icon {
+  color: #4f7b48;
+}
+
+.thinking-step-running .thinking-step-icon {
+  color: var(--eye-primary);
+}
+
+.thinking-step-failed .thinking-step-icon {
+  color: var(--eye-danger);
+}
+
+.thinking-step-content {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.thinking-step-title {
+  overflow-wrap: anywhere;
+  color: #30332c;
+  font-weight: 800;
+}
+
+.thinking-step-summary {
+  overflow-wrap: anywhere;
+  color: #74786c;
 }
 
 .tool-events {

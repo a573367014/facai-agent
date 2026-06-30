@@ -427,6 +427,78 @@ describe("agent routes", () => {
     expect(completed.message).not.toHaveProperty("steps");
   });
 
+  it("GET /agents/sessions 支持按 cursor 分页", async () => {
+    const app = await buildTestApp({ agentService: createTestAgentService() });
+
+    async function createSession(title: string) {
+      const response = await app.inject({
+        method: "POST",
+        url: "/agents/sessions",
+        payload: { title }
+      });
+
+      return (response.json() as { session: { id: string } }).session;
+    }
+
+    const first = await createSession("第一条");
+    const second = await createSession("第二条");
+    const third = await createSession("第三条");
+    const firstPageResponse = await app.inject({ method: "GET", url: "/agents/sessions?limit=2" });
+    const firstPage = firstPageResponse.json() as {
+      sessions: Array<{ id: string }>;
+      pageInfo: { hasMore: boolean; nextCursor?: string; limit: number };
+    };
+
+    expect(firstPageResponse.statusCode).toBe(200);
+    expect(firstPage.sessions.map((session) => session.id)).toEqual([third.id, second.id]);
+    expect(firstPage.pageInfo).toEqual({
+      hasMore: true,
+      nextCursor: second.id,
+      limit: 2
+    });
+
+    const secondPageResponse = await app.inject({
+      method: "GET",
+      url: `/agents/sessions?after=${firstPage.pageInfo.nextCursor}&limit=2`
+    });
+    const secondPage = secondPageResponse.json() as {
+      sessions: Array<{ id: string }>;
+      pageInfo: { hasMore: boolean; nextCursor?: string; limit: number };
+    };
+
+    expect(secondPage.sessions.map((session) => session.id)).toEqual([first.id]);
+    expect(secondPage.pageInfo).toEqual({
+      hasMore: false,
+      limit: 2
+    });
+  });
+
+  it("DELETE /agents/sessions/:sessionId 删除 session 并清理后续读取", async () => {
+    const app = await buildTestApp({ agentService: createTestAgentService() });
+    const createResponse = await app.inject({
+      method: "POST",
+      url: "/agents/messages",
+      payload: { input: "要删除的会话" }
+    });
+    const { session } = createResponse.json() as { session: { id: string } };
+
+    await app.inject({
+      method: "DELETE",
+      url: `/agents/sessions/${session.id}`
+    });
+
+    const getDeletedResponse = await app.inject({
+      method: "GET",
+      url: `/agents/sessions/${session.id}`
+    });
+    const listResponse = await app.inject({ method: "GET", url: "/agents/sessions" });
+
+    expect(getDeletedResponse.statusCode).toBe(404);
+    expect(listResponse.json()).toMatchObject({
+      sessions: []
+    });
+  });
+
   it("POST /agents/messages 支持直接提交 message parts", async () => {
     const app = await buildTestApp({ agentService: createTestAgentService() });
     const response = await app.inject({
@@ -514,6 +586,53 @@ describe("agent routes", () => {
     });
   });
 
+  it("buildApp 启动时清理上次进程遗留的 running run", async () => {
+    const databasePath = createTempDatabasePath();
+    const store = await SqliteAgentStore.create({ databasePath });
+    const session = store.createSession("遗留运行");
+    const userMessage = store.createMessage({
+      sessionId: session.id,
+      role: "user",
+      status: "completed",
+      parts: [{ type: "text", value: "再生产" }]
+    });
+    const assistantMessage = store.createMessage({
+      sessionId: session.id,
+      role: "assistant",
+      status: "running",
+      parts: [{ type: "text", value: "" }]
+    });
+    const run = store.createRun({
+      sessionId: session.id,
+      userMessageId: userMessage.id,
+      assistantMessageId: assistantMessage.id,
+      status: "running",
+      phase: "answering"
+    });
+    store.close();
+
+    const app = await buildApp({ databasePath, agentService: createTestAgentService() });
+    apps.push(app);
+    const response = await app.inject({
+      method: "GET",
+      url: `/agents/runs/${run.id}`
+    });
+    const payload = response.json() as {
+      run: { status: string; phase: string; error?: { code: string; message: string } };
+      events: Array<{ event: { type: string; code?: string } }>;
+    };
+
+    expect(payload.run).toMatchObject({
+      status: "failed",
+      phase: "failed",
+      error: {
+        code: "RUN_INTERRUPTED",
+        message: "服务重启后清理遗留运行"
+      }
+    });
+    expect(payload.events.map((event) => event.event.type)).toContain("error");
+  });
+
   it("GET /agents/runs/:runId/events 返回当前 assistant message snapshot", async () => {
     const app = await buildTestApp({ agentService: createTestAgentService() });
     const createResponse = await app.inject({
@@ -569,9 +688,9 @@ describe("agent routes", () => {
     const payload = response.json() as {
       message: { id: string };
       runs: Array<{ id: string; assistantMessageId?: string }>;
-      messageEvents: Array<{ event: { type: string } }>;
-      runEvents: Array<{ runId?: string; messageId?: string; event: { type: string } }>;
-      events: Array<{ runId?: string; messageId?: string; event: { type: string } }>;
+      messageEvents: Array<{ id: string; runId?: string; messageId?: string; event: { type: string } }>;
+      runEvents: Array<{ id: string; runId?: string; messageId?: string; event: { type: string } }>;
+      events: Array<{ id: string; runId?: string; messageId?: string; event: { type: string } }>;
     };
 
     expect(response.statusCode).toBe(200);
@@ -582,9 +701,11 @@ describe("agent routes", () => {
         assistantMessageId
       })
     ]);
-    expect(payload.messageEvents).toEqual([]);
+    expect(payload.messageEvents.map((event) => event.event.type)).toContain("run_completed");
+    expect(payload.messageEvents.every((event) => event.messageId === assistantMessageId)).toBe(true);
     expect(payload.runEvents.map((event) => event.event.type)).toContain("run_completed");
     expect(payload.runEvents.every((event) => event.runId === run.id)).toBe(true);
+    expect(new Set(payload.events.map((event) => event.id)).size).toBe(payload.events.length);
     expect(payload.events.map((event) => event.event.type)).toEqual(payload.runEvents.map((event) => event.event.type));
   });
 
@@ -1026,7 +1147,16 @@ describe("agent routes", () => {
       }
     };
     const app = await buildTestApp({
-      agentService: createAgentService(provider, registry)
+      agentService: createAgentService(provider, registry),
+      toolResourceStorage: {
+        storeRemoteResource: async () => ({
+          url: "http://127.0.0.1:4001/uploads/resources/images/local-pig.png",
+          mime: "image/png",
+          name: "local-pig.png",
+          size: 123,
+          relativePath: "resources/images/local-pig.png"
+        })
+      }
     });
     const createResponse = await app.inject({
       method: "POST",
@@ -1087,8 +1217,15 @@ describe("agent routes", () => {
     const resourceId = mediaPart?.extra?.resource?.id;
 
     expect(resourceId).toMatch(/^res_/);
-    expect(mediaPart).not.toHaveProperty("url");
-    expect(mediaPart).not.toHaveProperty("mime");
+    expect(mediaPart).toMatchObject({
+      type: "media",
+      mime: "image/png",
+      url: "http://127.0.0.1:4001/uploads/resources/images/local-pig.png",
+      extra: {
+        lifecycle: { state: "succeeded" },
+        generation: { prompt: "温馨田园小猪", provider: "test_image" }
+      }
+    });
     expect(payload.resources).toEqual([
       expect.objectContaining({
         id: resourceId,
@@ -1096,7 +1233,7 @@ describe("agent routes", () => {
         type: "image",
         mime: "image/png",
         status: "succeeded",
-        url: "https://example.com/pig.png",
+        url: "http://127.0.0.1:4001/uploads/resources/images/local-pig.png",
         metadata: { prompt: "温馨田园小猪", provider: "test_image" }
       })
     ]);
@@ -1114,14 +1251,18 @@ describe("agent routes", () => {
           { type: "text", value: "图片已经生成好了。" },
           expect.objectContaining({
             type: "media",
+            mime: "image/png",
+            url: "http://127.0.0.1:4001/uploads/resources/images/local-pig.png",
             extra: expect.objectContaining({
+              lifecycle: { state: "succeeded" },
               resource: { id: resourceId },
               tool: {
                 name: "generate_image",
                 toolCallId: "call_image",
                 toolCallRowId: expect.stringMatching(/^tool_call_/),
                 outputIndex: 0
-              }
+              },
+              generation: { prompt: "温馨田园小猪", provider: "test_image" }
             })
           })
         ]
@@ -1169,29 +1310,29 @@ describe("agent routes", () => {
     });
     const recentPayload = recentResponse.json() as {
       messages: Array<{ id: string; role: string; parts: Array<{ type: string; value: string }> }>;
-      pageInfo: { hasMore: boolean; oldestCursor?: string; limit: number };
+      pageInfo: { hasMore: boolean; nextCursor?: string; limit: number };
     };
 
     expect(recentResponse.statusCode).toBe(200);
     expect(recentPayload.messages.map((message) => message.parts[0]?.value)).toEqual(["第 4 轮问题", "第 4 轮回答"]);
     expect(recentPayload.pageInfo.hasMore).toBe(true);
     expect(recentPayload.pageInfo.limit).toBe(2);
-    expect(recentPayload.pageInfo.oldestCursor).toBe(recentPayload.messages[0].id);
+    expect(recentPayload.pageInfo.nextCursor).toBe(recentPayload.messages[0].id);
 
     const previousResponse = await app.inject({
       method: "GET",
-      url: `/agents/sessions/${firstPayload.session.id}/messages?before=${recentPayload.pageInfo.oldestCursor}&limit=2`
+      url: `/agents/sessions/${firstPayload.session.id}/messages?before=${recentPayload.pageInfo.nextCursor}&limit=2`
     });
     const previousPayload = previousResponse.json() as {
       messages: Array<{ parts: Array<{ type: string; value: string }> }>;
-      pageInfo: { hasMore: boolean; oldestCursor?: string; limit: number };
+      pageInfo: { hasMore: boolean; nextCursor?: string; limit: number };
     };
 
     expect(previousResponse.statusCode).toBe(200);
     expect(previousPayload.messages.map((message) => message.parts[0]?.value)).toEqual(["第 3 轮问题", "第 3 轮回答"]);
     expect(previousPayload.pageInfo).toEqual({
       hasMore: true,
-      oldestCursor: previousPayload.messages[0] ? expect.any(String) : undefined,
+      nextCursor: previousPayload.messages[0] ? expect.any(String) : undefined,
       limit: 2
     });
   });

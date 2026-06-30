@@ -44,7 +44,7 @@ describe("ToolRegistry", () => {
     expect(withSearch.getDefinitions().map((tool) => tool.name)).toContain("web_search");
   });
 
-  it("配置火山 AK/SK 后注册 generate_image 和 edit_image 工具", () => {
+  it("配置火山 AK/SK 后注册 generate_image、edit_image 和 generate_video 工具", () => {
     const withoutImage = createDefaultToolRegistry();
     const withImage = createDefaultToolRegistry({
       jimengImage: {
@@ -54,14 +54,21 @@ describe("ToolRegistry", () => {
       jimengImageEdit: {
         accessKeyId: "ak-test",
         secretAccessKey: "sk-test"
+      },
+      jimengVideo: {
+        accessKeyId: "ak-test",
+        secretAccessKey: "sk-test"
       }
     });
 
     expect(withoutImage.getTool("generate_image")).toBeUndefined();
     expect(withoutImage.getTool("edit_image")).toBeUndefined();
+    expect(withoutImage.getTool("generate_video")).toBeUndefined();
     expect(withImage.getTool("generate_image")).toBeDefined();
     expect(withImage.getTool("edit_image")).toBeDefined();
+    expect(withImage.getTool("generate_video")).toBeDefined();
     expect(withImage.getDefinitions().map((tool) => tool.name)).toContain("generate_image");
     expect(withImage.getDefinitions().map((tool) => tool.name)).toContain("edit_image");
+    expect(withImage.getDefinitions().map((tool) => tool.name)).toContain("generate_video");
   });
 });

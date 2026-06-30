@@ -387,6 +387,49 @@ describe("App", () => {
     expect(container.querySelector(".session-sidebar")).not.toContainElement(screen.getByLabelText("发消息"));
   });
 
+  it("当前会话选中背景挂在整行容器上，避免删除按钮区域背景断开", async () => {
+    window.history.replaceState(null, "", "/?sessionId=session_active");
+    mockAppFetch((url) => {
+      if (url.endsWith("/agents/sessions/session_active")) {
+        return jsonResponse({
+          session: {
+            id: "session_active",
+            title: "3b9c78ea809ad76577ea6...",
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:01.000Z"
+          },
+          messages: [],
+          resources: [],
+          pageInfo: { hasMore: false, limit: 30 }
+        });
+      }
+
+      if (url.endsWith("/agents/sessions")) {
+        return jsonResponse({
+          sessions: [
+            {
+              id: "session_active",
+              title: "3b9c78ea809ad76577ea6...",
+              createdAt: "2026-06-22T00:00:00.000Z",
+              updatedAt: "2026-06-22T00:00:01.000Z"
+            }
+          ]
+        });
+      }
+
+      return undefined;
+    });
+
+    const { container } = render(<App />);
+
+    const activeSessionButton = await screen.findByRole("button", { name: "3b9c78ea809ad76577ea6..." });
+    const activeSessionRow = activeSessionButton.closest(".session-history-row");
+
+    expect(activeSessionRow).toHaveClass("selected");
+    expect(activeSessionRow).toContainElement(screen.getByRole("button", { name: "删除会话：3b9c78ea809ad76577ea6..." }));
+    expect(container.querySelector(".session-history-row.selected .session-history-item.Mui-selected")).toBe(activeSessionButton);
+  });
+
   it("点击左侧会话会恢复对应消息并同步 URL", async () => {
     mockAppFetch((url) => {
       if (url.endsWith("/agents/sessions/session_a")) {
@@ -430,6 +473,129 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getByText("产品方案内容")).toBeInTheDocument());
     expect(window.location.search).toBe("?sessionId=session_a");
+  });
+
+  it("左侧会话列表滚动到底部时懒加载下一页", async () => {
+    mockAppFetch((url) => {
+      if (url.endsWith("/agents/sessions")) {
+        return jsonResponse({
+          sessions: [
+            {
+              id: "session_new",
+              title: "新会话",
+              createdAt: "2026-06-22T00:00:00.000Z",
+              updatedAt: "2026-06-22T00:00:03.000Z"
+            }
+          ],
+          pageInfo: {
+            hasMore: true,
+            nextCursor: "session_new",
+            limit: 30
+          }
+        });
+      }
+
+      if (url.endsWith("/agents/sessions?after=session_new&limit=30")) {
+        return jsonResponse({
+          sessions: [
+            {
+              id: "session_old",
+              title: "旧会话",
+              createdAt: "2026-06-21T00:00:00.000Z",
+              updatedAt: "2026-06-21T00:00:01.000Z"
+            }
+          ],
+          pageInfo: {
+            hasMore: false,
+            limit: 30
+          }
+        });
+      }
+
+      return undefined;
+    });
+
+    const { container } = render(<App />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "新会话" })).toBeInTheDocument());
+
+    const listElement = container.querySelector(".session-history-list") as HTMLUListElement;
+    Object.defineProperty(listElement, "clientHeight", {
+      configurable: true,
+      get: () => 300
+    });
+    Object.defineProperty(listElement, "scrollHeight", {
+      configurable: true,
+      get: () => 600
+    });
+    Object.defineProperty(listElement, "scrollTop", {
+      configurable: true,
+      get: () => 280
+    });
+    fireEvent.scroll(listElement);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "旧会话" })).toBeInTheDocument());
+    expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/sessions?after=session_new&limit=30");
+  });
+
+  it("删除当前会话后从列表移除并回到新对话", async () => {
+    window.history.replaceState(null, "", "/?sessionId=session_delete");
+    mockAppFetch((url, init) => {
+      if (url.endsWith("/agents/sessions?limit=30")) {
+        return jsonResponse({
+          sessions: [
+            {
+              id: "session_delete",
+              title: "要删除的会话",
+              createdAt: "2026-06-22T00:00:00.000Z",
+              updatedAt: "2026-06-22T00:00:01.000Z"
+            }
+          ],
+          pageInfo: {
+            hasMore: false,
+            nextCursor: "session_delete",
+            limit: 30
+          }
+        });
+      }
+
+      if (url.endsWith("/agents/sessions/session_delete") && init?.method === "DELETE") {
+        return jsonResponse({});
+      }
+
+      if (url.endsWith("/agents/sessions/session_delete")) {
+        return jsonResponse({
+          session: {
+            id: "session_delete",
+            title: "要删除的会话",
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:01.000Z"
+          },
+          messages: [
+            createUserMessage("session_delete", "删除前问题", { id: "msg_user_delete" }),
+            createAssistantMessage("session_delete", "删除前回答", {
+              id: "msg_assistant_delete",
+              completedAt: "2026-06-22T00:00:01.000Z"
+            })
+          ]
+        });
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("删除前回答")).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: "删除会话：要删除的会话" }));
+
+    expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/sessions/session_delete", {
+      method: "DELETE"
+    });
+    await waitFor(() => expect(screen.queryByText("要删除的会话")).not.toBeInTheDocument());
+    expect(screen.queryByText("删除前回答")).not.toBeInTheDocument();
+    expect(screen.getByText("有什么我能帮你的吗？")).toBeInTheDocument();
+    expect(window.location.search).toBe("");
   });
 
   it("重新生成旧回答时保留原回答并追加新的流式回答", async () => {
@@ -544,7 +710,7 @@ describe("App", () => {
           ],
           pageInfo: {
             hasMore: true,
-            oldestCursor: "msg_3",
+            nextCursor: "msg_3",
             limit: 30
           }
         });
@@ -562,7 +728,6 @@ describe("App", () => {
           ],
           pageInfo: {
             hasMore: false,
-            oldestCursor: "msg_1",
             limit: 30
           }
         });
@@ -691,9 +856,12 @@ describe("App", () => {
     expect(styles).toMatch(/\.sidebar-divider\.sidebar-divider\.MuiDivider-root\s*{[^}]*margin:\s*2px 0 12px;[^}]*border-color:\s*#e4e4df;/s);
     expect(styles).toMatch(/\.sidebar-history-heading\s*{[^}]*margin:\s*0 0 10px;/s);
     expect(styles).toMatch(/\.session-history-list\s*{[^}]*gap:\s*6px;/s);
-    expect(styles).toMatch(/\.session-history-item\.session-history-item\.MuiListItemButton-root\s*{[^}]*margin:\s*0 4px;[^}]*border-radius:\s*8px;[^}]*overflow:\s*hidden;/s);
-    expect(styles).toMatch(/\.session-history-item\.session-history-item\.MuiListItemButton-root:hover\s*{[^}]*background:\s*#edf3e8;[^}]*color:\s*var\(--eye-primary-strong\);/s);
-    expect(styles).toMatch(/\.session-history-item\.session-history-item\.Mui-selected,\s*\.session-history-item\.session-history-item\.Mui-selected:hover\s*{[^}]*background:\s*#e7f1d9;[^}]*border-radius:\s*8px;/s);
+    expect(styles).toMatch(/\.session-history-row\s*{[^}]*margin:\s*0 4px;[^}]*border-radius:\s*8px;/s);
+    expect(styles).toMatch(/\.session-history-item\.session-history-item\.MuiListItemButton-root\s*{[^}]*margin:\s*0;[^}]*border-radius:\s*8px;[^}]*overflow:\s*hidden;/s);
+    expect(styles).toMatch(/\.session-history-row:hover\s*{[^}]*background:\s*#edf3e8;/s);
+    expect(styles).toMatch(/\.session-history-row\.selected,\s*\.session-history-row\.selected:hover\s*{[^}]*background:\s*#e7f1d9;[^}]*border-radius:\s*8px;/s);
+    expect(styles).toMatch(/\.session-history-item\.session-history-item\.MuiListItemButton-root:hover\s*{[^}]*background:\s*transparent;[^}]*color:\s*var\(--eye-primary-strong\);/s);
+    expect(styles).toMatch(/\.session-history-item\.session-history-item\.Mui-selected,\s*\.session-history-item\.session-history-item\.Mui-selected:hover\s*{[^}]*background:\s*transparent;[^}]*color:\s*var\(--eye-primary-strong\);/s);
     expect(styles).toMatch(/\.session-history-item > svg\s*{[^}]*flex:\s*0 0 15px;[^}]*width:\s*15px;[^}]*height:\s*15px;/s);
     expect(styles).toMatch(/\.session-history-item \.MuiListItemText-root\s*{[^}]*min-width:\s*0;/s);
     expect(styles).toMatch(/\.workspace\s*{[^}]*--session-panel-width:\s*280px;[^}]*--trace-panel-width:\s*clamp\(320px,\s*24vw,\s*380px\);[^}]*--chat-main-left:\s*var\(--session-panel-width\);[^}]*--chat-main-right:\s*var\(--trace-panel-width\);/s);
@@ -767,6 +935,96 @@ describe("App", () => {
     expect(screen.getByLabelText("发消息")).toHaveFocus();
   });
 
+  it("点击 user 消息复制会把完整 part 格式回填并按 parts 提交", async () => {
+    window.history.replaceState(null, "", "/?sessionId=session_copy_parts");
+    let submittedBody: unknown;
+    const userParts = [
+      { type: "text", value: "你能告诉我这是什么吗 " },
+      {
+        type: "media",
+        mime: "image/png",
+        url: "https://example.com/screenshot.png",
+        name: "截图2026-06-29.png",
+        size: 123,
+        width: 640,
+        height: 480,
+        extra: {
+          lifecycle: { state: "succeeded" }
+        }
+      }
+    ];
+
+    mockAppFetch((url, init) => {
+      if (url.endsWith("/agents/sessions/session_copy_parts")) {
+        return jsonResponse({
+          session: {
+            id: "session_copy_parts",
+            title: "复制 parts",
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:01.000Z"
+          },
+          messages: [
+            createUserMessage("session_copy_parts", "", {
+              id: "msg_user_copy_parts",
+              parts: userParts
+            }),
+            createAssistantMessage("session_copy_parts", "旧回答", {
+              id: "msg_assistant_copy_parts",
+              completedAt: "2026-06-22T00:00:01.000Z"
+            })
+          ]
+        });
+      }
+
+      if (url.endsWith("/agents/runs") && init?.method === "POST") {
+        submittedBody = JSON.parse(String(init.body));
+        return jsonResponse({
+          session: {
+            id: "session_copy_parts",
+            title: "复制 parts",
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:02.000Z"
+          },
+          run: {
+            id: "run_copy_parts",
+            sessionId: "session_copy_parts",
+            status: "running",
+            phase: "answering",
+            userMessageId: "msg_user_new",
+            createdAt: timestamp,
+            updatedAt: timestamp
+          },
+          userMessage: createUserMessage("session_copy_parts", "", {
+            id: "msg_user_new",
+            parts: userParts
+          })
+        });
+      }
+
+      if (url.endsWith("/agents/runs/run_copy_parts/events?after=0")) {
+        return createStoredRunSseResponse("run_copy_parts", "msg_assistant_new", [{ type: "run_completed", messageId: "msg_assistant_new" }]);
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("旧回答")).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: "复制消息" }));
+
+    expect(screen.getByLabelText("发消息")).toHaveTextContent("截图2026-06-29.png");
+
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => {
+      expect(submittedBody).toEqual({
+        sessionId: "session_copy_parts",
+        parts: userParts
+      });
+    });
+  });
+
   it("保留护眼主题变量并使用豆包式全屏底色", () => {
     const styles = readFileSync(stylesPath, "utf8");
 
@@ -780,7 +1038,7 @@ describe("App", () => {
     expect(styles).toMatch(/\.primary-button\s*{[^}]*background:\s*var\(--eye-primary-strong\);/s);
   });
 
-  it("提交任务会用流式事件展示回答和可折叠工具过程", async () => {
+  it("提交任务会用流式事件展示回答，不再在正文兜底展示工具过程", async () => {
     window.history.replaceState(null, "", "/");
     mockAppFetch((url, init) => {
       if (url.endsWith("/agents/runs") && init?.method === "POST") {
@@ -817,7 +1075,7 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getAllByText("结果是 108").length).toBeGreaterThan(0));
     expect(window.location.search).toBe("?sessionId=session_1");
-    expect(screen.getByText("工具过程")).toBeInTheDocument();
+    expect(screen.queryByText("工具过程")).not.toBeInTheDocument();
     expect(screen.queryByText("工具步骤")).not.toBeInTheDocument();
     expect(screen.getAllByText(/"expression": "12 \* 9"/).length).toBeGreaterThan(0);
   });
@@ -849,6 +1107,65 @@ describe("App", () => {
     await userEvent.click(screen.getByRole("button", { name: "发送" }));
 
     await waitFor(() => expect(screen.getAllByText("已经生成后续内容").length).toBeGreaterThan(0));
+  });
+
+  it("事件流会把过程步骤更新到助手消息顶部", async () => {
+    window.history.replaceState(null, "", "/");
+    mockAppFetch((url, init) => {
+      if (url.endsWith("/agents/runs") && init?.method === "POST") {
+        return jsonResponse(createStartMessageResponse({ input: "生成图片", assistantMessageId: "msg_1" }));
+      }
+
+      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+        return createStoredSseResponse("msg_1", [
+          {
+            type: "process.step.created",
+            step: {
+              id: "step_tool",
+              sessionId: "session_1",
+              messageId: "msg_1",
+              kind: "tool",
+              title: "正在生成图片",
+              summary: "小猪",
+              status: "running",
+              orderIndex: 0,
+              startedAt: timestamp,
+              updatedAt: timestamp
+            }
+          },
+          {
+            type: "process.step.updated",
+            step: {
+              id: "step_tool",
+              sessionId: "session_1",
+              messageId: "msg_1",
+              kind: "tool",
+              title: "图片已生成",
+              summary: "耗时 1.2s",
+              status: "succeeded",
+              orderIndex: 0,
+              startedAt: timestamp,
+              updatedAt: timestamp,
+              completedAt: timestamp
+            }
+          },
+          { type: "final_answer", answer: "图片已生成。" },
+          { type: "run_completed", messageId: "msg_1" }
+        ]);
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await userEvent.type(screen.getByLabelText("发消息"), "生成图片");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(screen.getByText("任务进度")).toBeInTheDocument());
+    expect(screen.getByText("图片已生成")).toBeInTheDocument();
+    expect(screen.getByText("耗时 1.2s")).toBeInTheDocument();
+    expect(screen.getAllByText("图片已生成。").length).toBeGreaterThan(0);
   });
 
   it("事件流收到旧版本 snapshot 时不会覆盖更新的消息草稿", async () => {
@@ -974,14 +1291,18 @@ describe("App", () => {
                 { type: "text", value: "图片已生成。" },
                 {
                   type: "media",
+                  mime: "image/png",
+                  url: "https://example.com/dog.png",
                   extra: {
+                    lifecycle: { state: "succeeded" },
                     resource: { id: "res_dog" },
                     tool: {
                       name: "generate_image",
                       toolCallId: "call_image",
                       toolCallRowId: "tool_call_image",
                       outputIndex: 0
-                    }
+                    },
+                    generation: { prompt: "一只小狗", provider: "test" }
                   }
                 }
               ],
@@ -1015,6 +1336,151 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getByRole("img", { name: "一只小狗" })).toHaveAttribute("src", "https://example.com/dog.png"));
     expect(screen.getByRole("link", { name: "下载图片 1" })).toHaveAttribute("href", "https://example.com/dog.png");
+  });
+
+  it("点击 assistant 图片引用会把图片 part 追加到输入框并按 parts 提交", async () => {
+    window.history.replaceState(null, "", "/?sessionId=session_quote_image");
+    let submittedBody: unknown;
+
+    mockAppFetch((url, init) => {
+      if (url.endsWith("/agents/sessions/session_quote_image")) {
+        return jsonResponse({
+          session: {
+            id: "session_quote_image",
+            title: "图片引用会话",
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:00.000Z"
+          },
+          messages: [
+            createUserMessage("session_quote_image", "生成一只小狗", { id: "msg_user_quote_image" }),
+            createAssistantMessage("session_quote_image", "图片已生成。", {
+              id: "msg_assistant_quote_image",
+              parts: [
+                { type: "text", value: "图片已生成。" },
+                {
+                  type: "media",
+                  mime: "image/png",
+                  url: "https://example.com/quote-dog.png",
+                  name: "一只小狗",
+                  width: 1024,
+                  height: 768,
+                  extra: {
+                    lifecycle: { state: "succeeded" },
+                    resource: { id: "res_quote_dog" },
+                    tool: {
+                      name: "generate_image",
+                      toolCallId: "call_quote_image",
+                      toolCallRowId: "tool_call_quote_image",
+                      outputIndex: 0
+                    },
+                    generation: { prompt: "一只小狗" }
+                  }
+                }
+              ],
+              completedAt: "2026-06-22T00:00:01.000Z"
+            })
+          ],
+          resources: [
+            {
+              id: "res_quote_dog",
+              sessionId: "session_quote_image",
+              messageId: "msg_assistant_quote_image",
+              toolCallId: "call_quote_image",
+              toolCallRowId: "tool_call_quote_image",
+              type: "image",
+              mime: "image/png",
+              status: "succeeded",
+              url: "https://example.com/quote-dog.png",
+              width: 1024,
+              height: 768,
+              metadata: { prompt: "一只小狗" },
+              createdAt: "2026-06-22T00:00:00.000Z",
+              updatedAt: "2026-06-22T00:00:01.000Z"
+            }
+          ]
+        });
+      }
+
+      if (url.endsWith("/agents/runs") && init?.method === "POST") {
+        submittedBody = JSON.parse(String(init.body));
+        return jsonResponse({
+          session: {
+            id: "session_quote_image",
+            title: "图片引用会话",
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:02.000Z"
+          },
+          run: {
+            id: "run_quote_image",
+            sessionId: "session_quote_image",
+            status: "running",
+            phase: "answering",
+            userMessageId: "msg_user_quote_new",
+            createdAt: timestamp,
+            updatedAt: timestamp
+          },
+          userMessage: createUserMessage("session_quote_image", "", {
+            id: "msg_user_quote_new",
+            parts: [
+              {
+                type: "media",
+                mime: "image/png",
+                url: "https://example.com/quote-dog.png",
+                name: "一只小狗",
+                width: 1024,
+                height: 768
+              }
+            ]
+          })
+        });
+      }
+
+      if (url.endsWith("/agents/runs/run_quote_image/events?after=0")) {
+        return createStoredRunSseResponse("run_quote_image", "msg_assistant_quote_new", [
+          { type: "run_completed", messageId: "msg_assistant_quote_new" }
+        ]);
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByRole("img", { name: "一只小狗" })).toHaveAttribute("src", "https://example.com/quote-dog.png"));
+    await userEvent.click(screen.getByRole("button", { name: "更多图片操作 1" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: "引用图片 1" }));
+
+    expect(screen.getByLabelText("发消息")).toHaveTextContent("一只小狗");
+    expect(screen.getByLabelText("发消息")).toHaveFocus();
+
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => {
+      expect(submittedBody).toEqual({
+        sessionId: "session_quote_image",
+        parts: [
+          expect.objectContaining({
+            type: "media",
+            mime: "image/png",
+            url: "https://example.com/quote-dog.png",
+            name: "一只小狗",
+            width: 1024,
+            height: 768,
+            extra: expect.objectContaining({
+              lifecycle: { state: "succeeded" },
+              resource: { id: "res_quote_dog" },
+              tool: expect.objectContaining({
+                name: "generate_image",
+                toolCallId: "call_quote_image",
+                toolCallRowId: "tool_call_quote_image",
+                outputIndex: 0
+              }),
+              generation: { prompt: "一只小狗" }
+            })
+          })
+        ]
+      });
+    });
   });
 
   it("恢复会话时展示历史摘要 system 状态消息", async () => {
@@ -1152,15 +1618,20 @@ describe("App", () => {
             partIndex: 1,
             part: {
               type: "media",
+              mime: "image/png",
+              width: 1024,
+              height: 1024,
               extra: {
                 placeholder: { type: "image", label: "图片生成中" },
+                lifecycle: { state: "pending" },
                 resource: { id: "res_pig" },
                 tool: {
                   name: "generate_image",
                   toolCallId: "call_image",
                   toolCallRowId: "tool_call_image",
                   outputIndex: 0
-                }
+                },
+                generation: { prompt: "粉色小猪", provider: "test" }
               }
             }
           },
@@ -1173,6 +1644,29 @@ describe("App", () => {
               width: 1024,
               height: 1024,
               updatedAt: "2026-06-22T00:00:01.000Z"
+            }
+          },
+          {
+            type: "message.part.updated",
+            messageId: "msg_1",
+            partIndex: 1,
+            part: {
+              type: "media",
+              mime: "image/png",
+              url: "https://example.com/pig.png",
+              width: 1024,
+              height: 1024,
+              extra: {
+                lifecycle: { state: "succeeded" },
+                resource: { id: "res_pig" },
+                tool: {
+                  name: "generate_image",
+                  toolCallId: "call_image",
+                  toolCallRowId: "tool_call_image",
+                  outputIndex: 0
+                },
+                generation: { prompt: "粉色小猪", provider: "test" }
+              }
             }
           },
           {

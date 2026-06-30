@@ -6,10 +6,14 @@ import type { ToolImageActionPayload, ToolImageActionType } from "./ToolResultPr
 
 export interface MessageImageGalleryItem {
   id: string;
+  resourceId?: string;
   url?: string;
+  mime?: string;
   prompt?: string;
   width?: number;
   height?: number;
+  toolCallRowId?: string;
+  outputIndex?: number;
   state?: "pending" | "succeeded" | "failed";
   error?: string;
   trace: ToolTrace;
@@ -42,6 +46,12 @@ export function MessageImageGallery({ items, onImageAction }: MessageImageGaller
       url: item.url,
       index,
       prompt: item.prompt ?? `图片 ${index + 1}`,
+      mime: item.mime,
+      width: item.width,
+      height: item.height,
+      resourceId: item.resourceId,
+      toolCallRowId: item.toolCallRowId,
+      outputIndex: item.outputIndex,
       trace: item.trace
     });
   }
@@ -96,7 +106,6 @@ export function MessageImageGallery({ items, onImageAction }: MessageImageGaller
       return;
     }
 
-    copyText(`![${item.prompt || `图片 ${index + 1}`}](${item.url})`);
     setActionMenu(null);
     emitImageAction("quote", item, index);
   }
@@ -181,17 +190,19 @@ function renderImageFrame(
   copyImageLink: (item: MessageImageGalleryItem, index: number) => void,
   quoteImage: (item: MessageImageGalleryItem, index: number) => void
 ) {
-  const frameSize = fitWithinBox(item.width, item.height);
+  const isVideo = isVideoItem(item);
+  const frameSize = fitWithinBox(item.width, item.height, isVideo);
   const frameStyle = {
     width: `${frameSize.width}px`,
     height: `${frameSize.height}px`
   };
+  const mediaLabel = isVideo ? "视频" : "图片";
 
   if (item.state === "failed") {
     return (
       <div className="message-image-frame failed" style={frameStyle}>
-        <strong>图片生成失败</strong>
-        <p>{item.error ?? "图片生成失败"}</p>
+        <strong>{mediaLabel}生成失败</strong>
+        <p>{item.error ?? `${mediaLabel}生成失败`}</p>
       </div>
     );
   }
@@ -203,7 +214,7 @@ function renderImageFrame(
           <div className="message-image-loading-shine" aria-hidden="true" />
           <div className="message-image-loading-content">
             <CircularProgress size={20} />
-            <strong>正在生成图片</strong>
+            <strong>正在生成{mediaLabel}</strong>
             {item.width && item.height ? <span>{item.width} x {item.height}</span> : null}
           </div>
         </div>
@@ -214,21 +225,31 @@ function renderImageFrame(
   return (
     <>
       <div className="message-image-frame" style={frameStyle}>
-        <ButtonBase
-          type="button"
-          className="message-image-canvas"
-          aria-label={`预览图片 ${index + 1}`}
-          title="预览"
-          onClick={() => openPreview(index)}
-        >
-          <img alt={item.prompt ?? `图片 ${index + 1}`} src={item.url} />
-        </ButtonBase>
+        {isVideo ? (
+          <video
+            className="message-image-canvas message-video-canvas"
+            aria-label={item.prompt ?? `视频 ${index + 1}`}
+            src={item.url}
+            controls
+            preload="metadata"
+          />
+        ) : (
+          <ButtonBase
+            type="button"
+            className="message-image-canvas"
+            aria-label={`预览图片 ${index + 1}`}
+            title="预览"
+            onClick={() => openPreview(index)}
+          >
+            <img alt={item.prompt ?? `图片 ${index + 1}`} src={item.url} />
+          </ButtonBase>
+        )}
         <div className="message-image-actions">
           <IconButton
             component="a"
             href={item.url}
-            download={`generated-image-${index + 1}.png`}
-            aria-label={`下载图片 ${index + 1}`}
+            download={isVideo ? `generated-video-${index + 1}.mp4` : `generated-image-${index + 1}.png`}
+            aria-label={`下载${mediaLabel} ${index + 1}`}
             title="下载"
             size="small"
             onClick={() => emitImageAction("download", item, index)}
@@ -237,7 +258,7 @@ function renderImageFrame(
           </IconButton>
           <IconButton
             type="button"
-            aria-label={`更多图片操作 ${index + 1}`}
+            aria-label={`更多${mediaLabel}操作 ${index + 1}`}
             title="更多"
             aria-haspopup="menu"
             aria-expanded={actionMenu?.itemIndex === index}
@@ -255,17 +276,17 @@ function renderImageFrame(
           disableRestoreFocus
           slotProps={{
             list: {
-              "aria-label": `图片 ${index + 1} 操作菜单`
+              "aria-label": `${mediaLabel} ${index + 1} 操作菜单`
             }
           }}
           anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
           transformOrigin={{ vertical: "top", horizontal: "right" }}
         >
-          <MenuItem aria-label={`复制图片链接 ${index + 1}`} onClick={() => copyImageLink(item, index)}>
+          <MenuItem aria-label={`复制${mediaLabel}链接 ${index + 1}`} onClick={() => copyImageLink(item, index)}>
             <Copy size={14} />
             复制链接
           </MenuItem>
-          <MenuItem aria-label={`引用图片 ${index + 1}`} onClick={() => quoteImage(item, index)}>
+          <MenuItem aria-label={`引用${mediaLabel} ${index + 1}`} onClick={() => quoteImage(item, index)}>
             <Quote size={14} />
             引用
           </MenuItem>
@@ -274,14 +295,14 @@ function renderImageFrame(
             href={item.url}
             target="_blank"
             rel="noreferrer"
-            aria-label={`打开原图 ${index + 1}`}
+            aria-label={isVideo ? `打开原视频 ${index + 1}` : `打开原图 ${index + 1}`}
             onClick={() => {
               closeImageMenu();
               emitImageAction("open_original", item, index);
             }}
           >
             <ExternalLink size={14} />
-            打开原图
+            {isVideo ? "打开原视频" : "打开原图"}
           </MenuItem>
         </Menu>
       </div>
@@ -289,8 +310,19 @@ function renderImageFrame(
   );
 }
 
-function fitWithinBox(width?: number, height?: number) {
+function isVideoItem(item: MessageImageGalleryItem) {
+  return item.mime?.startsWith("video/") || item.trace.toolName === "generate_video";
+}
+
+function fitWithinBox(width?: number, height?: number, preferVideoRatio = false) {
   if (!width || !height || width <= 0 || height <= 0) {
+    if (preferVideoRatio) {
+      return {
+        width: MAX_IMAGE_TILE_SIZE,
+        height: Math.round((MAX_IMAGE_TILE_SIZE * 9) / 16)
+      };
+    }
+
     return {
       width: MAX_IMAGE_TILE_SIZE,
       height: MAX_IMAGE_TILE_SIZE
