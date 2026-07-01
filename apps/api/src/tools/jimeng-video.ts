@@ -150,6 +150,8 @@ async function tryReadLocalUploadAsBase64(imageUrl: string, uploadDirectory?: st
     return undefined;
   }
 
+  // 视频首尾帧也可能来自本地上传目录。第三方服务拉不到 localhost，
+  // 所以本地 /uploads 图片会在服务端安全读取后改用 base64 提交。
   const parsedUrl = new URL(imageUrl);
 
   if (!isLocalhost(parsedUrl.hostname) || !parsedUrl.pathname.startsWith("/uploads/")) {
@@ -187,6 +189,8 @@ function selectVideoMode(
     firstLastFrameReqKey: string;
   }
 ): VideoMode {
+  // 同一个 generate_video 工具覆盖三种上游能力：
+  // 纯文生视频、首帧图生视频、首尾帧过渡视频。这里根据用户是否带图选择 reqKey。
   if (args.firstFrameImageUrl && args.lastFrameImageUrl) {
     return {
       type: "first_last_frame",
@@ -220,6 +224,7 @@ async function toSubmitBody(args: VideoArgs, mode: VideoMode, uploadDirectory?: 
 
   const frameUrls = [args.firstFrameImageUrl, args.lastFrameImageUrl].filter(Boolean) as string[];
 
+  // 图生视频不传 aspect_ratio，让上游优先按首帧/首尾帧图片比例生成。
   return {
     req_key: mode.reqKey,
     prompt: args.prompt,
@@ -307,6 +312,8 @@ function signRequest(input: {
   service: string;
   date: Date;
 }) {
+  // 火山签名流程和图片工具一致：请求体 hash + canonical request + AK/SK 派生签名。
+  // 放在工具内部是因为它只服务火山视觉接口，不污染通用 ToolExecutor。
   const amzDate = toAmzDate(input.date);
   const dateStamp = toDateStamp(input.date);
   const payloadHash = sha256Hex(input.bodyText);
@@ -355,6 +362,8 @@ async function requestVolcengine(input: {
   fetchImpl: typeof fetch;
   now: () => Date;
 }) {
+  // 这一层把 fetch、签名、响应格式校验、权限错误提示统一封装。
+  // generateVideo 只负责业务流程：提交任务、轮询状态、拿最终视频 URL。
   const credentials = ensureCredentials(input.options);
   const url = toRequestUrl(input.endpoint, input.action, input.version);
   const bodyText = JSON.stringify(input.body);
@@ -447,6 +456,8 @@ export function createJimengVideoTool(options: JimengVideoToolOptions): Register
     mode: VideoMode,
     context: ToolExecutionContext
   ): Promise<{ taskId: string; videoUrl: string }> => {
+    // 即梦视频生成也是异步任务：提交后只拿 taskId，真正的视频 URL 要轮询获取。
+    // 轮询过程使用 context.signal，所以用户取消 run 时这里会尽快停止等待。
     const submitPayload = await request("CVSync2AsyncSubmitTask", await toSubmitBody(args, mode, options.uploadDirectory), context);
     ensureSuccessfulResponse(submitPayload, "提交任务");
 

@@ -60,10 +60,14 @@ export class AgentSummaryService {
     const uncoveredMessages = sliceAfterCoveredMessage(messages, input.previousSummary?.coveredMessageId);
     const refreshPlan = this.planRefresh(uncoveredMessages.length);
 
+    // 摘要刷新是“够多再做”，不是每轮都调用模型。
+    // 先看上一份摘要之后新增了多少可总结消息，再决定是否压缩旧上下文。
     if (!refreshPlan) {
       return undefined;
     }
 
+    // 只有消息条数多还不够，内容太短时压缩收益很低。
+    // 这个字符阈值能避免频繁花模型费用生成价值不大的摘要。
     if (!this.hasEnoughContextRefreshContent(uncoveredMessages)) {
       return undefined;
     }
@@ -79,6 +83,8 @@ export class AgentSummaryService {
       return undefined;
     }
 
+    // keepRecentMessages 是“保留最近原文”的数量。
+    // 被压缩进摘要的是更早的部分，最近几轮保留原文可以减少摘要丢细节带来的误解。
     const keepRecentMessages = Math.max(1, this.keepRecentMessages);
     const messagesToSummarizeLimit = Math.max(0, uncoveredMessageCount - keepRecentMessages);
 
@@ -120,6 +126,8 @@ export class AgentSummaryService {
       return undefined;
     }
 
+    // 摘要模型不允许用工具：它只是把旧摘要 + 新消息合并成结构化 JSON。
+    // 这里的输出后面会写入 SQLite，再由 ContextBuilder 转成 system 记忆喂回主 Agent。
     const response = await this.options.provider.complete({
       tools: [],
       signal: input.signal,
@@ -172,6 +180,8 @@ function toContextLikeMessages(messages: AgentMessageRecord[]): ContextLikeMessa
 function toContextLikeMessage(message: AgentMessageRecord): ContextLikeMessage | undefined {
   const content = partsToLlmText(message.parts);
 
+  // 摘要服务和真正对话上下文使用同一套“可被 LLM 理解的文本投影”。
+  // 媒体、失败、取消都会被转成短文本，避免摘要模型看到前端专用的结构化对象。
   if (message.role === "user" && content) {
     return { id: message.id, role: "user", content, createdAt: message.createdAt };
   }
@@ -249,6 +259,8 @@ function parseSummaryJson(content: string): unknown {
   const fencedMatch = trimmedContent.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   const jsonText = fencedMatch?.[1] ?? trimmedContent;
 
+  // 虽然提示要求“只输出 JSON”，兼容模型偶尔包一层 ```json。
+  // 解析失败直接抛出，让调用方把摘要步骤标记失败；主回答流程不应该吃到半坏摘要。
   return JSON.parse(jsonText) as unknown;
 }
 

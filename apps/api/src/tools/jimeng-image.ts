@@ -270,6 +270,8 @@ async function tryReadLocalUploadAsBase64(imageUrl: string, uploadDirectory?: st
     return undefined;
   }
 
+  // 当前 demo 的上传图片可能还是 localhost /uploads 地址，第三方服务访问不到。
+  // 所以服务端在确认路径安全后，把本地文件转成 base64 直接提交给火山。
   const parsedUrl = new URL(imageUrl);
 
   if (!isLocalhost(parsedUrl.hostname) || !parsedUrl.pathname.startsWith("/uploads/")) {
@@ -490,6 +492,8 @@ function signRequest(input: {
   service: string;
   date: Date;
 }) {
+  // 火山接口使用 HMAC-SHA256 签名。签名的关键不是“加密 body”，
+  // 而是把 method/path/query/headers/body hash 组成 canonical request，再用 AK/SK 证明请求确实由我们发出。
   const xDate = toAmzDate(input.date);
   const shortDate = toShortDate(xDate);
   const contentHash = hashSha256Hex(input.bodyText);
@@ -540,6 +544,8 @@ async function requestVolcengine(input: {
   serviceLabel: string;
   permissionHint: string;
 }) {
+  // 所有火山请求都从这里出去：补签名、带 AbortSignal、解析统一响应、把上游错误翻译成 AppError。
+  // 工具主流程只关心“提交任务/查结果”，不用重复写 HTTP 和鉴权细节。
   const credentials = ensureCredentials(input.options, input.toolLabel);
   const url = toRequestUrl(input.endpoint, input.action, input.version);
   const bodyText = JSON.stringify(input.body);
@@ -646,6 +652,8 @@ export function createJimengImageTool(options: JimengImageToolOptions): Register
   };
 
   const generateImageItem = async (item: ImageItemArgs, context: ToolExecutionContext): Promise<GeneratedImagePayload> => {
+    // 火山生图是 submit + poll 模式：
+    // 第一步提交任务拿 taskId，第二步按间隔查询，直到 done/异常/超时。
     const submitPayload = await request("CVSync2AsyncSubmitTask", toSubmitBody(item, reqKey), context);
     ensureSuccessfulResponse(submitPayload, "提交任务");
 
@@ -676,6 +684,7 @@ export function createJimengImageTool(options: JimengImageToolOptions): Register
         };
       }
 
+      // not_found/expired 不是“继续等就会好”的状态，直接失败能让上层尽快给用户反馈。
       if (status === "not_found" || status === "expired") {
         throw new AppError("TOOL_EXECUTION_ERROR", `火山通用文生图任务状态异常：${status}`, 502);
       }
@@ -784,6 +793,8 @@ export function createJimengImageTool(options: JimengImageToolOptions): Register
       let nextIndex = 0;
 
       const runNextItem = async () => {
+        // 多个 worker 共享 nextIndex，实现一个很轻量的并发队列。
+        // JS 单线程下这里不会出现两个 worker 抢到同一个 index 的问题。
         while (nextIndex < imageItems.length) {
           if (context.signal?.aborted) {
             return;
@@ -835,6 +846,8 @@ export function createJimengImageTool(options: JimengImageToolOptions): Register
         (item): item is Extract<JimengImageBatchItem, { status: "success" }> => item.status === "success"
       );
       const failed = items.length - succeededItems.length;
+      // 批量工具不因为单项失败就整体 throw。把 partial_failed 返回给 Agent，
+      // 前端可以展示成功图片，LLM 也能基于 llmContent 给用户简短说明失败项。
       const result: JimengImageBatchResult = {
         provider: "volcengine_seedream",
         reqKey,
@@ -886,6 +899,8 @@ export function createJimengImageEditTool(options: JimengImageEditToolOptions): 
   };
 
   const editImage = async (args: EditImageArgs, context: ToolExecutionContext): Promise<GeneratedImagePayload> => {
+    // 图生图和文生图共用火山的异步任务模型，只是提交 body 多了原图输入。
+    // 本地上传图会在 toEditSubmitBody 里转换成 base64，公网图则直接传 image_urls。
     const submitPayload = await request(
       "CVSync2AsyncSubmitTask",
       await toEditSubmitBody(args, reqKey, options.uploadDirectory),

@@ -58,6 +58,8 @@ export const PartComposer = forwardRef<PartComposerHandle, PartComposerProps>(fu
   onUploadImageRef.current = onUploadImage;
   disabledRef.current = disabled;
 
+  // 回调和 disabled 都放到 ref 里，是为了让 ProseMirror 插件始终读到最新值。
+  // EditorView 只初始化一次，如果直接闭包捕获 props，很容易拿到旧的 onSubmit/onUploadImage。
   useImperativeHandle(ref, () => ({
     openImagePicker: () => {
       pendingReplacementRangeRef.current = undefined;
@@ -87,6 +89,8 @@ export const PartComposer = forwardRef<PartComposerHandle, PartComposerProps>(fu
         class: "part-composer-editor"
       },
       dispatchTransaction(transaction) {
+        // ProseMirror 自己维护 doc/selection；React 只保存序列化后的 parts。
+        // 每个事务先更新 EditorView，再把 doc 转回 MessagePart 通知外层。
         const nextState = view.state.apply(transaction);
         view.updateState(nextState);
         updateEmptyClass(view);
@@ -113,6 +117,8 @@ export const PartComposer = forwardRef<PartComposerHandle, PartComposerProps>(fu
     const currentParts = JSON.stringify(docToParts(view.state.doc));
     const nextParts = JSON.stringify(stripRuntimeFields(parts));
 
+    // 外层可能因为“引用图片/选择建议/发送后清空”主动改 parts。
+    // 如果编辑器内容已经一致，就不要重建 EditorState，避免光标跳到末尾。
     if (currentParts === nextParts) {
       return;
     }
@@ -180,6 +186,8 @@ function createEditorState(input: {
 }) {
   const doc = partsToDoc(input.parts);
 
+  // 一个消息编辑器里同时混有普通文本和媒体 atom。
+  // 文本走 ProseMirror 默认编辑能力，媒体通过自定义插件处理上传、删除、选择和方向键导航。
   return EditorState.create({
     schema: partSchema,
     doc,
@@ -292,6 +300,8 @@ async function uploadAndInsertImage(
     return;
   }
 
+  // 点击已有图片会记录 replacementRange，此时上传完成后替换旧媒体；
+  // 直接粘贴/拖拽/选择文件则插入到当前光标位置。
   const node = partSchema.nodes.media_part.create({
     mime: part.mime ?? "",
     url: part.url ?? "",
@@ -360,6 +370,8 @@ function moveSelectionToEndWhenAtDocumentStart(view: EditorView) {
 }
 
 function findMediaReplacementRange(view: EditorView, element: HTMLElement): ReplacementRange | undefined {
+  // ProseMirror 的 posAtDOM 对 atom 节点有时会落在节点前后边界。
+  // 同时检查当前位置和前一位，能稳定找到 media_part 的真实范围。
   const candidatePositions = [view.posAtDOM(element, 0), Math.max(0, view.posAtDOM(element, 0) - 1)];
 
   for (const from of candidatePositions) {

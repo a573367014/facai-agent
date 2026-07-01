@@ -1,6 +1,6 @@
 # facai-agent
 
-一个基于 Node.js Fastify 和 React 的工具调用型 Agent 本地开发版。当前默认使用 SQLite 保存会话、消息、工具调用、资源索引和短期事件日志；运行中 assistant draft 默认走内存，也可以通过配置切到 Redis。消息渲染以 `message.parts` 快照为准，`agent_resources` 负责资源索引、审计和聚合查询；工具生成的图片 / 视频会先转储到本地 uploads，避免供应商临时 URL 短时间失效。架构边界按后续替换 MySQL / Redis / OSS 的产品化方向设计。
+一个基于 Node.js Fastify 和 React 的工具调用型 Agent 本地开发版。当前使用 SQLite 保存会话、消息、工具调用、资源索引和短期事件日志；Redis 负责运行时协调、事件广播、取消标记、执行锁和 BullMQ run 队列。消息渲染以 `message.parts` 快照为准，`agent_resources` 负责资源索引、审计和聚合查询；工具生成的图片 / 视频会先转储到本地 uploads，避免供应商临时 URL 短时间失效。架构边界按后续替换 MySQL / OSS 的产品化方向设计。
 
 ## 结构
 
@@ -9,60 +9,19 @@
 
 ## 环境变量
 
-复制 `.env.example` 为 `.env`，并填写：
+复制 `.env.example` 为 `.env`，日常只需要关注这些配置：
 
-- `PORT`：API 服务端口，默认 `4001`
-- `HOST`：API 监听地址，默认 `0.0.0.0`
-- `CORS_ORIGINS`：允许跨域访问的 Origin，逗号分隔；留空时允许本地和局域网开发地址
-- `OPENAI_API_KEY`
-- `OPENAI_BASE_URL`：OpenAI 兼容接口地址，默认 `https://api.openai.com/v1`
-- `OPENAI_MODEL`
-- `AGENT_MAX_ITERATIONS`：单次 Agent 最多循环调用 LLM / 工具的轮数，默认 `4`
-- `AGENT_CONTEXT_MAX_MESSAGES`：新消息最多携带多少条历史上下文，默认 `12`
-- `AGENT_CONTEXT_MAX_HISTORY_CHARS`：历史上下文的近似字符预算，默认 `12000`
-- `AGENT_SUMMARY_TRIGGER_MESSAGES`：会话可投影消息超过该数量后触发结构化摘要，默认 `16`；设为 `0` 可关闭摘要更新
-- `AGENT_SUMMARY_KEEP_RECENT_MESSAGES`：生成摘要后仍保留的最近原文消息数，默认 `8`
-- `AGENT_SUMMARY_TRIGGER_CHARS`：待压缩旧消息的有效文本量达到该字符数才真正压缩，默认 `2000`；设为 `0` 表示只按消息条数判断
-- `AGENT_TOOL_TIMEOUT_MS`：工具调用超时时间，默认 `10000`
-- `AGENT_EVENT_RETENTION_DAYS`：事件时间线保留天数，默认 `3`
-- `AGENT_EVENT_CLEANUP_HOUR`：每天几点清理过期事件，使用服务本地时区，默认 `3`
-- `AGENT_EVENT_CLEANUP_BATCH_SIZE`：每轮在统一事件表中分别最多删除多少条 message 事件和 run 事件，默认 `2000`
-- `AGENT_EVENT_CLEANUP_MAX_BATCHES`：每次清理最多执行多少轮，默认 `20`
-- `AGENT_PUBLIC_BASE_URL`：后端生成资源 URL 时使用的公开 API 地址，默认按当前 API 地址推导
-- `AGENT_UPLOAD_DIR`：用户上传和工具资源转储目录，默认 `./data/uploads`
-- `AGENT_TOOL_RESOURCE_MAX_BYTES`：工具生成资源转储的最大文件大小，默认 `209715200`
-- `AGENT_TOOL_RESOURCE_DOWNLOAD_TIMEOUT_MS`：工具生成资源下载超时时间，默认 `60000`
-- `AGENT_RUNNING_STATE_STORE`：运行中消息 draft 存储，`memory` 或 `redis`，默认 `memory`
-- `REDIS_URL`：Redis 连接地址，仅 `AGENT_RUNNING_STATE_STORE=redis` 时使用，默认 `redis://localhost:6379`
-- `AGENT_RUNNING_STATE_TTL_SECONDS`：运行中 draft 的 Redis TTL，默认 `7200`
-- `AGENT_RUNNING_STATE_REDIS_KEY_PREFIX`：运行中 draft 的 Redis key 前缀，默认 `agent`
-- `AGENT_ALLOWED_TOOLS`：允许暴露和执行的工具名，逗号分隔；留空表示允许全部已注册工具
-- `TAVILY_API_KEY`：Tavily Search API Key；配置后会启用 `web_search` 工具
-- `SEARCH_MAX_RESULTS`：默认搜索结果数量，默认 `5`，范围 `1-10`
-- `VOLCENGINE_ACCESS_KEY_ID`：火山引擎 Access Key ID；和 SK 同时配置后会启用 `generate_image` 和 `edit_image`
-- `VOLCENGINE_SECRET_ACCESS_KEY`：火山引擎 Secret Access Key；只放在本地 `.env`，不要提交
-- `VOLCENGINE_IMAGE_ENDPOINT`：火山视觉 OpenAPI 地址，默认 `https://visual.volcengineapi.com`
-- `VOLCENGINE_IMAGE_REGION`：签名 Region，默认 `cn-north-1`
-- `VOLCENGINE_IMAGE_SERVICE`：签名 Service，默认 `cv`
-- `VOLCENGINE_IMAGE_REQ_KEY`：Seedream 通用3.0 文生图服务标识，默认 `high_aes_general_v30l_zt2i`
-- `VOLCENGINE_IMAGE_EDIT_VERSION`：SeedEdit3.0 OpenAPI 版本，默认 `2022-08-31`
-- `VOLCENGINE_IMAGE_EDIT_REQ_KEY`：SeedEdit3.0 图像编辑服务标识，默认 `seededit_v3.0`
-- `VOLCENGINE_IMAGE_POLL_INTERVAL_MS`：轮询间隔，默认 `1500`
-- `VOLCENGINE_IMAGE_MAX_POLL_ATTEMPTS`：最大轮询次数，默认 `40`
-- `VOLCENGINE_IMAGE_TOOL_TIMEOUT_MS`：生图工具独立超时时间，默认 `90000`
-- `VOLCENGINE_IMAGE_BATCH_CONCURRENCY`：批量生图内部并发数，默认 `2`，范围 `1-5`
-- `VOLCENGINE_VIDEO_ENDPOINT`：火山视觉视频 OpenAPI 地址，默认 `https://visual.volcengineapi.com`
-- `VOLCENGINE_VIDEO_REGION`：视频工具签名 Region，默认 `cn-north-1`
-- `VOLCENGINE_VIDEO_SERVICE`：视频工具签名 Service，默认 `cv`
-- `VOLCENGINE_VIDEO_VERSION`：视频工具 OpenAPI 版本，默认 `2022-08-31`
-- `VOLCENGINE_VIDEO_REQ_KEY`：即梦文生视频服务标识，默认 `jimeng_t2v_v30`
-- `VOLCENGINE_VIDEO_FIRST_FRAME_REQ_KEY`：即梦首帧图生视频服务标识，默认 `jimeng_i2v_first_v30`
-- `VOLCENGINE_VIDEO_FIRST_LAST_FRAME_REQ_KEY`：即梦首尾帧图生视频服务标识，默认 `jimeng_i2v_first_tail_v30`
-- `VOLCENGINE_VIDEO_POLL_INTERVAL_MS`：视频任务轮询间隔，默认 `1500`
-- `VOLCENGINE_VIDEO_MAX_POLL_ATTEMPTS`：视频任务最大轮询次数，默认 `80`
-- `VOLCENGINE_VIDEO_TOOL_TIMEOUT_MS`：视频工具独立超时时间，默认 `600000`
-- `AGENT_SQLITE_PATH`：SQLite 文件路径，默认 `./data/agent.sqlite`
-- `VITE_API_BASE_URL`：前端 API 地址；留空时自动按当前 Web host 推导到 `4001`
+- `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`：模型接口配置。
+- `REDIS_URL`：Redis 连接地址，默认 `redis://localhost:6379`。产品化运行时固定依赖 Redis，不再提供切换底层实现的开发态开关。
+- `AGENT_WORKER_CONCURRENCY`：Worker 同时执行 run 的数量，默认 `2`。
+- `AGENT_SQLITE_PATH`：SQLite 文件路径，默认 `./data/agent.sqlite`。
+- `AGENT_UPLOAD_DIR`：用户上传和工具资源转储目录，默认 `./data/uploads`。
+- `TAVILY_API_KEY`：配置后启用 `web_search` 工具。
+- `VOLCENGINE_ACCESS_KEY_ID`、`VOLCENGINE_SECRET_ACCESS_KEY`：同时配置后启用图片 / 视频生成工具。
+- `AGENT_ALLOWED_TOOLS`：允许暴露和执行的工具名，逗号分隔；留空表示允许全部已注册工具。
+- `VITE_API_BASE_URL`：前端 API 地址；留空时自动按当前 Web host 推导到 `4001`。
+
+Agent 上下文窗口、摘要触发阈值、事件清理批大小、Redis TTL、队列名和工具超时都有代码默认值；即梦供应商 endpoint / req key 这类稳定参数固定在工具默认配置里，后续确实需要切换时再单独开放配置层。
 
 ## 安装
 
@@ -72,22 +31,24 @@ npm install
 
 ## 开发
 
-同时启动 API 和 Web：
+先启动 Redis：
+
+```bash
+docker compose up -d redis
+```
+
+同时启动 API、Web 和 Worker：
 
 ```bash
 npm run dev
 ```
 
-也可以单独启动 API：
+也可以按需单独启动：
 
 ```bash
 npm run dev:api
-```
-
-单独启动 Web：
-
-```bash
 npm run dev:web
+npm run dev:worker
 ```
 
 访问：
@@ -124,6 +85,33 @@ npm run dev:web
 - 新增抽象时，需要在抽象入口处说明职责分工，例如目录、执行器、存储、协调器分别负责什么。
 - 涉及流式、持久化、工具执行、上下文管理等容易误解的逻辑时，优先补注释，方便后续回看和继续演进。
 
+## Redis Runtime 链路阅读
+
+当前执行链路已经收口成 `run`，不再存在“直接启动 message 执行”的并行入口。`message` 仍然是持久化内容模型：用户输入、助手回答、系统压缩提示都会落成 message；但一次可取消、可订阅、可由 Worker 执行的任务单位是 run。
+
+一次用户提交的主链路：
+
+1. 前端调用 `POST /agents/runs` 或 `POST /agents/sessions/:sessionId/runs`。
+2. API 在 SQLite 创建 user message、assistant running message 和 run。
+3. API 在 Redis 初始化 running draft，用来保存生成中的 assistant parts。
+4. API 把 run job 投递到 BullMQ 队列，HTTP 请求立即返回 run 信息。
+5. 前端连接 `GET /agents/runs/:runId/events`，API 先返回当前 assistant snapshot，再订阅 Redis Pub/Sub。
+6. Worker 从 BullMQ 取 job，通过 run lock 抢占执行权，避免同一个 run 被多个 Worker 同时执行。
+7. Worker 调用 LLM 和工具；文本 delta 写 Redis running draft，关键事件写 SQLite run events，同时通过 Redis Pub/Sub 推给 API。
+8. 用户取消时，API 写 Redis cancel key 并中断本进程内 controller；Worker 每隔一段执行点检查 cancel key。
+9. Worker 得到最终答案后，把 assistant message 最终 parts 写回 SQLite，删除 Redis running draft，写入 `run_completed`。
+10. API SSE 收到终态事件后结束连接；刷新页面时仍可从 SQLite run events 和 Redis/SQLite snapshot 恢复视图。
+
+这几个 Redis 组件分别只管短期运行态：
+
+- `RedisRunningMessageStateStore`：保存运行中 assistant draft。原因是文本 delta 很频繁，不应该每个字都写 SQLite。
+- `RedisAgentEventBus`：用 run channel 做跨进程事件扇出。Worker 不直接连前端，只发布事件给 API。
+- `BullMqAgentRunQueue`：把“要执行哪个 run”交给 Worker。job payload 只放 id，真实上下文仍从 SQLite 读取。
+- `RedisAgentCancellationStore`：保存取消标记，让 API 和 Worker 即使不在同一进程也能协作取消。
+- `RedisAgentRunLock`：给 run 加执行锁，降低 BullMQ 重复投递或 Worker 重启导致的重复执行风险。
+
+SQLite 仍然是最终可信的数据源：session、message、run、tool calls、resources、关键事件都在 SQLite；Redis 里的内容都可以过期或丢失，最多影响运行中的实时体验，不应该成为最终审计依据。
+
 ## 演进路线 / TODO
 
 当前项目已经具备 Agent 本地开发版的基础能力：Fastify API、React 工作台、SSE 流式事件、session/message、SQLite 持久化、运行中 draft、资源索引表、工具调用表、事件压缩、断线恢复、上下文续聊、图片 / 视频生成、资源转储和图片引用。后续建议按产品化顺序演进，优先把 Agent Runtime、数据层和资源体系打稳。
@@ -140,9 +128,9 @@ npm run dev:web
 
 ### 1. Agent Runtime 稳定化
 
-目标：让一次 assistant message / run 的生命周期稳定可恢复，适合后续多实例部署。
+目标：让一次 run 的生命周期稳定可恢复，适合后续多实例部署。
 
-- [x] 支持取消生成：`POST /agents/messages/:messageId/cancel`。
+- [x] 支持取消生成：`POST /agents/runs/:runId/cancel`。
 - [x] 后端引入 `AbortController`，让 LLM 请求和工具执行都能响应取消。
 - [x] 运行中刷新页面后自动恢复订阅，并先返回 `message.snapshot`。
 - [x] 抽出 `RunningMessageStateStore`，运行中 full draft 不再每个 delta 写入持久化 message。

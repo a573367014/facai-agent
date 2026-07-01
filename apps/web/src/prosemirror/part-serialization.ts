@@ -6,10 +6,14 @@ import { partSchema } from "./part-schema";
 export type RuntimePart = MessagePart | (MessagePart & Record<`$${string}`, unknown>);
 
 export function stripRuntimeFields(parts: RuntimePart[]): MessagePart[] {
+  // RuntimePart 允许前端临时挂 $xxx 字段，但发请求/比较内容时必须去掉。
+  // 后端只认识稳定的 MessagePart，避免 UI 状态污染持久化数据。
   return parts.map((part) => Object.fromEntries(Object.entries(part).filter(([key]) => !key.startsWith("$"))) as MessagePart);
 }
 
 export function partsToDoc(parts: RuntimePart[]): ProseMirrorNode {
+  // MessagePart 是业务数据，ProseMirror doc 是编辑器内部数据。
+  // 文本会拆成 inline text/hard_break，媒体会变成不可拆分的 media_part atom。
   const inlineNodes = parts.flatMap((part) => {
     if (part.type === "text") {
       return textToInlineNodes(part.value);
@@ -36,6 +40,8 @@ export function docToParts(doc: ProseMirrorNode): MessagePart[] {
   let textBuffer = "";
 
   function flushText() {
+    // 连续文本先攒在 textBuffer 里，遇到媒体再 flush。
+    // 这样 “文字 + 图片 + 文字” 会变成三个 part，而不是每个字符一个 part。
     if (textBuffer) {
       parts.push({ type: "text", value: textBuffer });
       textBuffer = "";
@@ -80,6 +86,8 @@ export function getSelectedParts(doc: ProseMirrorNode, selection: Selection): Me
     return undefined;
   }
 
+  // 复制/复用用户消息时，不一定取整条消息。
+  // 这里把当前选区投影回 MessagePart，选中图片时会保留媒体结构，选中文本时保留换行。
   const parts: MessagePart[] = [];
   let textBuffer = "";
 

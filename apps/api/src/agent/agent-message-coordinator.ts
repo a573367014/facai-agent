@@ -34,6 +34,10 @@ import type {
   AgentToolCallRecord,
   StoredAgentEvent
 } from "./agent-store.js";
+import type { AgentRunJobPayload, AgentRunQueue } from "./agent-run-queue.js";
+import type { AgentEventBus } from "./agent-event-bus.js";
+import type { AgentCancellationStore } from "./agent-cancellation-store.js";
+import type { AgentRunLock } from "./agent-run-lock.js";
 
 const DEFAULT_SESSION_MESSAGE_LIMIT = 30;
 const DEFAULT_SESSION_PAGE_LIMIT = 30;
@@ -107,6 +111,13 @@ export interface StaleRunningCleanupResult {
   processSteps: number;
 }
 
+export interface AgentMessageCoordinatorOptions {
+  runQueue?: AgentRunQueue;
+  eventBus?: AgentEventBus;
+  cancellationStore?: AgentCancellationStore;
+  runLock?: AgentRunLock;
+}
+
 function toErrorDetail(error: unknown): AgentErrorDetail {
   if (error instanceof AppError) {
     return { code: error.code, message: error.message };
@@ -127,9 +138,7 @@ function now() {
 }
 
 export class AgentMessageCoordinator {
-  private readonly runningMessages = new Map<string, AbortController>();
   private readonly runningRuns = new Map<string, AbortController>();
-  private readonly runningMessageExecutions = new Map<string, Promise<void>>();
   private readonly runningRunExecutions = new Map<string, Promise<void>>();
 
   constructor(
@@ -138,7 +147,8 @@ export class AgentMessageCoordinator {
     private readonly contextBuilder = new AgentContextBuilder(),
     private readonly summaryService?: AgentSummaryService,
     private readonly runningStateStore: RunningMessageStateStore = new InMemoryRunningMessageStateStore(),
-    private readonly resourceStorage: ToolResourceStorage = new PassthroughToolResourceStorage()
+    private readonly resourceStorage: ToolResourceStorage = new PassthroughToolResourceStorage(),
+    private readonly options: AgentMessageCoordinatorOptions = {}
   ) {}
 
   createSession(title?: string) {
@@ -166,7 +176,6 @@ export class AgentMessageCoordinator {
       message: reason
     };
     const result = this.createEmptyCleanupResult();
-    const cleanedMessageIds = new Set<string>();
 
     for (const run of this.getAllRunningRuns()) {
       if (this.runningRuns.has(run.id)) {
@@ -175,23 +184,6 @@ export class AgentMessageCoordinator {
 
       const runResult = await this.failInterruptedRun(run, detail);
       this.addCleanupResult(result, runResult);
-
-      if (run.systemMessageId) {
-        cleanedMessageIds.add(run.systemMessageId);
-      }
-
-      if (run.assistantMessageId) {
-        cleanedMessageIds.add(run.assistantMessageId);
-      }
-    }
-
-    for (const message of this.getAllRunningMessages()) {
-      if (cleanedMessageIds.has(message.id) || this.runningMessages.has(message.id) || this.hasRunningRunForMessage(message.id)) {
-        continue;
-      }
-
-      const messageResult = await this.failInterruptedMessage(message, undefined, detail);
-      this.addCleanupResult(result, messageResult);
     }
 
     return result;
@@ -199,21 +191,13 @@ export class AgentMessageCoordinator {
 
   async shutdown(reason = "服务关闭") {
     const runIds = [...this.runningRuns.keys()];
-    const messageIds = [...this.runningMessages.keys()];
 
     for (const runId of runIds) {
       await this.cancelRun(runId, reason);
     }
 
-    for (const messageId of messageIds) {
-      await this.cancelMessage(messageId, reason);
-    }
-
     await Promise.allSettled([
-      ...runIds.map((runId) => this.runningRunExecutions.get(runId)).filter((execution): execution is Promise<void> => Boolean(execution)),
-      ...messageIds
-        .map((messageId) => this.runningMessageExecutions.get(messageId))
-        .filter((execution): execution is Promise<void> => Boolean(execution))
+      ...runIds.map((runId) => this.runningRunExecutions.get(runId)).filter((execution): execution is Promise<void> => Boolean(execution))
     ]);
   }
 
@@ -270,49 +254,9 @@ export class AgentMessageCoordinator {
     );
   }
 
-  async startMessage(input: AgentExecutionInput & { sessionId?: string }) {
-    const userParts = input.parts?.length ? input.parts : [createTextPart(input.input)];
-    const userText = partsToLlmText(userParts);
-    const session = input.sessionId ? this.getSession(input.sessionId).session : this.store.createSession(userText.slice(0, 32));
-    const history = this.buildConversationHistory(session.id);
-    const userMessage = this.store.createMessage({
-      sessionId: session.id,
-      role: "user",
-      status: "completed",
-      parts: userParts
-    });
-    const assistantMessage = this.store.createMessage({
-      sessionId: session.id,
-      role: "assistant",
-      status: "running",
-      parts: [],
-      maxIterations: input.maxIterations
-    });
-    const controller = new AbortController();
-
-    await this.initRunningMessageState(assistantMessage);
-    this.runningMessages.set(assistantMessage.id, controller);
-    const execution = this.executeMessage(assistantMessage.id, {
-      ...input,
-      sessionId: session.id,
-      messageId: assistantMessage.id,
-      history,
-      signal: controller.signal
-    }).finally(() => {
-      this.runningMessageExecutions.delete(assistantMessage.id);
-    });
-
-    this.runningMessageExecutions.set(assistantMessage.id, execution);
-    void execution;
-
-    return {
-      session,
-      userMessage,
-      assistantMessage
-    };
-  }
-
-  startRun(input: AgentExecutionInput & { sessionId?: string }) {
+  async startRun(input: AgentExecutionInput & { sessionId?: string }) {
+    // startRun 是 API 请求的边界：这里只创建“可恢复的任务外壳”，不在请求线程里长时间跑模型。
+    // SQLite 先落 user message / run，前端马上拿到 runId；Worker 后面会用这些 id 重新读取最新状态。
     const userParts = input.parts?.length ? input.parts : [createTextPart(input.input)];
     const userText = partsToLlmText(userParts);
     const session = input.sessionId ? this.getSession(input.sessionId).session : this.store.createSession(userText.slice(0, 32));
@@ -331,7 +275,44 @@ export class AgentMessageCoordinator {
     const controller = new AbortController();
 
     this.runningRuns.set(run.id, controller);
-    this.store.appendRunEvent(run.id, { type: "session.message.created", message: userMessage }, userMessage.id);
+    this.appendRunEvent(run.id, { type: "session.message.created", message: userMessage }, userMessage.id);
+
+    if (this.options.runQueue) {
+      // queue 模式下 assistant message 也提前创建出来。这样 SSE 建连时可以立刻返回
+      // message.snapshot；生成中的 parts 则先进 runningStateStore，完成后才写回 SQLite message。
+      const assistantMessage = this.store.createMessage({
+        sessionId: session.id,
+        role: "assistant",
+        status: "running",
+        parts: [],
+        maxIterations: input.maxIterations
+      });
+      await this.initRunningMessageState(assistantMessage, run.id);
+      const queuedRun =
+        this.store.updateRun(run.id, {
+          phase: "answering",
+          assistantMessageId: assistantMessage.id
+        }) ?? run;
+
+      this.appendRunEvent(run.id, { type: "session.message.created", message: assistantMessage }, assistantMessage.id);
+      // BullMQ job payload 只传 id。真正的 parts、summary、上下文都从 SQLite 现读，
+      // 这样可以避免队列里缓存一份已经过期的对话状态。
+      await this.options.runQueue.enqueueRun({
+        runId: queuedRun.id,
+        sessionId: session.id,
+        userMessageId: userMessage.id,
+        assistantMessageId: assistantMessage.id
+      });
+      this.runningRuns.delete(run.id);
+
+      return {
+        run: queuedRun,
+        session,
+        userMessage
+      };
+    }
+
+    // 这条分支只用于测试或显式注入无 queue 的场景；产品路径会通过上面的 runQueue 交给 Worker。
     const execution = this.executeRun(run.id, {
       ...input,
       input: userText,
@@ -413,6 +394,10 @@ export class AgentMessageCoordinator {
       return { run };
     }
 
+    // cancelRun 同时处理两件事：
+    // 1. 写 Redis cancel key，让其他进程的 Worker 能看到取消；
+    // 2. abort 当前进程里的 controller，让同进程执行也能尽快停止。
+    await this.options.cancellationStore?.cancelRun(runId);
     this.runningRuns.get(runId)?.abort();
     const timestamp = now();
 
@@ -426,7 +411,7 @@ export class AgentMessageCoordinator {
             parts: [createTextPart("上下文压缩已中断")],
             completedAt: timestamp
           }) ?? systemMessage;
-        this.store.appendRunEvent(runId, { type: "session.message.updated", message: cancelledSystemMessage }, cancelledSystemMessage.id);
+        this.appendRunEvent(runId, { type: "session.message.updated", message: cancelledSystemMessage }, cancelledSystemMessage.id);
       }
     }
 
@@ -436,19 +421,23 @@ export class AgentMessageCoordinator {
       if (assistantMessage?.status === "running") {
         const draftMessage = await this.withRunningDraft(assistantMessage);
         this.completeRunningProcessSteps(assistantMessage.id, runId, "cancelled");
-        this.store.appendRunEvent(runId, {
-          type: "agent_state",
-          iteration: 0,
-          state: "done",
-          label: "已中断"
-        }, assistantMessage.id);
+        this.appendRunEvent(
+          runId,
+          {
+            type: "agent_state",
+            iteration: 0,
+            state: "done",
+            label: "已中断"
+          },
+          assistantMessage.id
+        );
         const cancelledAssistantMessage =
           this.store.updateMessage(assistantMessage.id, {
             status: "cancelled",
             parts: draftMessage.parts,
             completedAt: timestamp
           }) ?? assistantMessage;
-        this.store.appendRunEvent(
+        this.appendRunEvent(
           runId,
           { type: "session.message.updated", message: cancelledAssistantMessage },
           cancelledAssistantMessage.id
@@ -457,7 +446,7 @@ export class AgentMessageCoordinator {
       }
     }
 
-    this.store.appendRunEvent(runId, { type: "cancelled", reason }, run.assistantMessageId ?? run.systemMessageId);
+    this.appendRunEvent(runId, { type: "cancelled", reason }, run.assistantMessageId ?? run.systemMessageId);
     const cancelledRun =
       this.store.updateRun(runId, {
         status: "cancelled",
@@ -476,6 +465,55 @@ export class AgentMessageCoordinator {
       run,
       events: this.store.getRunEvents(runId)
     };
+  }
+
+  async executeQueuedRun(payload: AgentRunJobPayload) {
+    // Worker 的入口。这里不能信任 BullMQ job 一定只投递一次，所以先看 SQLite run 状态，
+    // 再抢 Redis run lock。SQLite 状态机是最终防线，Redis lock 是降低重复执行概率。
+    const run = this.ensureRun(payload.runId);
+
+    if (run.status !== "running") {
+      return this.getRun(run.id);
+    }
+
+    if (await this.options.cancellationStore?.isRunCancelled(run.id)) {
+      await this.cancelRun(run.id);
+      return this.getRun(run.id);
+    }
+
+    const lockLease = await this.options.runLock?.acquire(run.id);
+
+    if (this.options.runLock && !lockLease) {
+      // 另一个 Worker 已经拿到锁时直接跳过。队列可以重投，但同一时刻只应该有一个执行者。
+      return this.getRun(run.id);
+    }
+
+    const userMessage = this.ensureMessage(run.userMessageId);
+    const assistantMessageId = run.assistantMessageId ?? payload.assistantMessageId;
+    const assistantMessage = this.ensureAssistantMessage(assistantMessageId);
+    const controller = new AbortController();
+
+    try {
+      this.runningRuns.set(run.id, controller);
+      await this.executeRun(
+        run.id,
+        {
+          input: partsToLlmText(userMessage.parts),
+          parts: userMessage.parts,
+          maxIterations: assistantMessage.maxIterations,
+          sessionId: run.sessionId,
+          signal: controller.signal
+        },
+        {
+          assistantMessageId
+        }
+      );
+    } finally {
+      // lock 带 TTL 是崩溃兜底，正常路径仍要主动释放，减少下一次重试等待时间。
+      await lockLease?.release();
+    }
+
+    return this.getRun(run.id);
   }
 
   getMessageDebugEvents(messageId: string) {
@@ -498,41 +536,47 @@ export class AgentMessageCoordinator {
     return this.store.getRunEvents(runId, after);
   }
 
-  subscribeRun(runId: string, listener: AgentEventListener) {
+  async subscribeRun(runId: string, listener: AgentEventListener) {
     this.ensureRun(runId);
-    return this.store.subscribeRun(runId, listener);
+    // 本进程 store.subscribeRun 能接到当前 API 进程写入的事件；
+    // eventBus.subscribeRun 能接到 Worker 进程通过 Redis Pub/Sub 发布的事件。
+    // SSE 同时订阅两边，才兼容测试、单进程和多进程部署。
+    const unsubscribeStore = this.store.subscribeRun(runId, listener);
+    const unsubscribeEventBus = await this.options.eventBus?.subscribeRun(runId, listener);
+
+    return async () => {
+      unsubscribeStore();
+      await unsubscribeEventBus?.();
+    };
   }
 
-  async cancelMessage(messageId: string, reason = "用户中断") {
-    const message = this.ensureAssistantMessage(messageId);
+  private createRunExecutionGuard(runId: string, signal?: AbortSignal) {
+    let lastCheckedAt = 0;
 
-    if (message.status !== "running") {
-      return { message };
-    }
+    return {
+      ensureActive: async (options: { force?: boolean } = {}) => {
+        if (signal?.aborted) {
+          throw new DOMException("Aborted", "AbortError");
+        }
 
-    this.runningMessages.get(messageId)?.abort();
-    this.completeRunningProcessSteps(messageId, undefined, "cancelled");
-    this.store.appendEvent(messageId, {
-      type: "agent_state",
-      iteration: 0,
-      state: "done",
-      label: "已中断"
-    });
-    this.store.appendEvent(messageId, {
-      type: "cancelled",
-      reason
-    });
-    const draftMessage = await this.withRunningDraft(message);
-    const cancelledMessage =
-      this.store.updateMessage(messageId, {
-        status: "cancelled",
-        parts: draftMessage.parts,
-        completedAt: now()
-      }) ?? message;
-    this.runningMessages.delete(messageId);
-    await this.runningStateStore.remove(messageId);
+        const nowMs = Date.now();
+        if (!options.force && nowMs - lastCheckedAt < 500) {
+          return;
+        }
 
-    return { message: cancelledMessage };
+        lastCheckedAt = nowMs;
+        const run = this.store.getRun(runId);
+
+        if (!run || run.status !== "running") {
+          throw new DOMException("Aborted", "AbortError");
+        }
+
+        if (await this.options.cancellationStore?.isRunCancelled(runId)) {
+          await this.cancelRun(runId);
+          throw new DOMException("Aborted", "AbortError");
+        }
+      }
+    };
   }
 
   getMessage(messageId: string) {
@@ -558,21 +602,17 @@ export class AgentMessageCoordinator {
     };
   }
 
-  getEvents(messageId: string, after = 0) {
-    this.ensureAssistantMessage(messageId);
-    return this.store.getEvents(messageId, after);
-  }
-
-  subscribe(messageId: string, listener: AgentEventListener) {
-    this.ensureAssistantMessage(messageId);
-    return this.store.subscribe(messageId, listener);
-  }
-
   private async executeRun(
     runId: string,
     input: AgentExecutionInput,
-    options: { history?: AgentMessage[]; skipSummaryRefresh?: boolean } = {}
+    options: { history?: AgentMessage[]; skipSummaryRefresh?: boolean; assistantMessageId?: string } = {}
   ) {
+    // executeRun 是真正的执行循环：Worker 会走这里，regenerate 的本地执行也走这里。
+    // 这里的设计重点是把高频运行态和最终数据分开：
+    // - answer_delta / running parts 写 runningStateStore，通常是 Redis；
+    // - 工具、资源、最终回答、终态事件写 SQLite；
+    // - 写入的 run event 再通过 eventBus 推给 API SSE。
+    const runGuard = this.createRunExecutionGuard(runId, input.signal);
     let assistantMessage: AgentMessageRecord | undefined;
     let finalAnswerEvent: Extract<AgentStreamEvent, { type: "final_answer" }> | undefined;
 
@@ -583,30 +623,41 @@ export class AgentMessageCoordinator {
 
       const run = this.ensureRun(runId);
       const userMessageId = run.userMessageId;
+      await runGuard.ensureActive({ force: true });
 
       if (!options.skipSummaryRefresh) {
+        // 压缩发生在回答前，并挂在当前 run 上。它可以产生 system message 和 summary events，
+        // 但不会走旧的“message 完成后静默摘要”路径。
         await this.refreshSessionSummaryBeforeAnswer(runId, input.sessionId, userMessageId, input.signal);
       }
 
-      if (input.signal.aborted || this.store.getRun(runId)?.status !== "running") {
-        return;
-      }
+      await runGuard.ensureActive({ force: true });
 
       const history = options.history ?? this.buildConversationHistoryBefore(input.sessionId, userMessageId);
 
-      assistantMessage = this.store.createMessage({
-        sessionId: input.sessionId,
-        role: "assistant",
-        status: "running",
-        parts: [],
-        maxIterations: input.maxIterations
-      });
-      await this.initRunningMessageState(assistantMessage, runId);
+      assistantMessage = options.assistantMessageId
+        ? this.ensureAssistantMessage(options.assistantMessageId)
+        : this.store.createMessage({
+            sessionId: input.sessionId,
+            role: "assistant",
+            status: "running",
+            parts: [],
+            maxIterations: input.maxIterations
+          });
+
+      if (assistantMessage.sessionId !== input.sessionId) {
+        throw new AppError("VALIDATION_ERROR", "run 和 assistant message 不属于同一个会话", 400);
+      }
+
+      await this.ensureRunningState(assistantMessage, runId);
       this.store.updateRun(runId, {
         phase: "answering",
         assistantMessageId: assistantMessage.id
       });
-      this.store.appendRunEvent(runId, { type: "session.message.created", message: assistantMessage }, assistantMessage.id);
+
+      if (!options.assistantMessageId) {
+        this.appendRunEvent(runId, { type: "session.message.created", message: assistantMessage }, assistantMessage.id);
+      }
 
       const result = await this.agentService.run({
         input: input.input,
@@ -617,34 +668,38 @@ export class AgentMessageCoordinator {
         sessionId: input.sessionId,
         signal: input.signal,
         onEvent: async (event) => {
+          // delta 很频繁，检查取消时做节流；关键事件仍强制检查，避免取消后继续落库工具结果。
+          await runGuard.ensureActive({ force: event.type !== "answer_delta" });
+
           if (event.type === "final_answer") {
             finalAnswerEvent = event;
             return;
           }
 
           await this.handleExecutionEvent(assistantMessage!.id, event, runId);
+          await runGuard.ensureActive({ force: false });
         }
       });
 
-      if (this.store.getMessage(assistantMessage.id)?.status !== "running" || this.store.getRun(runId)?.status !== "running") {
-        return;
-      }
+      await runGuard.ensureActive({ force: true });
 
+      // 最终答案才写回 SQLite message。这样 SQLite 保存的是可审计的稳定结果，
+      // Redis draft 只承担生成过程中的临时状态。
       const finalParts = await this.setAssistantTextAndEmitUpdate(assistantMessage.id, result.answer, runId);
       this.completeRunningProcessSteps(assistantMessage.id, runId, "succeeded");
-      this.store.appendRunEvent(runId, finalAnswerEvent ?? { type: "final_answer", answer: result.answer }, assistantMessage.id);
+      this.appendRunEvent(runId, finalAnswerEvent ?? { type: "final_answer", answer: result.answer }, assistantMessage.id);
       const completedAssistantMessage =
         this.store.updateMessage(assistantMessage.id, {
           status: "completed",
           parts: finalParts,
           completedAt: now()
         }) ?? assistantMessage;
-      this.store.appendRunEvent(
+      this.appendRunEvent(
         runId,
         { type: "session.message.updated", message: completedAssistantMessage },
         completedAssistantMessage.id
       );
-      this.store.appendRunEvent(runId, { type: "run_completed", messageId: assistantMessage.id }, assistantMessage.id);
+      this.appendRunEvent(runId, { type: "run_completed", messageId: assistantMessage.id }, assistantMessage.id);
       this.store.updateRun(runId, {
         status: "completed",
         phase: "completed",
@@ -658,7 +713,7 @@ export class AgentMessageCoordinator {
       const detail = toErrorDetail(error);
       const messageId = assistantMessage?.id;
 
-      this.store.appendRunEvent(
+      this.appendRunEvent(
         runId,
         {
           type: "error",
@@ -679,7 +734,7 @@ export class AgentMessageCoordinator {
           }) ?? this.store.getMessage(messageId);
 
         if (failedMessage) {
-          this.store.appendRunEvent(runId, { type: "session.message.updated", message: failedMessage }, messageId);
+          this.appendRunEvent(runId, { type: "session.message.updated", message: failedMessage }, messageId);
         }
       }
 
@@ -692,6 +747,7 @@ export class AgentMessageCoordinator {
     } finally {
       this.runningRuns.delete(runId);
       if (assistantMessage) {
+        // 不论成功、失败还是被取消，run 结束后都清理 draft；最终可恢复状态应来自 SQLite。
         await this.runningStateStore.remove(assistantMessage.id);
       }
     }
@@ -715,6 +771,8 @@ export class AgentMessageCoordinator {
       return { message };
     }
 
+    // running message 在 SQLite 里只保存“空壳/最终态”，生成中的 parts 在 Redis draft。
+    // SSE 建连和详情查询需要合并这两层，前端才能在刷新后看到当前已经生成的内容。
     const state = await this.runningStateStore.get(message.id);
 
     if (!state) {
@@ -775,65 +833,6 @@ export class AgentMessageCoordinator {
     return {
       parts: this.store.updateMessageParts(messageId, parts)?.parts ?? parts
     };
-  }
-
-  private async executeMessage(messageId: string, input: AgentExecutionInput) {
-    let finalAnswerEvent: Extract<AgentStreamEvent, { type: "final_answer" }> | undefined;
-
-    try {
-      const result = await this.agentService.run({
-        input: input.input,
-        history: input.history,
-        maxIterations: input.maxIterations,
-        messageId: input.messageId,
-        sessionId: input.sessionId,
-        signal: input.signal,
-        onEvent: async (event) => {
-          if (event.type === "final_answer") {
-            finalAnswerEvent = event;
-            return;
-          }
-
-          await this.handleExecutionEvent(messageId, event);
-        }
-      });
-
-      if (this.store.getMessage(messageId)?.status !== "running") {
-        return;
-      }
-
-      const finalParts = await this.setAssistantTextAndEmitUpdate(messageId, result.answer);
-      this.completeRunningProcessSteps(messageId, undefined, "succeeded");
-      this.store.appendEvent(messageId, finalAnswerEvent ?? { type: "final_answer", answer: result.answer });
-      this.store.updateMessage(messageId, {
-        status: "completed",
-        parts: finalParts,
-        completedAt: now()
-      });
-      await this.refreshSessionSummary(input.sessionId);
-      this.store.appendEvent(messageId, { type: "run_completed", messageId });
-    } catch (error) {
-      if (isAbortError(error) || this.store.getMessage(messageId)?.status === "cancelled") {
-        return;
-      }
-
-      const detail = toErrorDetail(error);
-      this.completeRunningProcessSteps(messageId, undefined, "failed");
-      this.store.appendEvent(messageId, {
-        type: "error",
-        code: detail.code,
-        message: detail.message
-      });
-      this.store.updateMessage(messageId, {
-        status: "failed",
-        parts: await this.withAssistantText(messageId, "本轮运行失败。"),
-        error: detail,
-        completedAt: now()
-      });
-    } finally {
-      this.runningMessages.delete(messageId);
-      await this.runningStateStore.remove(messageId);
-    }
   }
 
   private ensureAssistantMessage(messageId: string) {
@@ -1851,21 +1850,42 @@ export class AgentMessageCoordinator {
   }
 
   private appendEvent(messageId: string, event: AgentStreamEvent, runId?: string) {
-    if (runId) {
-      this.store.appendRunEvent(runId, event, messageId);
-      return;
+    if (!runId) {
+      throw new Error("执行事件必须关联 run");
     }
 
-    this.store.appendEvent(messageId, event);
+    this.appendRunEvent(runId, event, messageId);
+  }
+
+  private appendRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): StoredAgentEvent | undefined {
+    // 持久化事件先写 SQLite，保证刷新和断线重连有短期回放；随后再发布到 Redis Pub/Sub 做实时推送。
+    const storedEvent = this.store.appendRunEvent(runId, event, messageId);
+
+    if (storedEvent) {
+      this.publishStoredEvent(storedEvent);
+    }
+
+    return storedEvent;
   }
 
   private publishTransientEvent(messageId: string, event: AgentStreamEvent, runId?: string) {
-    if (runId) {
-      this.store.publishTransientRunEvent(runId, event, messageId);
-      return;
+    if (!runId) {
+      throw new Error("临时执行事件必须关联 run");
     }
 
-    this.store.publishTransientEvent(messageId, event);
+    // transient event 不进入 SQLite，只通过本进程订阅和 Redis Pub/Sub 推给在线 SSE。
+    // 典型例子是 message.part.delta：它太高频，完整 draft 已经在 Redis running state 里。
+    const storedEvent = this.store.publishTransientRunEvent(runId, event, messageId);
+
+    if (storedEvent) {
+      this.publishStoredEvent(storedEvent);
+    }
+  }
+
+  private publishStoredEvent(event: StoredAgentEvent) {
+    if (event.runId) {
+      void this.options.eventBus?.publishRunEvent(event.runId, event);
+    }
   }
 
   private buildConversationHistory(sessionId: string): AgentMessage[] {
@@ -1939,8 +1959,8 @@ export class AgentMessageCoordinator {
       phase: "compressing",
       systemMessageId: systemMessage.id
     });
-    this.store.appendRunEvent(runId, { type: "session.message.created", message: systemMessage }, systemMessage.id);
-    this.store.appendRunEvent(
+    this.appendRunEvent(runId, { type: "session.message.created", message: systemMessage }, systemMessage.id);
+    this.appendRunEvent(
       runId,
       {
         type: "summary_start",
@@ -1980,7 +2000,7 @@ export class AgentMessageCoordinator {
           parts: [createTextPart("上下文已自动压缩")],
           completedAt: now()
         }) ?? systemMessage;
-      this.store.appendRunEvent(
+      this.appendRunEvent(
         runId,
         {
           type: "summary_completed",
@@ -1993,7 +2013,7 @@ export class AgentMessageCoordinator {
         },
         systemMessage.id
       );
-      this.store.appendRunEvent(
+      this.appendRunEvent(
         runId,
         { type: "session.message.updated", message: completedSystemMessage },
         completedSystemMessage.id
@@ -2011,7 +2031,7 @@ export class AgentMessageCoordinator {
           error: detail,
           completedAt: now()
         }) ?? systemMessage;
-      this.store.appendRunEvent(
+      this.appendRunEvent(
         runId,
         {
           type: "summary_failed",
@@ -2024,57 +2044,7 @@ export class AgentMessageCoordinator {
         },
         systemMessage.id
       );
-      this.store.appendRunEvent(runId, { type: "session.message.updated", message: failedSystemMessage }, failedSystemMessage.id);
-    }
-  }
-
-  private async refreshSessionSummary(sessionId: string | undefined): Promise<void> {
-    if (!sessionId || !this.summaryService) {
-      return;
-    }
-
-    const previousSummary = this.store.getSessionSummary(sessionId);
-    const uncoveredMessageCount = this.store.countContextMessagesAfter(sessionId, previousSummary?.coveredMessageId);
-    const refreshPlan = this.summaryService.planRefresh(uncoveredMessageCount);
-
-    if (!refreshPlan) {
-      return;
-    }
-
-    const uncoveredMessages = this.store.getContextMessagesAfter(
-      sessionId,
-      previousSummary?.coveredMessageId
-    );
-
-    if (!uncoveredMessages.length || !this.summaryService.hasEnoughRefreshContent(uncoveredMessages)) {
-      return;
-    }
-
-    const messagesToSummarize = uncoveredMessages.slice(0, refreshPlan.messagesToSummarizeLimit);
-
-    if (!messagesToSummarize.length) {
-      return;
-    }
-
-    try {
-      const nextSummary = await this.summaryService.summarizeSessionMessages({
-        sessionId,
-        messagesToSummarize,
-        previousSummary
-      });
-
-      if (!nextSummary) {
-        return;
-      }
-
-      this.store.upsertSessionSummary({
-        sessionId,
-        summary: nextSummary.summary,
-        coveredMessageId: nextSummary.coveredMessageId,
-        schemaVersion: nextSummary.schemaVersion
-      });
-    } catch (error) {
-      // 摘要失败不应该影响本轮已经完成的回答；下一轮仍可使用最近原文上下文。
+      this.appendRunEvent(runId, { type: "session.message.updated", message: failedSystemMessage }, failedSystemMessage.id);
     }
   }
 
@@ -2156,7 +2126,7 @@ export class AgentMessageCoordinator {
       this.addCleanupResult(result, messageResult);
     }
 
-    this.store.appendRunEvent(
+    this.appendRunEvent(
       run.id,
       {
         type: "error",
@@ -2177,13 +2147,13 @@ export class AgentMessageCoordinator {
 
   private async failInterruptedMessage(
     message: AgentMessageRecord,
-    runId: string | undefined,
+    runId: string,
     detail: AgentErrorDetail
   ): Promise<StaleRunningCleanupResult> {
     const result = this.createEmptyCleanupResult();
     const runningSteps = this.store
       .getProcessStepsByMessages([message.id])
-      .filter((step) => step.status === "running" && (!runId || step.runId === runId));
+      .filter((step) => step.status === "running" && step.runId === runId);
 
     this.completeRunningProcessSteps(message.id, runId, "failed");
     result.processSteps += runningSteps.length;
@@ -2198,28 +2168,20 @@ export class AgentMessageCoordinator {
         completedAt: now()
       }) ?? message;
 
-    if (runId) {
-      this.store.appendRunEvent(runId, { type: "session.message.updated", message: failedMessage }, message.id);
-    } else {
-      this.store.appendEvent(message.id, {
-        type: "error",
-        code: detail.code,
-        message: detail.message
-      });
-    }
+    this.appendRunEvent(runId, { type: "session.message.updated", message: failedMessage }, message.id);
 
     await this.runningStateStore.remove(message.id);
     result.messages += 1;
     return result;
   }
 
-  private failInterruptedToolCalls(message: AgentMessageRecord, runId: string | undefined, detail: AgentErrorDetail): number {
+  private failInterruptedToolCalls(message: AgentMessageRecord, runId: string, detail: AgentErrorDetail): number {
     const toolCalls = this.store
       .getToolCallsBySession(message.sessionId)
       .filter(
         (toolCall) =>
           toolCall.messageId === message.id &&
-          (!runId || toolCall.runId === runId) &&
+          toolCall.runId === runId &&
           (toolCall.status === "pending" || toolCall.status === "running")
       );
 
@@ -2266,17 +2228,6 @@ export class AgentMessageCoordinator {
     }
 
     return [...runsById.values()];
-  }
-
-  private getAllRunningMessages(): AgentMessageRecord[] {
-    return this.store
-      .listSessions()
-      .flatMap((session) => this.store.getMessagesBySession(session.id))
-      .filter((message) => message.status === "running");
-  }
-
-  private hasRunningRunForMessage(messageId: string): boolean {
-    return this.store.getRunsByMessageId(messageId).some((run) => run.status === "running");
   }
 
   private createEmptyCleanupResult(): StaleRunningCleanupResult {

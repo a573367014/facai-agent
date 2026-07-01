@@ -9,6 +9,8 @@ export interface OpenAiCompatibleProviderOptions {
 }
 
 function toProviderMessage(message: AgentMessage): Record<string, unknown> {
+  // 项目内部的 AgentMessage 是“框架无关”的格式。
+  // 到这里才翻译成 OpenAI compatible API 需要的 role/tool_calls/tool_call_id 字段。
   if (message.role === "assistant") {
     return {
       role: "assistant",
@@ -38,6 +40,8 @@ function toProviderMessage(message: AgentMessage): Record<string, unknown> {
 
 function parseToolArguments(rawArguments: string, toolName: string): Record<string, unknown> {
   try {
+    // 模型返回的 tool arguments 是字符串形式的 JSON。
+    // 后续 ToolExecutor 还会用 zod 再校验一遍；这里先保证 provider 层拿到的是对象。
     const parsed = JSON.parse(rawArguments || "{}") as unknown;
 
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -185,6 +189,8 @@ export class OpenAiCompatibleProvider implements LlmProvider {
     let buffer = "";
 
     const handleBlock = async (block: string) => {
+      // OpenAI compatible 的 stream 是 SSE：一个事件块里可能有多行 data。
+      // 网络 chunk 不保证正好按事件边界到达，所以外层用 buffer 拼块，这里只处理完整 block。
       const dataLines = block
         .split("\n")
         .map((line) => line.trim())
@@ -212,6 +218,8 @@ export class OpenAiCompatibleProvider implements LlmProvider {
         for (const toolCallDelta of delta.tool_calls ?? []) {
           const index = toolCallDelta.index ?? 0;
           const current = toolCalls.get(index) ?? { arguments: "" };
+          // 流式 tool call 的 arguments 常常被拆成很多小片段。
+          // 不能每个片段单独 JSON.parse，必须按 index 累积完整字符串后再统一解析。
           current.id = toolCallDelta.id ?? current.id;
           current.name = toolCallDelta.function?.name ?? current.name;
           current.arguments += toolCallDelta.function?.arguments ?? "";
@@ -229,6 +237,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
 
       buffer += decoder.decode(value, { stream: true });
       const blocks = buffer.split("\n\n");
+      // 最后一段可能只是半个 SSE block，先留下来等下一次 reader.read() 补齐。
       buffer = blocks.pop() ?? "";
 
       for (const block of blocks) {

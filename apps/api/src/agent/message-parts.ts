@@ -75,6 +75,8 @@ export function createTextPart(value: string): TextPart {
 }
 
 export function stripRuntimePartFields(parts: Array<MessagePart & Record<string, unknown>>): MessagePart[] {
+  // 前端编辑器会临时挂一些 $ 开头的运行时字段，比如选中态、上传态。
+  // 这些字段只服务 UI，不应该写进数据库，也不应该发给 LLM。
   return parts.map((part) => {
     const cleanEntries = Object.entries(part).filter(([key]) => !key.startsWith("$"));
     return Object.fromEntries(cleanEntries) as unknown as MessagePart;
@@ -82,6 +84,8 @@ export function stripRuntimePartFields(parts: Array<MessagePart & Record<string,
 }
 
 export function partsToLlmText(parts: MessagePart[]): string {
+  // MessagePart 是给产品展示用的结构化消息；LLM 只需要一段可读文本。
+  // pending 的媒体不参与投影，避免模型把“正在生成中”的资源当作已经可用。
   return projectParts(parts, { includePendingMedia: false }).join("\n");
 }
 
@@ -126,6 +130,8 @@ export interface GeneratedImagePartInput {
 }
 
 export function upsertGeneratedImageParts(parts: MessagePart[], input: GeneratedImagePartInput): MessagePart[] {
+  // 生成类工具通常先插入 pending 占位，再用同一个 resource/toolCall/outputIndex 更新成成功或失败。
+  // 用 upsert 而不是 append，可以避免流式事件重放或进度更新时重复出现同一张图。
   const existingIndex = parts.findIndex(
     (part) =>
       part.type === "media" &&
@@ -180,6 +186,8 @@ function projectParts(parts: MessagePart[], options: { includePendingMedia: bool
 function projectTextPart(part: TextPart): string {
   const placeholder = part.extra?.placeholder;
 
+  // 占位型文本在 UI 里可能是一个下拉/输入控件。
+  // 投影给 LLM 时要变成“标签：用户选择”，否则模型只看到原始 value 会缺少语义。
   if (placeholder?.type === "select") {
     const selected = placeholder.options?.find((option) => option.value === part.value);
     return `${placeholder.label}：${selected?.label ?? part.value}`;
@@ -195,6 +203,8 @@ function projectTextPart(part: TextPart): string {
 function projectMediaPart(part: MediaPart, options: { includePendingMedia: boolean }): string {
   const state = part.extra?.lifecycle?.state;
 
+  // 媒体 part 对 LLM 的价值是“有什么资源、资源是否失败、资源地址是否可访问”。
+  // base64、本地 blob 等前端专用地址不投影，避免上下文暴涨或给模型不可用链接。
   if (state === "pending" && !options.includePendingMedia) {
     return "";
   }

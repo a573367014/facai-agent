@@ -2,7 +2,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { InMemoryAgentCancellationStore } from "../../src/agent/agent-cancellation-store.js";
+import { InMemoryAgentEventBus } from "../../src/agent/agent-event-bus.js";
+import { InMemoryAgentRunLock } from "../../src/agent/agent-run-lock.js";
+import type { AgentRunJobPayload, AgentRunQueue } from "../../src/agent/agent-run-queue.js";
 import { AgentService } from "../../src/agent/agent-service.js";
+import { InMemoryRunningMessageStateStore } from "../../src/agent/running-message-state-store.js";
 import { SqliteAgentStore } from "../../src/agent/sqlite-agent-store.js";
 import { buildApp } from "../../src/app.js";
 import type { LlmProvider } from "../../src/providers/types.js";
@@ -11,6 +16,10 @@ import { ToolRegistry } from "../../src/tools/registry.js";
 import type { MessagePart } from "../../src/agent/message-parts.js";
 
 let tempDirs: string[] = [];
+
+class NoopAgentRunQueue implements AgentRunQueue {
+  async enqueueRun(_payload: AgentRunJobPayload): Promise<void> {}
+}
 
 function createTempDatabasePath() {
   const dir = mkdtempSync(join(tmpdir(), "agent-store-"));
@@ -115,6 +124,55 @@ describe("SqliteAgentStore", () => {
       }
     });
     secondStore.close();
+  });
+
+  it("多个已打开 store 会在文件变化后读到彼此写入", async () => {
+    const databasePath = createTempDatabasePath();
+    const apiStore = await SqliteAgentStore.create({ databasePath });
+    const workerStore = await SqliteAgentStore.create({ databasePath });
+
+    try {
+      const session = apiStore.createSession("queue session");
+      const userMessage = apiStore.createMessage({
+        sessionId: session.id,
+        role: "user",
+        status: "completed",
+        parts: [{ type: "text", value: "排队执行" }]
+      });
+      const run = apiStore.createRun({
+        sessionId: session.id,
+        userMessageId: userMessage.id,
+        status: "running",
+        phase: "answering"
+      });
+
+      expect(workerStore.getRun(run.id)).toMatchObject({
+        id: run.id,
+        status: "running"
+      });
+
+      const assistantMessage = workerStore.createMessage({
+        sessionId: session.id,
+        role: "assistant",
+        status: "completed",
+        parts: [{ type: "text", value: "完成" }]
+      });
+      workerStore.updateRun(run.id, {
+        status: "completed",
+        phase: "completed",
+        assistantMessageId: assistantMessage.id
+      });
+
+      expect(apiStore.getRun(run.id)).toMatchObject({
+        id: run.id,
+        status: "completed",
+        phase: "completed",
+        assistantMessageId: assistantMessage.id
+      });
+    } finally {
+      apiStore.close();
+      workerStore.close();
+    }
   });
 
   it("按版本追加 session summary，并能查询某条消息之前可用的摘要", async () => {
@@ -852,7 +910,14 @@ describe("SqliteAgentStore", () => {
     process.env.AGENT_SQLITE_PATH = databasePath;
 
     try {
-      const app = await buildApp({ agentService: createTestAgentService() });
+      const app = await buildApp({
+        agentService: createTestAgentService(),
+        runningStateStore: new InMemoryRunningMessageStateStore(),
+        eventBus: new InMemoryAgentEventBus(),
+        runQueue: new NoopAgentRunQueue(),
+        cancellationStore: new InMemoryAgentCancellationStore(),
+        runLock: new InMemoryAgentRunLock()
+      });
       const response = await app.inject({
         method: "POST",
         url: "/agents/sessions",

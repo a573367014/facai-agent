@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import initSqlJs from "sql.js";
 import type { AgentStreamEvent } from "./types.js";
@@ -45,6 +45,8 @@ interface SqlDatabase {
   close(): void;
 }
 
+type SqlJsModule = Awaited<ReturnType<typeof initSqlJs>>;
+
 interface SqliteAgentStoreOptions {
   databasePath: string;
   eventRetentionDays?: number;
@@ -87,6 +89,8 @@ function normalizePositiveInteger(value: number): number {
 
 const contextMessageFilter = "(role = 'user' OR (role = 'assistant' AND status IN ('completed', 'failed')))";
 
+// 只有用户消息、已完成/失败的 assistant 消息会进入后续上下文。
+// running/cancelled/system 更多是流程状态，参与检索容易污染下一轮模型输入。
 function isTerminalToolCallStatus(status: AgentToolCallRecord["status"]) {
   return status === "succeeded" || status === "failed";
 }
@@ -120,25 +124,34 @@ function parseJson<T>(value: SqlValue | undefined): T | undefined {
 }
 
 export class SqliteAgentStore implements AgentStore {
+  // 这个 store 负责“长期事实”：会话、消息、run、工具调用、资源、事件回放都落在 SQLite。
+  // Redis 只做运行时协调，进程重启后最终仍以 SQLite 里的记录和事件为准。
   private readonly subscribers = new Map<string, Set<AgentEventListener>>();
   private readonly runSubscribers = new Map<string, Set<AgentEventListener>>();
   private readonly eventRetentionDays: number;
+  private lastLoadedMtimeMs: number;
+  private transactionDepth = 0;
+  private hasUnpersistedChanges = false;
 
   private constructor(
     private readonly databasePath: string,
-    private readonly database: SqlDatabase,
-    options: { eventRetentionDays: number }
+    private database: SqlDatabase,
+    private readonly SQL: SqlJsModule,
+    options: { eventRetentionDays: number; lastLoadedMtimeMs: number }
   ) {
     this.eventRetentionDays = options.eventRetentionDays;
+    this.lastLoadedMtimeMs = options.lastLoadedMtimeMs;
   }
 
   static async create(options: SqliteAgentStoreOptions): Promise<SqliteAgentStore> {
     mkdirSync(dirname(options.databasePath), { recursive: true });
     const SQL = await initSqlJs();
-    const data = existsSync(options.databasePath) ? readFileSync(options.databasePath) : undefined;
+    const databaseExists = existsSync(options.databasePath);
+    const data = databaseExists ? readFileSync(options.databasePath) : undefined;
     const database = new SQL.Database(data) as SqlDatabase;
-    const store = new SqliteAgentStore(options.databasePath, database, {
-      eventRetentionDays: normalizePositiveInteger(options.eventRetentionDays ?? 3)
+    const store = new SqliteAgentStore(options.databasePath, database, SQL, {
+      eventRetentionDays: normalizePositiveInteger(options.eventRetentionDays ?? 3),
+      lastLoadedMtimeMs: databaseExists ? statSync(options.databasePath).mtimeMs : 0
     });
 
     store.initializeSchema();
@@ -155,7 +168,7 @@ export class SqliteAgentStore implements AgentStore {
       updatedAt: timestamp
     };
 
-    this.database.run(
+    this.run(
       `INSERT INTO agent_sessions (id, title, created_at, updated_at)
        VALUES (?, ?, ?, ?)`,
       [session.id, title ?? null, timestamp, timestamp]
@@ -220,23 +233,23 @@ export class SqliteAgentStore implements AgentStore {
       requiredString(row.id, "id")
     );
 
-    this.database.run("BEGIN TRANSACTION");
+    this.run("BEGIN TRANSACTION");
     try {
-      this.database.run(
+      this.run(
         `DELETE FROM agent_events
          WHERE run_id IN (SELECT id FROM agent_runs WHERE session_id = ?)
             OR message_id IN (SELECT id FROM agent_messages WHERE session_id = ?)`,
         [sessionId, sessionId]
       );
-      this.database.run(`DELETE FROM agent_resources WHERE session_id = ?`, [sessionId]);
-      this.database.run(`DELETE FROM agent_tool_calls WHERE session_id = ?`, [sessionId]);
-      this.database.run(`DELETE FROM agent_session_summaries WHERE session_id = ?`, [sessionId]);
-      this.database.run(`DELETE FROM agent_runs WHERE session_id = ?`, [sessionId]);
-      this.database.run(`DELETE FROM agent_messages WHERE session_id = ?`, [sessionId]);
-      this.database.run(`DELETE FROM agent_sessions WHERE id = ?`, [sessionId]);
-      this.database.run("COMMIT");
+      this.run(`DELETE FROM agent_resources WHERE session_id = ?`, [sessionId]);
+      this.run(`DELETE FROM agent_tool_calls WHERE session_id = ?`, [sessionId]);
+      this.run(`DELETE FROM agent_session_summaries WHERE session_id = ?`, [sessionId]);
+      this.run(`DELETE FROM agent_runs WHERE session_id = ?`, [sessionId]);
+      this.run(`DELETE FROM agent_messages WHERE session_id = ?`, [sessionId]);
+      this.run(`DELETE FROM agent_sessions WHERE id = ?`, [sessionId]);
+      this.run("COMMIT");
     } catch (error) {
-      this.database.run("ROLLBACK");
+      this.run("ROLLBACK");
       throw error;
     }
 
@@ -332,6 +345,8 @@ export class SqliteAgentStore implements AgentStore {
     const previousSummary = this.getSessionSummary(input.sessionId);
     const coveredMessage = this.getMessage(input.coveredMessageId);
 
+    // 摘要一定要指向一个真实消息，coveredMessageId 表示“摘要已经覆盖到哪里”。
+    // 下次构造上下文时，ContextBuilder 会从这个消息之后继续补最近原文。
     if (!coveredMessage || coveredMessage.sessionId !== input.sessionId) {
       throw new Error(`SQLite 会话摘要覆盖消息无效：${input.coveredMessageId}`);
     }
@@ -339,7 +354,7 @@ export class SqliteAgentStore implements AgentStore {
     const summaryId = `summary_${randomUUID()}`;
     const version = (previousSummary?.version ?? 0) + 1;
 
-    this.database.run(
+    this.run(
       `INSERT INTO agent_session_summaries (
          id,
          session_id,
@@ -393,7 +408,7 @@ export class SqliteAgentStore implements AgentStore {
       updatedAt: timestamp
     };
 
-    this.database.run(
+    this.run(
       `INSERT INTO agent_runs (
          id,
          session_id,
@@ -437,6 +452,8 @@ export class SqliteAgentStore implements AgentStore {
     const timestamp = now();
     const status = input.status ?? existingRun.status;
     const phase = input.phase ?? existingRun.phase;
+    // run 是用户一次请求的执行单元，状态流转必须单向：
+    // running 可以进入 completed/failed/cancelled，终态不能再被改回 running。
     assertValidRunTransition(existingRun.status, status);
     assertRunPhaseMatchesStatus(status, phase);
     const systemMessageId = input.systemMessageId ?? existingRun.systemMessageId;
@@ -444,7 +461,7 @@ export class SqliteAgentStore implements AgentStore {
     const error = input.error;
     const completedAt = input.completedAt ?? existingRun.completedAt;
 
-    this.database.run(
+    this.run(
       `UPDATE agent_runs
        SET status = ?,
            phase = ?,
@@ -529,7 +546,7 @@ export class SqliteAgentStore implements AgentStore {
       updatedAt: timestamp
     };
 
-    this.database.run(
+    this.run(
       `INSERT INTO agent_messages (
          id,
          session_id,
@@ -570,12 +587,14 @@ export class SqliteAgentStore implements AgentStore {
 
     const timestamp = now();
     const status = input.status ?? existingMessage.status;
+    // message 状态也只允许 running -> 终态。这个保护能避免延迟到达的流式事件
+    // 把已经失败/取消/完成的消息重新改成运行中。
     assertValidMessageTransition(existingMessage.status, status);
     const parts = input.parts ?? existingMessage.parts;
     const error = input.error;
     const completedAt = input.completedAt ?? existingMessage.completedAt;
 
-    this.database.run(
+    this.run(
       `UPDATE agent_messages
        SET status = ?,
            parts_json = ?,
@@ -1070,6 +1089,8 @@ export class SqliteAgentStore implements AgentStore {
     let runEvents = 0;
     let batches = 0;
 
+    // agent_events 是给 SSE 断线重连/刷新恢复用的回放日志，不需要永久保存。
+    // 这里分批删除，避免一次 DELETE 太大导致 UI 请求被长时间阻塞。
     while (batches < maxBatches) {
       const deletedEvents = this.deleteExpiredEventBatch(input.nowIso, batchSize);
       const deletedMessageEvents = deletedEvents.messageEvents;
@@ -1102,6 +1123,8 @@ export class SqliteAgentStore implements AgentStore {
 
   createToolCall(input: CreateAgentToolCallInput): AgentToolCallRecord {
     const timestamp = now();
+    // tool_call 是审计和 UI trace 的结构化记录：它和原始 stream event 不一样，
+    // 适合后续统计“工具成功率/耗时/失败原因”，也能按 message/session 查询。
     const toolCall: AgentToolCallRecord = {
       id: createId("tool_call"),
       sessionId: input.sessionId,
@@ -1115,7 +1138,7 @@ export class SqliteAgentStore implements AgentStore {
       startedAt: timestamp
     };
 
-    this.database.run(
+    this.run(
       `INSERT INTO agent_tool_calls (
          id,
          session_id,
@@ -1166,7 +1189,7 @@ export class SqliteAgentStore implements AgentStore {
     const status = input.status ?? existingToolCall.status;
     const completedAt = input.completedAt ?? (isTerminalToolCallStatus(status) ? existingToolCall.completedAt ?? timestamp : existingToolCall.completedAt);
 
-    this.database.run(
+    this.run(
       `UPDATE agent_tool_calls
        SET status = ?,
            result_summary_json = ?,
@@ -1241,6 +1264,8 @@ export class SqliteAgentStore implements AgentStore {
 
   createResource(input: CreateAgentResourceInput): AgentResourceRecord {
     const timestamp = now();
+    // resource 是工具产物的持久化索引，比如生成图片/视频。
+    // message part 里只引用 resourceId，真正的 URL、尺寸、状态集中存在这里，后续更新更方便。
     const resource: AgentResourceRecord = {
       id: createId("res"),
       sessionId: input.sessionId,
@@ -1259,7 +1284,7 @@ export class SqliteAgentStore implements AgentStore {
       updatedAt: timestamp
     };
 
-    this.database.run(
+    this.run(
       `INSERT INTO agent_resources (
          id,
          session_id,
@@ -1310,7 +1335,7 @@ export class SqliteAgentStore implements AgentStore {
 
     const timestamp = now();
 
-    this.database.run(
+    this.run(
       `UPDATE agent_resources
        SET tool_call_row_id = ?,
            tool_call_id = ?,
@@ -1375,6 +1400,8 @@ export class SqliteAgentStore implements AgentStore {
 
   createProcessStep(input: CreateAgentProcessStepInput): AgentProcessStepRecord {
     const timestamp = now();
+    // process_step 是给用户看的“任务进度条”，粒度比原始事件更粗。
+    // 例如一次工具调用可以对应一个步骤，便于前端稳定渲染而不用理解所有 event 类型。
     const processStep: AgentProcessStepRecord = {
       id: createId("step"),
       sessionId: input.sessionId,
@@ -1393,7 +1420,7 @@ export class SqliteAgentStore implements AgentStore {
       completedAt: input.status && isTerminalProcessStepStatus(input.status) ? timestamp : undefined
     };
 
-    this.database.run(
+    this.run(
       `INSERT INTO agent_process_steps (
          id,
          session_id,
@@ -1446,7 +1473,7 @@ export class SqliteAgentStore implements AgentStore {
     const status = input.status ?? existingStep.status;
     const completedAt = input.completedAt ?? (isTerminalProcessStepStatus(status) ? existingStep.completedAt ?? timestamp : existingStep.completedAt);
 
-    this.database.run(
+    this.run(
       `UPDATE agent_process_steps
        SET tool_call_row_id = ?,
            tool_call_id = ?,
@@ -1572,12 +1599,19 @@ export class SqliteAgentStore implements AgentStore {
   }
 
   close() {
-    this.persist();
+    if (this.hasUnpersistedChanges) {
+      this.persist();
+    }
+
     this.database.close();
   }
 
   private initializeSchema() {
-    this.database.run(`
+    // schema 放在代码里初始化，方便本地 demo 零迁移启动。
+    // 重要表可以按职责读：
+    // sessions/messages 是聊天主数据；runs 是一次执行；events 是 SSE 回放；
+    // tool_calls/resources/process_steps 是工具审计、媒体产物和可视化进度。
+    this.run(`
       CREATE TABLE IF NOT EXISTS agent_sessions (
         id TEXT PRIMARY KEY,
         title TEXT,
@@ -1719,7 +1753,7 @@ export class SqliteAgentStore implements AgentStore {
   }
 
   private ensureCurrentSchemaIndexes() {
-    this.database.run(`
+    this.run(`
       DROP INDEX IF EXISTS idx_agent_run_events_run_id_seq;
       DROP INDEX IF EXISTS idx_agent_run_events_expires_at;
 
@@ -1741,11 +1775,13 @@ export class SqliteAgentStore implements AgentStore {
     const eventColumns = this.getTableColumns("agent_events");
     const isLegacyMessageEventTable = eventColumns.length > 0 && !eventColumns.includes("run_id");
 
+    // 旧版本事件按 message 存，新版本按 run 订阅 SSE，同时保留 message_id 方便定位消息。
+    // 这里做一次兼容清理，避免历史表结构和新查询混用。
     if (isLegacyMessageEventTable) {
-      this.database.run(`DROP TABLE IF EXISTS agent_events`);
+      this.run(`DROP TABLE IF EXISTS agent_events`);
     }
 
-    this.database.run(`
+    this.run(`
       DROP TABLE IF EXISTS agent_run_events;
 
       CREATE TABLE IF NOT EXISTS agent_events (
@@ -1852,6 +1888,8 @@ export class SqliteAgentStore implements AgentStore {
     const eventSeq = input.runId ? this.nextRunEventSeq(input.runId) : this.nextMessageEventSeq(input.messageId!);
     const timestamp = now();
     const expiresAt = addDaysIso(timestamp, this.eventRetentionDays);
+    // seq 是客户端断线续传的游标：浏览器记住最后收到的 seq，
+    // 重连时只请求 seq 之后的事件，就不会重复回放整条流。
     const storedEvent: StoredAgentEvent = {
       id: eventId,
       seq: eventSeq,
@@ -1861,7 +1899,7 @@ export class SqliteAgentStore implements AgentStore {
       createdAt: timestamp
     };
 
-    this.database.run(
+    this.run(
       `INSERT INTO agent_events (id, run_id, message_id, seq, type, payload_json, created_at, expires_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
@@ -1876,6 +1914,8 @@ export class SqliteAgentStore implements AgentStore {
       ]
     );
     this.persist();
+    // 写库后同时通知内存订阅者。这样当前连接能实时收到事件，
+    // 断线后的新连接又能从 SQLite 读到同一批事件。
     this.publish(storedEvent);
     this.publishRun(storedEvent);
     return storedEvent;
@@ -1988,7 +2028,7 @@ export class SqliteAgentStore implements AgentStore {
   }
 
   private touchSession(sessionId: string, timestamp: string) {
-    this.database.run(
+    this.run(
       `UPDATE agent_sessions
        SET updated_at = ?
        WHERE id = ?`,
@@ -1996,8 +2036,70 @@ export class SqliteAgentStore implements AgentStore {
     );
   }
 
+  private run(sql: string, params?: SqlParams): SqlDatabase {
+    const command = this.getSqlCommand(sql);
+    const beginsTransaction = command === "BEGIN";
+    const endsTransaction = command === "COMMIT" || command === "ROLLBACK";
+
+    // sql.js 是内存数据库，文件只是 export 后的快照。
+    // 每次外层写入前先检查磁盘 mtime，可以兼容 API/worker 两个进程交替写同一个 SQLite 文件。
+    if (this.transactionDepth === 0) {
+      this.refreshFromDiskIfChanged();
+    }
+
+    if (beginsTransaction) {
+      this.transactionDepth += 1;
+    }
+
+    try {
+      const result = this.database.run(sql, params);
+
+      if (!beginsTransaction && !endsTransaction) {
+        this.hasUnpersistedChanges = true;
+      }
+
+      if (endsTransaction) {
+        this.transactionDepth = Math.max(0, this.transactionDepth - 1);
+
+        if (command === "ROLLBACK" && this.transactionDepth === 0) {
+          this.hasUnpersistedChanges = false;
+        }
+      }
+
+      return result;
+    } catch (error) {
+      if (beginsTransaction) {
+        this.transactionDepth = Math.max(0, this.transactionDepth - 1);
+      }
+
+      throw error;
+    }
+  }
+
+  private refreshFromDiskIfChanged() {
+    if (this.transactionDepth > 0 || !existsSync(this.databasePath)) {
+      return;
+    }
+
+    const { mtimeMs } = statSync(this.databasePath);
+
+    if (mtimeMs === this.lastLoadedMtimeMs) {
+      return;
+    }
+
+    // 检测到别的进程已经持久化了新快照，就重新加载数据库。
+    // 注意这不是高并发数据库方案，只是本地 demo/单机 worker 下的轻量同步。
+    const data = readFileSync(this.databasePath);
+    this.database.close();
+    this.database = new this.SQL.Database(data) as SqlDatabase;
+    this.lastLoadedMtimeMs = mtimeMs;
+    this.hasUnpersistedChanges = false;
+  }
+
   private persist() {
     writeFileSync(this.databasePath, this.database.export());
+    this.lastLoadedMtimeMs = statSync(this.databasePath).mtimeMs;
+    this.hasUnpersistedChanges = false;
   }
 
   private queryOne(sql: string, params?: SqlParams): SqlRow | undefined {
@@ -2005,6 +2107,7 @@ export class SqliteAgentStore implements AgentStore {
   }
 
   private queryMany(sql: string, params?: SqlParams): SqlRow[] {
+    this.refreshFromDiskIfChanged();
     const [result] = this.database.exec(sql, params);
 
     if (!result) {
@@ -2014,6 +2117,10 @@ export class SqliteAgentStore implements AgentStore {
     return result.values.map((values) =>
       Object.fromEntries(result.columns.map((column, index) => [column, values[index] ?? null]))
     );
+  }
+
+  private getSqlCommand(sql: string): string {
+    return sql.trim().split(/\s+/, 1)[0]?.toUpperCase() ?? "";
   }
 
   private deleteExpiredEventBatch(nowIso: string, limit: number): { messageEvents: number; runEvents: number; total: number } {
@@ -2044,7 +2151,7 @@ export class SqliteAgentStore implements AgentStore {
     const ids = expiredEvents.map((row) => requiredString(row.id, "id"));
     const placeholders = ids.map(() => "?").join(", ");
 
-    this.database.run(
+    this.run(
       `DELETE FROM agent_events
        WHERE id IN (${placeholders})`,
       ids

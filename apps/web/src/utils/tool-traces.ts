@@ -128,6 +128,8 @@ function ensureTrace(traces: Map<string, ToolTrace>, event: ToolEvent) {
 }
 
 export function buildToolTraces(events: AgentStreamEvent[]): ToolTrace[] {
+  // 后端发的是细粒度事件：ready/start/progress/result/error。
+  // UI 更适合按“某一次工具调用”展示，所以这里把同一个 toolCallId 的事件折叠成一条 ToolTrace。
   const traces = new Map<string, ToolTrace>();
 
   for (const event of events) {
@@ -147,6 +149,7 @@ export function buildToolTraces(events: AgentStreamEvent[]): ToolTrace[] {
         trace.arguments = event.arguments;
         break;
       case "tool_progress":
+        // progress 只代表中间态；如果 result/error 已经到了，不能把终态改回 running。
         trace.status = trace.status === "success" || trace.status === "failed" ? trace.status : "running";
         trace.progressEvents = [...(trace.progressEvents ?? []), event.progress];
         if (isImageToolName(trace.toolName)) {

@@ -242,12 +242,6 @@ export interface StoredAgentEvent {
   transient?: boolean;
 }
 
-export interface StartAgentMessageResponse {
-  session: AgentSessionRecord;
-  userMessage: AgentMessageRecord;
-  assistantMessage: AgentMessageRecord;
-}
-
 export interface StartAgentRunResponse {
   run: AgentRunRecord;
   session: AgentSessionRecord;
@@ -294,10 +288,6 @@ export interface AgentRunDetailResponse {
   events: StoredAgentEvent[];
 }
 
-export interface CancelAgentMessageResponse {
-  message: AgentMessageRecord;
-}
-
 export interface CancelAgentRunResponse {
   run: AgentRunRecord;
 }
@@ -319,6 +309,8 @@ export function resolveApiBaseUrl(configuredBaseUrl?: string, pageHref = window.
   const pageUrl = new URL(pageHref);
   const configured = configuredBaseUrl?.trim();
 
+  // 前端可能跑在 localhost，也可能通过局域网 IP 打开。
+  // 如果配置里写的是 localhost，但页面不是 localhost，就自动替换成当前页面 hostname，方便手机/其他设备调试。
   if (!configured) {
     return `${pageUrl.protocol}//${pageUrl.hostname}:${defaultApiPort}`;
   }
@@ -351,6 +343,9 @@ function trimTrailingSlash(value: string) {
 export const apiBaseUrl = resolveApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
 
 function parseSseBlock<T>(block: string): T | null {
+  // 后端 SSE 每个事件块形如：
+  // data: {"seq":1,"event":...}
+  // 这里先只解析 data 行，event/id/retry 这些字段当前业务不依赖。
   const dataLine = block
     .split("\n")
     .map((line) => line.trim())
@@ -363,33 +358,12 @@ function parseSseBlock<T>(block: string): T | null {
   return JSON.parse(dataLine.slice("data:".length).trim()) as T;
 }
 
-export async function startAgentMessage(
-  input: string | MessagePart[],
-  sessionId?: string
-): Promise<StartAgentMessageResponse> {
-  const requestPayload = Array.isArray(input) ? { parts: input, sessionId } : { input, sessionId };
-  const response = await fetch(`${apiBaseUrl}/agents/messages`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json"
-    },
-    body: JSON.stringify(requestPayload)
-  });
-
-  const payload = (await response.json()) as StartAgentMessageResponse | ApiErrorResponse;
-
-  if (!response.ok) {
-    const errorPayload = payload as ApiErrorResponse;
-    throw new Error(`${errorPayload.error.code}: ${errorPayload.error.message}`);
-  }
-
-  return payload as StartAgentMessageResponse;
-}
-
 export async function startAgentRun(
   input: string | MessagePart[],
   sessionId?: string
 ): Promise<StartAgentRunResponse> {
+  // 新流程统一从 run 开始：一次用户提交会创建 user message + run，
+  // assistant/system 消息由后端执行过程中通过 SSE 逐步推给前端。
   const requestPayload = Array.isArray(input) ? { parts: input, sessionId } : { input, sessionId };
   const response = await fetch(`${apiBaseUrl}/agents/runs`, {
     method: "POST",
@@ -519,20 +493,6 @@ export async function getAgentRun(runId: string): Promise<AgentRunDetailResponse
   return payload as AgentRunDetailResponse;
 }
 
-export async function cancelAgentMessage(messageId: string): Promise<CancelAgentMessageResponse> {
-  const response = await fetch(`${apiBaseUrl}/agents/messages/${messageId}/cancel`, {
-    method: "POST"
-  });
-  const payload = (await response.json()) as CancelAgentMessageResponse | ApiErrorResponse;
-
-  if (!response.ok) {
-    const errorPayload = payload as ApiErrorResponse;
-    throw new Error(`${errorPayload.error.code}: ${errorPayload.error.message}`);
-  }
-
-  return payload as CancelAgentMessageResponse;
-}
-
 export async function cancelAgentRun(runId: string): Promise<CancelAgentRunResponse> {
   const response = await fetch(`${apiBaseUrl}/agents/runs/${runId}/cancel`, {
     method: "POST"
@@ -565,61 +525,14 @@ export async function uploadAgentImage(file: File): Promise<MediaPart> {
   return (payload as UploadAgentImageResponse).file;
 }
 
-export async function streamAgentMessageEvents(
-  messageId: string,
-  after: number,
-  onEvent: (event: StoredAgentEvent) => void,
-  signal?: AbortSignal
-): Promise<void> {
-  const response = await fetch(`${apiBaseUrl}/agents/messages/${messageId}/events?after=${after}`, {
-    signal,
-    headers: {
-      accept: "text/event-stream"
-    }
-  });
-
-  if (!response.ok || !response.body) {
-    throw new Error("流式请求失败");
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-
-    if (done) {
-      break;
-    }
-
-    buffer += decoder.decode(value, { stream: true });
-    const blocks = buffer.split("\n\n");
-    buffer = blocks.pop() ?? "";
-
-    for (const block of blocks) {
-      const event = parseSseBlock<StoredAgentEvent>(block);
-      if (event) {
-        onEvent(event);
-      }
-    }
-  }
-
-  buffer += decoder.decode();
-  if (buffer.trim()) {
-    const event = parseSseBlock<StoredAgentEvent>(buffer);
-    if (event) {
-      onEvent(event);
-    }
-  }
-}
-
 export async function streamAgentRunEvents(
   runId: string,
   after: number,
   onEvent: (event: StoredAgentEvent) => void,
   signal?: AbortSignal
 ): Promise<void> {
+  // after 是断点续传游标：浏览器记录最后收到的 seq，刷新/重连时从这个 seq 之后继续读。
+  // 所以即使网络断一下，也不需要重新发起一次模型调用。
   const response = await fetch(`${apiBaseUrl}/agents/runs/${runId}/events?after=${after}`, {
     signal,
     headers: {
@@ -635,6 +548,8 @@ export async function streamAgentRunEvents(
   const decoder = new TextDecoder();
   let buffer = "";
 
+  // fetch reader 每次给的是网络 chunk，不一定刚好等于一个 SSE 事件。
+  // 用 buffer 累积文本，只有遇到空行分隔符 \n\n 才把完整事件交给 parseSseBlock。
   while (true) {
     const { done, value } = await reader.read();
 
@@ -656,6 +571,7 @@ export async function streamAgentRunEvents(
 
   buffer += decoder.decode();
   if (buffer.trim()) {
+    // 流结束时如果还有最后一个未用 \n\n 结尾的 block，也要补处理一次。
     const event = parseSseBlock<StoredAgentEvent>(buffer);
     if (event) {
       onEvent(event);

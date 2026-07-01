@@ -1,14 +1,16 @@
 # Redis Agent Runtime 设计
 
+> 2026-07-01 更新：运行时配置已按产品化方案收口。当前主路径固定为 `API + Worker + Redis + SQLite`；不再暴露切换内存运行态、API 进程内 run 执行或 Redis event bus 的环境变量。
+
 ## 背景
 
 当前项目已经从最初的同步 Agent demo 演进到本地 Agent 工作台：
 
 - Fastify API 负责 session、message、run、SSE 路由。
 - SQLite 保存最终消息、run、工具调用、资源索引和短期事件。
-- `AgentService` 在 API 进程内执行 LLM 调用和工具调用。
+- Worker 进程执行 LLM 调用和工具调用。
 - `RunningMessageStateStore` 把运行中 assistant draft 从持久化 message 中拆出来。
-- `RedisRunningMessageStateStore` 已经实现，但默认仍使用 memory。
+- `RedisRunningMessageStateStore` 是产品运行时默认实现；内存实现仅用于单元测试注入。
 
 这套结构适合单进程本地开发。问题出现在 Agent 任务变长之后：图片和视频生成要轮询，工具执行可能很慢，SSE 连接可能断开，API 进程可能重启，未来也可能出现多个 API / Worker 实例。仅靠 Node 内存保存运行态，就像前端只用组件内 `useState` 管理全局异步任务：刷新、切实例或重启时会丢状态。
 
@@ -153,10 +155,9 @@ interface AgentRunJobPayload {
 
 新增 `AgentEventBus` 封装 Redis Pub/Sub。
 
-Worker 执行时发布事件：
+Worker 执行时按 run 发布事件；事件里仍带 `messageId`，前端用它定位 assistant message：
 
 ```text
-agent:events:message:{messageId}
 agent:events:run:{runId}
 ```
 
@@ -174,7 +175,7 @@ API 收到取消请求后：
 
 1. SQLite run/message 标记取消。
 2. 写 Redis cancel key。
-3. 发布 cancel 事件。
+3. 发布 run 级 cancel 事件。
 
 Worker 在这些位置检查 cancel key：
 
@@ -188,7 +189,6 @@ Redis key 示例：
 
 ```text
 agent:run:{runId}:cancelled
-agent:message:{messageId}:cancelled
 ```
 
 为什么不能只用 `AbortController`：`AbortController` 是当前 Node 进程里的对象。API 和 Worker 分进程后，API 里 abort 一个 controller，不会自动中断 Worker 里的网络请求。Redis cancel key 是跨进程可见的取消信号。
@@ -216,7 +216,7 @@ agent:run:{runId}:lock
 2. API 创建 user message、assistant running message、run。
 3. API 初始化 Redis running draft。
 4. API 投递 BullMQ job。
-5. 前端连接 /agents/runs/:runId/events 或 /agents/messages/:messageId/events。
+5. 前端连接 /agents/runs/:runId/events。
 6. API 从 SQLite 返回已有事件，并从 Redis draft 返回 snapshot。
 7. Worker 消费 job，获取 run lock。
 8. Worker 检查 SQLite run 状态和 Redis cancel key。
@@ -231,75 +231,72 @@ agent:run:{runId}:lock
 
 ## 配置设计
 
-新增或调整环境变量：
+当前运行时配置已按产品化方案收口，只保留真实部署需要的参数：
 
 ```env
 REDIS_URL=redis://localhost:6379
-AGENT_RUNNING_STATE_STORE=redis
 AGENT_RUNNING_STATE_TTL_SECONDS=7200
 AGENT_RUNNING_STATE_REDIS_KEY_PREFIX=agent
 
-AGENT_RUN_EXECUTION_MODE=queue
 AGENT_QUEUE_NAME=agent-runs
 AGENT_WORKER_CONCURRENCY=2
 AGENT_RUN_LOCK_TTL_SECONDS=1800
 AGENT_CANCEL_TTL_SECONDS=7200
-AGENT_EVENT_BUS=redis
 ```
 
-保留 `AGENT_RUN_EXECUTION_MODE=inline` 作为开发和测试兜底。这样改造可以分阶段落地，不必一次切断现有执行路径。
+不再提供 `AGENT_RUNNING_STATE_STORE`、`AGENT_RUN_EXECUTION_MODE`、`AGENT_EVENT_BUS` 这类模式开关。原因是产品主路径已经明确：API 负责接入和 SSE，Worker 负责执行，Redis 负责运行时协调，SQLite 负责持久化。保留多套运行模式会让调试时很难判断问题出在业务逻辑、内存实现还是 Redis 实现。
+
+测试仍然可以通过 `BuildAppOptions` 注入内存实现，这属于单元测试隔离手段，不是产品配置。
 
 ## 代码边界
 
-建议新增模块：
+当前模块分工：
 
 - `apps/api/src/redis/runtime.ts`
-  - 创建 Redis runtime 依赖。
-  - 管理 client 生命周期。
+  - 集中创建 Redis clients。
+  - `commandClient` 给普通 key/value 和 Lua 脚本使用。
+  - `eventPublisher` / `eventSubscriber` 给 Pub/Sub 使用，避免订阅连接和命令连接互相影响。
 
 - `apps/api/src/agent/agent-run-queue.ts`
   - 封装 BullMQ queue。
-  - 提供 `enqueueRun(payload)`。
+  - job payload 只放 run/message id，避免队列里出现大对象或过期上下文。
 
-- `apps/api/src/agent/agent-run-worker.ts`
-  - 封装 Worker 消费逻辑。
-  - 调用 coordinator/service 执行 run。
+- `apps/api/src/worker.ts`
+  - 独立 Worker 入口。
+  - 从 BullMQ 消费 `agent-run` job。
+  - 调用 `AgentMessageCoordinator.executeQueuedRun()`。
 
 - `apps/api/src/agent/agent-event-bus.ts`
-  - 封装 publish / subscribe。
-  - 本地 inline 模式可以使用内存实现，queue 模式使用 Redis Pub/Sub。
+  - 封装 run 级 publish / subscribe。
+  - messageId 仍保留在事件字段里，但 Pub/Sub channel 只按 run 订阅。
 
 - `apps/api/src/agent/agent-cancellation-store.ts`
-  - 封装 cancel key 的 set/get/remove。
+  - 封装 run cancel key 的 set/get/remove。
 
 - `apps/api/src/agent/agent-run-lock.ts`
-  - 封装 Redis lock。
-
-需要调整的现有模块：
+  - 封装 Redis lock，防止同一个 run 被多个 Worker 重复执行。
 
 - `app.ts`
-  - 装配 Redis runtime、queue、event bus、running state store。
+  - 装配 Redis runtime、queue、event bus、running state store、cancel store、run lock。
+  - 关闭 Fastify 时统一关闭 BullMQ queue、Redis clients 和 SQLite store。
 
 - `agent-message-coordinator.ts`
-  - 拆分“创建 run”和“执行 run”。
-  - inline 模式继续直接执行。
-  - queue 模式只 enqueue。
-
-- `server.ts`
-  - API server 仍只启动 Fastify。
-  - 新增独立 worker entry，例如 `worker.ts`。
+  - `startRun()` 创建 user message、assistant running message、run，并投递 job。
+  - `executeQueuedRun()` 是 Worker 执行入口，负责检查状态、抢锁、构造上下文、执行 AgentService。
+  - `cancelRun()` 统一处理 API/Worker 可见的取消。
 
 - 根 `package.json`
-  - 增加 `dev:worker`。
-  - 根 `dev` 同时启动 api、web、worker。
+  - `dev` 同时启动 api、web、worker。
+  - `dev:worker` 可单独启动 Worker。
 
 ## 错误处理
 
 Redis 不可用时的策略要明确：
 
-- 如果配置 `AGENT_RUN_EXECUTION_MODE=queue` 或 `AGENT_EVENT_BUS=redis`，Redis 启动失败应让服务启动失败，避免用户以为任务已入队但实际没有执行。
-- 如果配置 `AGENT_RUNNING_STATE_STORE=redis`，Redis 写入失败应让当前 run 失败，而不是悄悄退回 memory。静默降级会让排查变困难。
-- 本地开发可以通过 `.env` 切回 `inline + memory`，但这是显式选择。
+- 产品运行依赖 Redis。Redis 启动失败或连接失败时，不应该静默降级到 memory。
+- running draft 写入失败应让当前 run 失败，避免前端看到的实时状态和最终状态不一致。
+- BullMQ enqueue 失败时，`POST /agents/runs` 应返回明确错误，不能让用户以为任务已经开始。
+- Pub/Sub 失败会影响实时推送，但 SQLite run events 仍是短期回放来源；前端重连后可以先拿 snapshot 和已有事件。
 
 Worker 失败策略：
 
@@ -312,7 +309,7 @@ Worker 失败策略：
 
 单元测试：
 
-- Redis running state store 已有 fake client 测试，继续保留。
+- `RedisRunningMessageStateStore` 使用 fake client 测试 Lua 脚本 contract。
 - `AgentCancellationStore` 测试 set/get/ttl。
 - `AgentRunLock` 测试获取锁、重复获取失败、释放锁。
 - `AgentEventBus` 测试 publish/subscribe contract。
@@ -320,59 +317,32 @@ Worker 失败策略：
 
 集成测试：
 
-- inline 模式保持原测试通过。
-- queue 模式创建 run 后会 enqueue job。
+- 创建 run 后会 enqueue job。
 - Worker 消费 job 后能完成 assistant message。
 - SSE 能收到 Worker 通过 Redis event bus 发布的事件。
 - cancel run 后 Worker 能停止后续工具执行。
-- Redis 不可用且配置 queue 时，服务启动失败或返回明确错误。
+- 旧 message 执行入口保持 404，避免重新出现双执行路径。
 
 手动验证：
 
 1. `docker compose up -d redis`
-2. `.env` 切到 Redis + queue。
+2. 配好 `.env` 里的模型、工具和 `REDIS_URL`。
 3. `npm run dev`
 4. 发一条普通聊天消息，确认最终答案写入 SQLite。
 5. 发一条图片生成任务，刷新页面确认 running snapshot 能恢复。
 6. 生成中取消，确认 run/message 进入 cancelled。
 7. 重启 API，不中断 Worker，确认 SSE 重新连接后仍能看到进度。
 
-## 实施顺序
+## 阅读顺序
 
-虽然目标是完整 Redis Runtime，但实现必须分段，方便定位问题。
+建议按这条线读代码：
 
-1. 本地 Redis 基础设施
-   - `docker-compose.yml`
-   - env 文档
-   - Redis client factory
-
-2. Running draft 切 Redis
-   - 使用现有 `RedisRunningMessageStateStore`
-   - 验证刷新恢复和完成删除 draft
-
-3. Event bus
-   - 先保持 inline 执行
-   - 把事件通过 Redis Pub/Sub 走一遍
-   - 确认 SSE 不破
-
-4. Queue + Worker
-   - 新增 BullMQ queue
-   - 新增 worker entry
-   - `startRun` 支持 queue 模式
-
-5. Cancel store
-   - API 写 cancel key
-   - Worker 检查 cancel key
-   - 图片/视频轮询支持取消检查
-
-6. Lock 和恢复
-   - Worker 执行前加 run lock
-   - 补重复执行保护
-   - 复用 stale cleanup
-
-7. 文档和验收
-   - README 增加 Redis Runtime 运行说明
-   - 测试覆盖 inline 和 queue 两种模式
+1. `app.ts`：看 Redis/BullMQ/SQLite/Coordinator 如何装配。
+2. `agent-message-coordinator.ts` 的 `startRun()`：看 API 请求如何变成 run 和 queue job。
+3. `worker.ts`：看 Worker 如何取 BullMQ job。
+4. `agent-message-coordinator.ts` 的 `executeQueuedRun()` / `executeRun()`：看真正执行、取消、锁、summary、事件如何发生。
+5. `agent-routes.ts` 的 `/agents/runs/:runId/events`：看前端如何通过 SSE 接收 snapshot 和 live events。
+6. `redis-running-message-state-store.ts`、`agent-event-bus.ts`、`agent-cancellation-store.ts`、`agent-run-lock.ts`：分别看 Redis 四类运行态。
 
 ## 学习重点
 

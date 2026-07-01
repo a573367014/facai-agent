@@ -44,6 +44,8 @@ type RunningRunState = { runId: string; lastSeq: number };
 type RunningRunsBySession = Record<string, RunningRunState>;
 
 function readRunningRunsBySession(): RunningRunsBySession {
+  // 这里记录“每个会话当前还在跑的 run”。
+  // 用户切换会话或刷新页面后，前端可以用 runId + lastSeq 重新接上 SSE，而不是丢掉正在生成的回答。
   try {
     const rawValue = localStorage.getItem(runningRunsBySessionKey);
 
@@ -160,6 +162,8 @@ function shouldShowSummarySystemMessage(message: ChatMessage, options: { showRun
 }
 
 function normalizeVisibleMessages(messages: ChatMessage[], options: { showRunningSummary?: boolean } = {}): ChatMessage[] {
+  // system 消息主要承载“上下文压缩中/已压缩”这类状态。
+  // 聊天窗口只保留最新一条已完成摘要提示，避免历史里堆一长串系统提示影响阅读。
   const latestSummarySystemMessageId = [...messages].reverse().find((message) => shouldShowSummarySystemMessage(message, options) && isSummarySystemMessage(message))?.id;
 
   return messages.filter((message) => {
@@ -276,6 +280,8 @@ function upsertMessageRecord(currentMessages: ChatMessage[], message: AgentMessa
 function upsertMessageSnapshot(currentMessages: ChatMessage[], event: Extract<AgentStreamEvent, { type: "message.snapshot" }>): ChatMessage[] {
   const existingMessage = currentMessages.find((message) => message.id === event.message.id);
 
+  // snapshot 是后端给前端的“消息当前完整状态”，常用于重连后校准。
+  // 如果本地已经收到更高版本的 part 事件，就不要被旧 snapshot 覆盖。
   if (isOlderSnapshotVersion(existingMessage, event.version)) {
     return currentMessages;
   }
@@ -301,6 +307,8 @@ function isDuplicateOrOlderPartVersion(message: ChatMessage, event: AgentStreamE
     return false;
   }
 
+  // part 事件可能因为重连回放而重复到达。
+  // version 是消息级别的递增号，用它挡住重复/更旧事件，可以避免 delta 被追加两次。
   return typeof event.version === "number" && typeof message.version === "number" && event.version <= message.version;
 }
 
@@ -340,6 +348,8 @@ function setTextPartValue(parts: MessagePart[] = [], value: string): MessagePart
 }
 
 function applyPartEventToMessage(message: ChatMessage, event: AgentStreamEvent): ChatMessage {
+  // 后端不会每次都重发整条消息：流式文本用 delta，媒体/占位用 created/updated。
+  // 这个函数只负责把“一个 part 事件”折叠到当前 ChatMessage 上。
   if (event.type === "message.part.created") {
     const parts = [...(message.parts ?? [])];
     parts.splice(event.partIndex, 0, event.part);
@@ -553,6 +563,8 @@ export default function App() {
   const activeRunIdRef = useRef<string | null>(null);
   const activeSessionIdRef = useRef<string | undefined>(activeSessionId);
   const runningRunsBySessionRef = useRef<RunningRunsBySession>(readRunningRunsBySession());
+  // 这些 ref 是为了给异步 SSE 回调读“最新状态”。
+  // React state 在闭包里可能是旧值，ref.current 可以避免旧流把事件写进新的会话。
 
   useEffect(() => {
     const controller = new AbortController();
@@ -642,6 +654,8 @@ export default function App() {
     const controller = new AbortController();
 
     async function recoverActiveRun() {
+      // 刷新页面后，如果 localStorage 里还有 activeRunId，先拉 run 快照和会话快照，
+      // 再从最后 seq 继续订阅 SSE。这样刷新不会重新发起模型调用。
       setIsStreaming(true);
       setActiveRun(runId);
       activeStreamControllerRef.current = controller;
@@ -743,6 +757,7 @@ export default function App() {
 
     const currentRun = runningRunsBySessionRef.current[sessionId];
 
+    // lastSeq 只前进不后退，避免旧事件把断点游标覆盖成更小的值。
     if (!currentRun || currentRun.runId !== runId || currentRun.lastSeq >= seq) {
       return;
     }
@@ -792,6 +807,8 @@ export default function App() {
       return;
     }
 
+    // run 结束时要同时清三处：内存 ref、React state、localStorage。
+    // 少清任意一处，刷新或切会话时都可能误以为还有流在跑。
     forgetRunningRunByRunId(runId ?? activeRunIdRef.current ?? undefined);
     clearActiveRun();
     activeStreamControllerRef.current = null;
@@ -844,6 +861,8 @@ export default function App() {
   }
 
   function applyAgentEvent(event: AgentStreamEvent, messageId?: string, runId?: string) {
+    // 这是前端的“事件归约器”：后端发来的每个 SSE 事件都会进入这里，
+    // 然后更新 messages/resources/events/error 等 UI 状态。
     if (event.type === "message.snapshot") {
       setMessages((currentMessages) => upsertMessageSnapshot(currentMessages, event));
       setResourcesById((currentResources) => mergeResources(currentResources, event.resources));
@@ -932,6 +951,8 @@ export default function App() {
     }
 
     if (event.type === "error") {
+      // error/cancelled/run_completed 都是 run 生命周期的终点。
+      // 收到终点事件后必须释放 active run，否则发送按钮会一直处于生成中。
       setError(`${event.code}: ${event.message}`);
       forgetRunningRunByRunId(runId ?? activeRunIdRef.current ?? undefined);
       clearActiveRun();
@@ -949,12 +970,16 @@ export default function App() {
 
   function applyStoredEvent(storedEvent: StoredAgentEvent) {
     if (storedEvent.seq > 0) {
+      // seq 同时写 localStorage 和 runningRunsBySession：
+      // activeEventSeqKey 服务当前页面刷新，runningRunsBySession 服务切会话后恢复。
       localStorage.setItem(activeEventSeqKey, String(storedEvent.seq));
     }
     applyAgentEvent(storedEvent.event, storedEvent.messageId, storedEvent.runId);
   }
 
   function applyStoredRunEvent(storedEvent: StoredAgentEvent, expectedRunId: string, expectedSessionId?: string) {
+    // SSE 是长连接。用户可能在旧连接还没彻底关闭时切到了别的会话/开启了新 run。
+    // 这里用 activeRunId、sessionId、event.runId 三重校验，防止旧流污染当前界面。
     if (activeRunIdRef.current !== expectedRunId) {
       return;
     }
@@ -995,6 +1020,8 @@ export default function App() {
     const runId = activeRunId;
     const controller = activeStreamControllerRef.current;
 
+    // 先中断本地 SSE 读取，再请求后端取消 run。
+    // 这样 UI 不会继续消费取消前后交错到达的旧流事件。
     controller?.abort();
 
     try {
@@ -1047,6 +1074,8 @@ export default function App() {
     const runId = runningRun.runId;
     const controller = new AbortController();
 
+    // 切回一个仍在生成的会话时，只恢复这个会话自己的 run。
+    // 先校验 run 快照属于该 session，再从 lastSeq 继续订阅。
     setIsStreaming(true);
     setActiveRun(runId);
     activeStreamControllerRef.current = controller;
@@ -1100,6 +1129,8 @@ export default function App() {
     }
 
     if (activeRunId) {
+      // 当前只允许前端界面绑定一个 active run。
+      // 用户提交新消息时先取消旧 run，避免两个 SSE 流同时写同一组 messages。
       await cancelActiveRun({ refreshAfterCancel: false, settleStreaming: false });
     }
 
@@ -1141,6 +1172,7 @@ export default function App() {
 
   async function handleRegenerateMessage(messageId: string) {
     if (activeRunId) {
+      // 重新生成本质上也是启动一个新的 run，所以同样先释放旧 run。
       await cancelActiveRun({ refreshAfterCancel: false, settleStreaming: false });
     }
 
@@ -1229,6 +1261,8 @@ export default function App() {
     }
 
     if (activeRunId) {
+      // 切会话时不一定取消后端 run，只是把当前前端流解绑。
+      // 如果那个会话还在跑，会记录在 runningRunsBySession，切回来时再恢复。
       detachActiveRun();
     }
 
