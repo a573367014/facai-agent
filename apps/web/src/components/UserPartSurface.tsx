@@ -72,15 +72,16 @@ function renderUserPart(part: MessagePart, index: number) {
     );
   }
 
-  const label = part.name || "图片";
+  const mediaLabel = getMediaLabel(part.mime);
+  const label = part.name || mediaLabel;
   const mediaAttrs = createMediaDataAttrs(part, index);
 
   return (
     <span className="pm-part pm-part--media" key={`media-${index}`} {...mediaAttrs}>
-      {part.url ? (
+      {part.url && !isVideoMime(part.mime) ? (
         <img className="pm-part-media-thumb" src={part.url} alt={label} draggable={false} />
       ) : (
-        <span className="pm-part-media-placeholder">图片</span>
+        <span className="pm-part-media-placeholder">{mediaLabel}</span>
       )}
       <span className="pm-part-media-name">{label}</span>
     </span>
@@ -88,8 +89,10 @@ function renderUserPart(part: MessagePart, index: number) {
 }
 
 function createMediaDataAttrs(part: MediaPart, index: number) {
+  const mediaLabel = getMediaLabel(part.mime);
+
   return {
-    "aria-label": part.name || "图片",
+    "aria-label": part.name || mediaLabel,
     "data-height": typeof part.height === "number" ? String(part.height) : undefined,
     "data-extra": part.extra ? JSON.stringify(part.extra) : undefined,
     "data-mime": part.mime ?? "",
@@ -100,6 +103,14 @@ function createMediaDataAttrs(part: MediaPart, index: number) {
     "data-user-part-kind": "media",
     "data-width": typeof part.width === "number" ? String(part.width) : undefined
   };
+}
+
+function isVideoMime(value?: string) {
+  return value?.startsWith("video/") ?? false;
+}
+
+function getMediaLabel(mime?: string) {
+  return isVideoMime(mime) ? "视频" : "图片";
 }
 
 function getSelectedDomParts(root: HTMLElement | null): MessagePart[] | undefined {

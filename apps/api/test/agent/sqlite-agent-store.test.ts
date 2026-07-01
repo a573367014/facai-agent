@@ -2,7 +2,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { InMemoryAgentCancellationStore } from "../../src/agent/agent-cancellation-store.js";
+import { InMemoryAgentEventBus } from "../../src/agent/agent-event-bus.js";
+import { InMemoryAgentRunLock } from "../../src/agent/agent-run-lock.js";
+import type { AgentRunJobPayload, AgentRunQueue } from "../../src/agent/agent-run-queue.js";
 import { AgentService } from "../../src/agent/agent-service.js";
+import { InMemoryRunningMessageStateStore } from "../../src/agent/running-message-state-store.js";
 import { SqliteAgentStore } from "../../src/agent/sqlite-agent-store.js";
 import { buildApp } from "../../src/app.js";
 import type { LlmProvider } from "../../src/providers/types.js";
@@ -11,6 +16,10 @@ import { ToolRegistry } from "../../src/tools/registry.js";
 import type { MessagePart } from "../../src/agent/message-parts.js";
 
 let tempDirs: string[] = [];
+
+class NoopAgentRunQueue implements AgentRunQueue {
+  async enqueueRun(_payload: AgentRunJobPayload): Promise<void> {}
+}
 
 function createTempDatabasePath() {
   const dir = mkdtempSync(join(tmpdir(), "agent-store-"));
@@ -115,6 +124,55 @@ describe("SqliteAgentStore", () => {
       }
     });
     secondStore.close();
+  });
+
+  it("多个已打开 store 会在文件变化后读到彼此写入", async () => {
+    const databasePath = createTempDatabasePath();
+    const apiStore = await SqliteAgentStore.create({ databasePath });
+    const workerStore = await SqliteAgentStore.create({ databasePath });
+
+    try {
+      const session = apiStore.createSession("queue session");
+      const userMessage = apiStore.createMessage({
+        sessionId: session.id,
+        role: "user",
+        status: "completed",
+        parts: [{ type: "text", value: "排队执行" }]
+      });
+      const run = apiStore.createRun({
+        sessionId: session.id,
+        userMessageId: userMessage.id,
+        status: "running",
+        phase: "answering"
+      });
+
+      expect(workerStore.getRun(run.id)).toMatchObject({
+        id: run.id,
+        status: "running"
+      });
+
+      const assistantMessage = workerStore.createMessage({
+        sessionId: session.id,
+        role: "assistant",
+        status: "completed",
+        parts: [{ type: "text", value: "完成" }]
+      });
+      workerStore.updateRun(run.id, {
+        status: "completed",
+        phase: "completed",
+        assistantMessageId: assistantMessage.id
+      });
+
+      expect(apiStore.getRun(run.id)).toMatchObject({
+        id: run.id,
+        status: "completed",
+        phase: "completed",
+        assistantMessageId: assistantMessage.id
+      });
+    } finally {
+      apiStore.close();
+      workerStore.close();
+    }
   });
 
   it("按版本追加 session summary，并能查询某条消息之前可用的摘要", async () => {
@@ -477,7 +535,7 @@ describe("SqliteAgentStore", () => {
     secondStore.close();
   });
 
-  it("重新创建 store 后仍能读回 session、messages 和 events", async () => {
+  it("重新创建 store 后仍能读回 session 和 messages", async () => {
     const databasePath = createTempDatabasePath();
     const firstStore = await SqliteAgentStore.create({ databasePath });
     const session = firstStore.createSession("图片会话");
@@ -494,14 +552,6 @@ describe("SqliteAgentStore", () => {
       parts: [{ type: "text", value: "" }]
     });
 
-    firstStore.appendEvent(assistantMessage.id, { type: "iteration_start", iteration: 0 });
-    firstStore.appendEvent(assistantMessage.id, {
-      type: "message.part.delta",
-      messageId: assistantMessage.id,
-      partIndex: 0,
-      delta: "你好世界"
-    });
-    firstStore.appendEvent(assistantMessage.id, { type: "final_answer", answer: "你好世界" });
     firstStore.updateMessage(assistantMessage.id, {
       status: "completed",
       parts: [{ type: "text", value: "你好世界" }],
@@ -510,8 +560,6 @@ describe("SqliteAgentStore", () => {
     firstStore.close();
 
     const secondStore = await SqliteAgentStore.create({ databasePath });
-    const storedEvents = secondStore.getEvents(assistantMessage.id);
-
     expect(secondStore.getSession(session.id)).toMatchObject({
       id: session.id,
       title: "图片会话"
@@ -530,21 +578,10 @@ describe("SqliteAgentStore", () => {
         parts: [{ type: "text", value: "你好世界" }]
       })
     ]);
-    expect(storedEvents.map((event) => event.seq)).toEqual([1, 2, 3]);
-    expect(storedEvents.map((event) => event.messageId)).toEqual([
-      assistantMessage.id,
-      assistantMessage.id,
-      assistantMessage.id
-    ]);
-    expect(storedEvents.map((event) => event.event)).toEqual([
-      { type: "iteration_start", iteration: 0 },
-      { type: "message.part.delta", messageId: assistantMessage.id, partIndex: 0, delta: "你好世界" },
-      { type: "final_answer", answer: "你好世界" }
-    ]);
     secondStore.close();
   });
 
-  it("run events 同时能按 run 和 message 读取", async () => {
+  it("run events 只通知当前 live 订阅者，不写入 SQLite 回放", async () => {
     const databasePath = createTempDatabasePath();
     const firstStore = await SqliteAgentStore.create({ databasePath });
     const session = firstStore.createSession("统一事件会话");
@@ -568,158 +605,20 @@ describe("SqliteAgentStore", () => {
       phase: "answering"
     });
 
+    const liveEvents: string[] = [];
+    const unsubscribe = firstStore.subscribeRun(run.id, (event) => {
+      liveEvents.push(event.event.type);
+    });
+
     firstStore.appendRunEvent(run.id, { type: "iteration_start", iteration: 0 }, assistantMessage.id);
     firstStore.appendRunEvent(run.id, { type: "run_completed", messageId: assistantMessage.id }, assistantMessage.id);
+    unsubscribe();
     firstStore.close();
 
     const secondStore = await SqliteAgentStore.create({ databasePath });
-    const runEvents = secondStore.getRunEvents(run.id);
-    const messageEvents = secondStore.getEvents(assistantMessage.id);
 
-    expect(runEvents.map((event) => event.seq)).toEqual([1, 2]);
-    expect(messageEvents.map((event) => event.seq)).toEqual([1, 2]);
-    expect(messageEvents).toEqual(runEvents);
-    expect(messageEvents.map((event) => event.runId)).toEqual([run.id, run.id]);
-    expect(messageEvents.map((event) => event.messageId)).toEqual([assistantMessage.id, assistantMessage.id]);
+    expect(liveEvents).toEqual(["iteration_start", "run_completed"]);
     secondStore.close();
-  });
-
-  it("按写入时固化的 expires_at 清理过期 message events 和 run events", async () => {
-    vi.useFakeTimers();
-    const databasePath = createTempDatabasePath();
-    const store = await SqliteAgentStore.create({ databasePath, eventRetentionDays: 3 });
-    const session = store.createSession("事件清理");
-    const userMessage = store.createMessage({
-      sessionId: session.id,
-      role: "user",
-      status: "completed",
-      parts: [{ type: "text", value: "生成图片" }]
-    });
-    const assistantMessage = store.createMessage({
-      sessionId: session.id,
-      role: "assistant",
-      status: "running",
-      parts: [{ type: "text", value: "" }]
-    });
-    const run = store.createRun({
-      sessionId: session.id,
-      userMessageId: userMessage.id,
-      assistantMessageId: assistantMessage.id,
-      status: "running",
-      phase: "answering"
-    });
-
-    vi.setSystemTime(new Date("2026-06-20T00:00:00.000Z"));
-    store.appendEvent(assistantMessage.id, { type: "iteration_start", iteration: 0 });
-    store.appendRunEvent(run.id, { type: "iteration_start", iteration: 0 }, assistantMessage.id);
-
-    vi.setSystemTime(new Date("2026-06-24T00:00:00.000Z"));
-    store.appendEvent(assistantMessage.id, { type: "final_answer", answer: "新事件" });
-    store.appendRunEvent(run.id, { type: "final_answer", answer: "新事件" }, assistantMessage.id);
-    store.close();
-
-    const reopenedStore = await SqliteAgentStore.create({ databasePath, eventRetentionDays: 10 });
-    const result = reopenedStore.pruneExpiredEvents({
-      nowIso: "2026-06-23T00:00:00.000Z",
-      batchSize: 10,
-      maxBatches: 2
-    });
-
-    expect(result).toEqual({ messageEvents: 1, runEvents: 1, batches: 1, reachedLimit: false });
-    expect(reopenedStore.getEvents(assistantMessage.id).map((event) => event.event)).toEqual([
-      { type: "final_answer", answer: "新事件" },
-      { type: "final_answer", answer: "新事件" }
-    ]);
-    expect(reopenedStore.getRunEvents(run.id).map((event) => event.event)).toEqual([
-      { type: "final_answer", answer: "新事件" }
-    ]);
-    reopenedStore.close();
-  });
-
-  it("按批次循环清理过期事件，并在达到最大批次数后停止", async () => {
-    vi.useFakeTimers();
-    const databasePath = createTempDatabasePath();
-    const store = await SqliteAgentStore.create({ databasePath, eventRetentionDays: 1 });
-    const session = store.createSession("批量清理");
-    const assistantMessage = store.createMessage({
-      sessionId: session.id,
-      role: "assistant",
-      status: "running",
-      parts: [{ type: "text", value: "" }]
-    });
-    const userMessage = store.createMessage({
-      sessionId: session.id,
-      role: "user",
-      status: "completed",
-      parts: [{ type: "text", value: "批量清理" }]
-    });
-    const run = store.createRun({
-      sessionId: session.id,
-      userMessageId: userMessage.id,
-      assistantMessageId: assistantMessage.id,
-      status: "running",
-      phase: "answering"
-    });
-
-    vi.setSystemTime(new Date("2026-06-20T00:00:00.000Z"));
-    for (let index = 0; index < 5; index += 1) {
-      store.appendEvent(assistantMessage.id, { type: "iteration_start", iteration: index });
-      store.appendRunEvent(run.id, { type: "iteration_start", iteration: index }, assistantMessage.id);
-    }
-
-    const firstResult = store.pruneExpiredEvents({
-      nowIso: "2026-06-22T00:00:00.000Z",
-      batchSize: 2,
-      maxBatches: 2
-    });
-
-    expect(firstResult).toEqual({ messageEvents: 4, runEvents: 4, batches: 2, reachedLimit: true });
-    expect(store.getEvents(assistantMessage.id).map((event) => event.event)).toEqual([
-      { type: "iteration_start", iteration: 4 },
-      { type: "iteration_start", iteration: 4 }
-    ]);
-    expect(store.getRunEvents(run.id).map((event) => event.event)).toEqual([
-      { type: "iteration_start", iteration: 4 }
-    ]);
-
-    const secondResult = store.pruneExpiredEvents({
-      nowIso: "2026-06-22T00:00:00.000Z",
-      batchSize: 2,
-      maxBatches: 2
-    });
-
-    expect(secondResult).toEqual({ messageEvents: 1, runEvents: 1, batches: 1, reachedLimit: false });
-    expect(store.getEvents(assistantMessage.id)).toEqual([]);
-    expect(store.getRunEvents(run.id)).toEqual([]);
-    store.close();
-  });
-
-  it("支持单批清理 2000 条过期事件", async () => {
-    vi.useFakeTimers();
-    const databasePath = createTempDatabasePath();
-    const store = await SqliteAgentStore.create({ databasePath, eventRetentionDays: 1 });
-    const session = store.createSession("大批量清理");
-    const assistantMessage = store.createMessage({
-      sessionId: session.id,
-      role: "assistant",
-      status: "running",
-      parts: [{ type: "text", value: "" }]
-    });
-
-    vi.setSystemTime(new Date("2026-06-20T00:00:00.000Z"));
-    for (let index = 0; index < 2000; index += 1) {
-      store.appendEvent(assistantMessage.id, { type: "iteration_start", iteration: index });
-    }
-
-    const result = store.pruneExpiredEvents({
-      nowIso: "2026-06-22T00:00:00.000Z",
-      batchSize: 2000,
-      maxBatches: 1
-    });
-
-    expect(result).toEqual({ messageEvents: 2000, runEvents: 0, batches: 1, reachedLimit: false });
-    expect(store.getEvents(assistantMessage.id)).toEqual([]);
-    store.close();
   });
 
   it("能按更新时间倒序列出持久化会话", async () => {
@@ -806,7 +705,6 @@ describe("SqliteAgentStore", () => {
       name: "image.png",
       status: "succeeded"
     });
-    firstStore.appendEvent(assistantMessage.id, { type: "final_answer", answer: "已生成" });
     firstStore.appendRunEvent(run.id, { type: "run_completed", messageId: assistantMessage.id }, assistantMessage.id);
     firstStore.upsertSessionSummary({
       sessionId: session.id,
@@ -835,9 +733,7 @@ describe("SqliteAgentStore", () => {
     expect(secondStore.deleteSession(session.id)).toBe(true);
     expect(secondStore.getSession(session.id)).toBeUndefined();
     expect(secondStore.getMessagesBySession(session.id)).toEqual([]);
-    expect(secondStore.getEvents(assistantMessage.id)).toEqual([]);
     expect(secondStore.getRun(run.id)).toBeUndefined();
-    expect(secondStore.getRunEvents(run.id)).toEqual([]);
     expect(secondStore.getToolCallsBySession(session.id)).toEqual([]);
     expect(secondStore.getResourcesByMessages([assistantMessage.id])).toEqual([]);
     expect(secondStore.listSessionSummaries(session.id)).toEqual([]);
@@ -852,7 +748,14 @@ describe("SqliteAgentStore", () => {
     process.env.AGENT_SQLITE_PATH = databasePath;
 
     try {
-      const app = await buildApp({ agentService: createTestAgentService() });
+      const app = await buildApp({
+        agentService: createTestAgentService(),
+        runningStateStore: new InMemoryRunningMessageStateStore(),
+        eventBus: new InMemoryAgentEventBus(),
+        runQueue: new NoopAgentRunQueue(),
+        cancellationStore: new InMemoryAgentCancellationStore(),
+        runLock: new InMemoryAgentRunLock()
+      });
       const response = await app.inject({
         method: "POST",
         url: "/agents/sessions",

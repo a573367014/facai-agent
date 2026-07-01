@@ -45,6 +45,8 @@ interface AgentConversationProps {
 }
 
 interface ScrollSnapshot {
+  // 记录一次渲染前的滚动状态。加载更早消息时列表高度会变，
+  // 用这些值可以把用户视野固定在原来的消息附近，而不是突然跳到顶部/底部。
   firstId?: string;
   lastId?: string;
   scrollHeight: number;
@@ -86,6 +88,7 @@ const messageActionTooltipSlotProps: TooltipProps["slotProps"] = {
 };
 
 function getLatestState(events: AgentStreamEvent[] = []) {
+  // Agent 状态事件是流式追加的，倒着找能拿到最新状态，用来显示“思考中/调用工具”等小标签。
   return [...events].reverse().find((event) => event.type === "agent_state");
 }
 
@@ -324,6 +327,8 @@ export function AgentConversation({
   }
 
   function requestLoadOlderMessages() {
+    // 只有明确的用户上滑才触发加载历史。
+    // 否则消息流式更新造成 scrollTop 接近顶部时，也可能误触发分页请求。
     if (
       !userScrollIntentRef.current ||
       !hasMoreMessages ||
@@ -425,6 +430,8 @@ export function AgentConversation({
     const isPrepending = previousSnapshot && previousSnapshot.lastId === lastId && previousSnapshot.firstId !== firstId;
 
     if (isPrepending) {
+      // prepend 历史消息会让 scrollHeight 变大。
+      // 新 scrollTop = 旧 scrollTop + 新旧高度差，用户眼前那条消息就不会位移。
       scrollElement.scrollTop = previousSnapshot.scrollTop + scrollElement.scrollHeight - previousSnapshot.scrollHeight;
       pendingPrependScrollSnapshotRef.current = undefined;
       previousScrollSnapshotRef.current = {
@@ -446,6 +453,8 @@ export function AgentConversation({
     const shouldAutoScroll = !previousSnapshot || isReplacingMessageList || isAtBottom(previousSnapshot);
 
     if (!shouldAutoScroll) {
+      // 用户正在看历史时，不因为新 token 到达就强行拉到底部。
+      // 只更新快照，保留用户当前阅读位置。
       previousScrollSnapshotRef.current = {
         firstId,
         lastId,

@@ -49,14 +49,16 @@ export const partSchema = new Schema({
         }
       ],
       toDOM: (node) => {
-        const label = node.attrs.name || "图片";
+        const isVideo = isVideoMime(node.attrs.mime);
+        const mediaLabel = getMediaLabel(node.attrs.mime);
+        const label = node.attrs.name || mediaLabel;
         const attrs: Record<string, string> = {
           class: "pm-part pm-part--media",
           contenteditable: "false",
           "data-mime": String(node.attrs.mime ?? ""),
           "data-url": String(node.attrs.url ?? ""),
           "data-name": String(node.attrs.name ?? ""),
-          title: "点击替换图片"
+          title: isVideo ? "已引用视频" : "点击替换图片"
         };
 
         if (node.attrs.size !== null && node.attrs.size !== undefined) {
@@ -75,17 +77,17 @@ export const partSchema = new Schema({
         return [
           "span",
           attrs,
-          node.attrs.url
+          node.attrs.url && !isVideo
             ? ["img", { class: "pm-part-media-thumb", src: node.attrs.url, alt: label, draggable: "false" }]
-            : ["span", { class: "pm-part-media-placeholder" }, "图片"],
+            : ["span", { class: "pm-part-media-placeholder" }, mediaLabel],
           ["span", { class: "pm-part-media-name" }, label],
           [
             "button",
             {
               class: "pm-part-media-remove",
               type: "button",
-              title: "删除图片",
-              "aria-label": `删除图片 ${label}`,
+              title: `删除${mediaLabel}`,
+              "aria-label": `删除${mediaLabel} ${label}`,
               contenteditable: "false",
               tabindex: "-1"
             },
@@ -108,4 +110,12 @@ function parseJsonDataAttribute(value?: string) {
   } catch {
     return null;
   }
+}
+
+function isVideoMime(value: unknown) {
+  return typeof value === "string" && value.startsWith("video/");
+}
+
+function getMediaLabel(mime: unknown) {
+  return isVideoMime(mime) ? "视频" : "图片";
 }

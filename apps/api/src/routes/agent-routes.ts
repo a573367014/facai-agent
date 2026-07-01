@@ -58,9 +58,6 @@ const runParamsSchema = z.object({
 const sessionParamsSchema = z.object({
   sessionId: z.string().min(1)
 });
-const eventsQuerySchema = z.object({
-  after: z.coerce.number().int().min(0).optional()
-});
 const sessionMessagesQuerySchema = z.object({
   before: z.string().min(1).optional(),
   limit: z.coerce.number().int().min(1).max(100).optional()
@@ -166,16 +163,6 @@ function parseSessionsQuery(query: unknown) {
   return parsed.data;
 }
 
-function parseEventsQuery(query: unknown) {
-  const parsed = eventsQuerySchema.safeParse(query);
-
-  if (!parsed.success) {
-    throw new AppError("VALIDATION_ERROR", "after 必须是大于等于 0 的整数", 400);
-  }
-
-  return parsed.data;
-}
-
 function parseSessionMessagesQuery(query: unknown) {
   const parsed = sessionMessagesQuerySchema.safeParse(query);
 
@@ -187,8 +174,7 @@ function parseSessionMessagesQuery(query: unknown) {
 }
 
 function formatStoredSseEvent(event: StoredAgentEvent): string {
-  const eventId = event.seq > 0 ? event.seq : event.id;
-  return `id: ${eventId}\ndata: ${JSON.stringify(event)}\n\n`;
+  return `id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`;
 }
 
 function isTerminalStoredEvent(event: StoredAgentEvent): boolean {
@@ -218,7 +204,6 @@ function createLiveSseEvent(input: {
 }): StoredAgentEvent {
   return {
     id: `event_live_${randomUUID()}`,
-    seq: 0,
     messageId: input.messageId,
     runId: input.runId,
     event: input.event,
@@ -283,11 +268,6 @@ export async function registerAgentRoutes(
     return coordinator.getSessionMessages(sessionId, { before, messageLimit: limit });
   });
 
-  app.post("/agents/messages", async (request, reply) => {
-    const input = parseMessageStartRequest(request.body);
-    reply.status(202).send(await coordinator.startMessage(input));
-  });
-
   app.post("/agents/runs", async (request, reply) => {
     const input = parseMessageStartRequest(request.body);
     reply.status(202).send(await coordinator.startRun(input));
@@ -335,12 +315,6 @@ export async function registerAgentRoutes(
     });
   });
 
-  app.post("/agents/sessions/:sessionId/messages", async (request, reply) => {
-    const { sessionId } = parseSessionParams(request.params);
-    const input = parseMessageRequest(request.body);
-    reply.status(202).send(await coordinator.startMessage({ ...input, sessionId }));
-  });
-
   app.post("/agents/sessions/:sessionId/runs", async (request, reply) => {
     const { sessionId } = parseSessionParams(request.params);
     const input = parseMessageRequest(request.body);
@@ -352,19 +326,9 @@ export async function registerAgentRoutes(
     return coordinator.getMessageSnapshot(messageId);
   });
 
-  app.get("/agents/messages/:messageId/debug/events", async (request) => {
-    const { messageId } = parseMessageParams(request.params);
-    return coordinator.getMessageDebugEvents(messageId);
-  });
-
   app.get("/agents/runs/:runId", async (request) => {
     const { runId } = parseRunParams(request.params);
     return coordinator.getRun(runId);
-  });
-
-  app.post("/agents/messages/:messageId/cancel", async (request) => {
-    const { messageId } = parseMessageParams(request.params);
-    return coordinator.cancelMessage(messageId);
   });
 
   app.post("/agents/runs/:runId/cancel", async (request) => {
@@ -377,96 +341,30 @@ export async function registerAgentRoutes(
     reply.status(202).send(await coordinator.regenerateMessage(messageId));
   });
 
-  app.get("/agents/messages/:messageId/events", async (request, reply) => {
-    const { messageId } = parseMessageParams(request.params);
-    parseEventsQuery(request.query);
-    await coordinator.getMessageSnapshot(messageId);
-
-    reply.raw.writeHead(200, buildSseHeaders(reply.getHeaders()));
-
-    const sentEventSeqs = new Set<number>();
-    let ended = false;
-    let unsubscribe = () => {};
-    const finish = () => {
-      if (ended) {
-        return;
-      }
-
-      ended = true;
-      unsubscribe();
-      reply.raw.end();
-    };
-    const writeStoredEvent = (event: StoredAgentEvent) => {
-      if (ended) {
-        return;
-      }
-
-      if (event.seq > 0 && sentEventSeqs.has(event.seq)) {
-        return;
-      }
-
-      if (event.seq > 0) {
-        sentEventSeqs.add(event.seq);
-      }
-
-      reply.raw.write(formatStoredSseEvent(event));
-
-      if (isTerminalStoredEvent(event)) {
-        finish();
-      }
-    };
-
-    unsubscribe = coordinator.subscribe(messageId, writeStoredEvent);
-    request.raw.on("close", () => {
-      if (!ended) {
-        ended = true;
-        unsubscribe();
-      }
-    });
-
-    const { message, resources, processSteps, version } = await coordinator.getMessageSnapshot(messageId);
-    writeStoredEvent(
-      createLiveSseEvent({
-        messageId,
-        event: { type: "message.snapshot", message, resources, processSteps, version }
-      })
-    );
-
-    if (message.status !== "running") {
-      finish();
-    }
-  });
-
-  app.get("/agents/runs/:runId/events", async (request, reply) => {
+  app.get("/agents/runs/:runId/stream", async (request, reply) => {
     const { runId } = parseRunParams(request.params);
-    parseEventsQuery(request.query);
     coordinator.getRun(runId);
 
     reply.raw.writeHead(200, buildSseHeaders(reply.getHeaders()));
 
-    const sentEventSeqs = new Set<number>();
+    // SSE 连接可能来自首次提交，也可能来自刷新后的恢复。
+    // 因此这里不只订阅 live event，还会在订阅后主动补一个 message.snapshot：
+    // - running 时 snapshot 从 Redis draft 读，能恢复当前生成中的 parts；
+    // - completed/failed/cancelled 时 snapshot 从 SQLite message 读，展示最终状态。
     let ended = false;
-    let unsubscribe = () => {};
+    let unsubscribe: () => void | Promise<void> = () => {};
     const finish = () => {
       if (ended) {
         return;
       }
 
       ended = true;
-      unsubscribe();
+      void unsubscribe();
       reply.raw.end();
     };
     const writeStoredEvent = (event: StoredAgentEvent) => {
       if (ended) {
         return;
-      }
-
-      if (event.seq > 0 && sentEventSeqs.has(event.seq)) {
-        return;
-      }
-
-      if (event.seq > 0) {
-        sentEventSeqs.add(event.seq);
       }
 
       reply.raw.write(formatStoredSseEvent(event));
@@ -476,11 +374,11 @@ export async function registerAgentRoutes(
       }
     };
 
-    unsubscribe = coordinator.subscribeRun(runId, writeStoredEvent);
+    unsubscribe = await coordinator.subscribeRun(runId, writeStoredEvent);
     request.raw.on("close", () => {
       if (!ended) {
         ended = true;
-        unsubscribe();
+        void unsubscribe();
       }
     });
 

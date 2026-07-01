@@ -1,14 +1,19 @@
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import type { FastifyInstance } from "fastify";
+import { InMemoryAgentCancellationStore } from "../../src/agent/agent-cancellation-store.js";
+import { InMemoryAgentEventBus } from "../../src/agent/agent-event-bus.js";
 import { AgentContextBuilder } from "../../src/agent/context-builder.js";
 import { AgentMessageCoordinator } from "../../src/agent/agent-message-coordinator.js";
+import { InMemoryAgentRunLock } from "../../src/agent/agent-run-lock.js";
+import type { AgentRunJobPayload, AgentRunQueue } from "../../src/agent/agent-run-queue.js";
 import { AgentService } from "../../src/agent/agent-service.js";
 import { AgentSummaryService } from "../../src/agent/agent-summary-service.js";
+import { InMemoryRunningMessageStateStore } from "../../src/agent/running-message-state-store.js";
 import { SqliteAgentStore } from "../../src/agent/sqlite-agent-store.js";
 import { buildApp } from "../../src/app.js";
 import type { LlmProvider } from "../../src/providers/types.js";
@@ -18,6 +23,29 @@ import { ToolRegistry } from "../../src/tools/registry.js";
 const apps: FastifyInstance[] = [];
 let tempDirs: string[] = [];
 
+class CapturingAgentRunQueue implements AgentRunQueue {
+  readonly jobs: AgentRunJobPayload[] = [];
+
+  async enqueueRun(payload: AgentRunJobPayload): Promise<void> {
+    this.jobs.push(payload);
+  }
+
+  takeNextJob(): AgentRunJobPayload {
+    const job = this.jobs.shift();
+
+    if (!job) {
+      throw new Error("expected queued agent run job");
+    }
+
+    return job;
+  }
+}
+
+type TestFastifyApp = FastifyInstance & {
+  agentCoordinator?: AgentMessageCoordinator;
+  testRunQueue: CapturingAgentRunQueue;
+};
+
 function createTempDatabasePath() {
   const dir = mkdtempSync(join(tmpdir(), "agent-routes-"));
   tempDirs.push(dir);
@@ -25,12 +53,33 @@ function createTempDatabasePath() {
 }
 
 async function buildTestApp(options: Parameters<typeof buildApp>[0]) {
+  const testRunQueue = new CapturingAgentRunQueue();
   const app = await buildApp({
     ...options,
+    runningStateStore: options.runningStateStore ?? new InMemoryRunningMessageStateStore(),
+    eventBus: options.eventBus ?? new InMemoryAgentEventBus(),
+    runQueue: testRunQueue,
+    cancellationStore: options.cancellationStore ?? new InMemoryAgentCancellationStore(),
+    runLock: options.runLock ?? new InMemoryAgentRunLock(),
     databasePath: createTempDatabasePath()
-  });
+  }) as TestFastifyApp;
+  app.testRunQueue = testRunQueue;
   apps.push(app);
   return app;
+}
+
+class FailingRunningMessageStateStore extends InMemoryRunningMessageStateStore {
+  async init(): ReturnType<InMemoryRunningMessageStateStore["init"]> {
+    throw new Error('Reached the max retries per request limit (which is 2). Refer to "maxRetriesPerRequest" option for details.');
+  }
+}
+
+async function executeNextQueuedRun(app: TestFastifyApp) {
+  if (!app.agentCoordinator) {
+    throw new Error("expected test app to expose AgentMessageCoordinator");
+  }
+
+  await app.agentCoordinator.executeQueuedRun(app.testRunQueue.takeNextJob());
 }
 
 function createMultipartPayload(input: { fieldName: string; fileName: string; contentType: string; content: string | Buffer }) {
@@ -83,32 +132,6 @@ function createTestAgentService(): AgentService {
   return createAgentService(provider, registry);
 }
 
-function createDeferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((promiseResolve, promiseReject) => {
-    resolve = promiseResolve;
-    reject = promiseReject;
-  });
-
-  return { promise, resolve, reject };
-}
-
-async function waitForMessage(app: FastifyInstance, messageId: string) {
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    const response = await app.inject({ method: "GET", url: `/agents/messages/${messageId}` });
-    const payload = response.json() as { message: { status: string } };
-
-    if (payload.message.status !== "running") {
-      return payload;
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-
-  throw new Error("message did not finish in time");
-}
-
 async function waitForRun(app: FastifyInstance, runId: string) {
   for (let attempt = 0; attempt < 10; attempt += 1) {
     const response = await app.inject({ method: "GET", url: `/agents/runs/${runId}` });
@@ -138,7 +161,6 @@ function parseSseEvents(body: string) {
 
       return JSON.parse(dataLine.slice("data: ".length)) as {
         id: string;
-        seq: number;
         messageId?: string;
         runId?: string;
         event: {
@@ -153,61 +175,33 @@ function parseSseEvents(body: string) {
 }
 
 describe("agent routes", () => {
-  it("启动后不会立即清理事件，会在配置的凌晨窗口清理过期事件", async () => {
-    vi.useFakeTimers();
-    const databasePath = createTempDatabasePath();
-    const store = await SqliteAgentStore.create({ databasePath, eventRetentionDays: 3 });
-
-    vi.setSystemTime(new Date(2026, 5, 20, 0, 0, 0, 0));
-    const session = store.createSession("事件清理");
-    const assistantMessage = store.createMessage({
-      sessionId: session.id,
-      role: "assistant",
-      status: "completed",
-      parts: [{ type: "text", value: "已有回答" }],
-      completedAt: "2026-06-22T00:00:01.000Z"
-    });
-    store.appendEvent(assistantMessage.id, { type: "final_answer", answer: "已有回答" });
-    store.close();
-
-    vi.setSystemTime(new Date(2026, 5, 24, 2, 30, 0, 0));
-    const app = await buildApp({
+  it("执行 run 会把 agent 过程事件写入本地 JSONL 日志", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-event-log-"));
+    tempDirs.push(dir);
+    const eventLogPath = join(dir, "agent-events.jsonl");
+    const app = await buildTestApp({
       agentService: createTestAgentService(),
-      databasePath,
-      eventCleanupHour: 3,
-      eventCleanupBatchSize: 10,
-      eventCleanupMaxBatches: 2
+      agentEventLogPath: eventLogPath
     });
-    apps.push(app);
-
-    const beforeResponse = await app.inject({
-      method: "GET",
-      url: `/agents/messages/${assistantMessage.id}`
+    const createResponse = await app.inject({
+      method: "POST",
+      url: "/agents/runs",
+      payload: { input: "你好" }
     });
+    const { run } = createResponse.json() as { run: { id: string } };
 
-    expect(beforeResponse.json()).toMatchObject({
-      events: [expect.objectContaining({ event: { type: "final_answer", answer: "已有回答" } })]
-    });
+    await executeNextQueuedRun(app);
 
-    await vi.advanceTimersByTimeAsync(29 * 60 * 1000);
+    expect(existsSync(eventLogPath)).toBe(true);
+    const logLines = readFileSync(eventLogPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { kind: string; eventType: string; runId: string });
 
-    const stillBeforeCleanupResponse = await app.inject({
-      method: "GET",
-      url: `/agents/messages/${assistantMessage.id}`
-    });
-
-    expect(stillBeforeCleanupResponse.json()).toMatchObject({
-      events: [expect.objectContaining({ event: { type: "final_answer", answer: "已有回答" } })]
-    });
-
-    await vi.advanceTimersByTimeAsync(60 * 1000);
-
-    const afterResponse = await app.inject({
-      method: "GET",
-      url: `/agents/messages/${assistantMessage.id}`
-    });
-
-    expect(afterResponse.json()).toMatchObject({ events: [] });
+    expect(logLines.map((line) => line.eventType)).toEqual(
+      expect.arrayContaining(["session.message.created", "final_answer", "session.message.updated", "run_completed"])
+    );
+    expect(logLines.every((line) => line.kind === "agent_event" && line.runId === run.id)).toBe(true);
   });
 
   it("GET /health 返回 ok", async () => {
@@ -381,50 +375,32 @@ describe("agent routes", () => {
     expect(response.headers["access-control-allow-origin"]).toBeUndefined();
   });
 
-  it("POST /agents/messages 创建 session、user message 和后台 assistant message", async () => {
+  it("旧 message 执行入口不再对外提供", async () => {
     const app = await buildTestApp({ agentService: createTestAgentService() });
-    const response = await app.inject({
+    const createSessionResponse = await app.inject({
+      method: "POST",
+      url: "/agents/sessions",
+      payload: { title: "旧入口测试" }
+    });
+    const { session } = createSessionResponse.json() as { session: { id: string } };
+    const rootResponse = await app.inject({
       method: "POST",
       url: "/agents/messages",
       payload: { input: "你好" }
     });
-
-    expect(response.statusCode).toBe(202);
-    const payload = response.json() as {
-      session: { id: string };
-      userMessage: { id: string; role: string; status: string; parts: unknown[] };
-      assistantMessage: { id: string; sessionId: string; role: string; status: string; parts: unknown[] };
-    };
-
-    expect(payload.session.id).toMatch(/^session_/);
-    expect(payload.userMessage).toMatchObject({
-      role: "user",
-      status: "completed",
-      parts: [{ type: "text", value: "你好" }]
+    const sessionResponse = await app.inject({
+      method: "POST",
+      url: `/agents/sessions/${session.id}/messages`,
+      payload: { input: "你好" }
     });
-    expect(payload.userMessage).not.toHaveProperty("content");
-    expect(payload.userMessage).not.toHaveProperty("assets");
-    expect(payload.assistantMessage.id).toMatch(/^msg_/);
-    expect(payload.assistantMessage.sessionId).toBe(payload.session.id);
-    expect(payload.assistantMessage).toMatchObject({
-      role: "assistant",
-      status: "running",
-      parts: []
+    const cancelResponse = await app.inject({
+      method: "POST",
+      url: "/agents/messages/msg_legacy/cancel"
     });
-    expect(payload.assistantMessage).not.toHaveProperty("content");
-    expect(payload.assistantMessage).not.toHaveProperty("assets");
 
-    const completed = await waitForMessage(app, payload.assistantMessage.id);
-    expect(completed.message).toMatchObject({
-      id: payload.assistantMessage.id,
-      sessionId: payload.session.id,
-      role: "assistant",
-      status: "completed",
-      parts: [{ type: "text", value: "测试回答" }]
-    });
-    expect(completed.message).not.toHaveProperty("content");
-    expect(completed.message).not.toHaveProperty("assets");
-    expect(completed.message).not.toHaveProperty("steps");
+    expect(rootResponse.statusCode).toBe(404);
+    expect(sessionResponse.statusCode).toBe(404);
+    expect(cancelResponse.statusCode).toBe(404);
   });
 
   it("GET /agents/sessions 支持按 cursor 分页", async () => {
@@ -477,8 +453,8 @@ describe("agent routes", () => {
     const app = await buildTestApp({ agentService: createTestAgentService() });
     const createResponse = await app.inject({
       method: "POST",
-      url: "/agents/messages",
-      payload: { input: "要删除的会话" }
+      url: "/agents/sessions",
+      payload: { title: "要删除的会话" }
     });
     const { session } = createResponse.json() as { session: { id: string } };
 
@@ -499,11 +475,11 @@ describe("agent routes", () => {
     });
   });
 
-  it("POST /agents/messages 支持直接提交 message parts", async () => {
+  it("POST /agents/runs 支持直接提交 message parts", async () => {
     const app = await buildTestApp({ agentService: createTestAgentService() });
     const response = await app.inject({
       method: "POST",
-      url: "/agents/messages",
+      url: "/agents/runs",
       payload: {
         parts: [
           { type: "text", value: "帮我生成图片" },
@@ -529,6 +505,7 @@ describe("agent routes", () => {
       };
     };
 
+    expect(payload).toHaveProperty("run");
     expect(payload.userMessage.parts).toEqual([
       { type: "text", value: "帮我生成图片" },
       {
@@ -546,7 +523,7 @@ describe("agent routes", () => {
     expect(payload.userMessage).not.toHaveProperty("content");
   });
 
-  it("POST /agents/runs 创建 run，并在后台生成 assistant message", async () => {
+  it("POST /agents/runs 创建 run，并投递给 worker 队列", async () => {
     const app = await buildTestApp({ agentService: createTestAgentService() });
     const response = await app.inject({
       method: "POST",
@@ -565,8 +542,9 @@ describe("agent routes", () => {
     expect(payload.run.id).toMatch(/^run_/);
     expect(payload.run).toMatchObject({
       status: "running",
-      phase: "compressing",
-      userMessageId: payload.userMessage.id
+      phase: "answering",
+      userMessageId: payload.userMessage.id,
+      assistantMessageId: expect.stringMatching(/^msg_/)
     });
     expect(payload.assistantMessage).toBeUndefined();
     expect(payload.userMessage).toMatchObject({
@@ -574,7 +552,16 @@ describe("agent routes", () => {
       status: "completed",
       parts: [{ type: "text", value: "你好" }]
     });
+    expect(app.testRunQueue.jobs).toEqual([
+      {
+        runId: payload.run.id,
+        sessionId: payload.session.id,
+        userMessageId: payload.userMessage.id,
+        assistantMessageId: payload.run.assistantMessageId
+      }
+    ]);
 
+    await executeNextQueuedRun(app);
     const completed = await waitForRun(app, payload.run.id);
     expect(completed.run).toMatchObject({
       id: payload.run.id,
@@ -584,6 +571,42 @@ describe("agent routes", () => {
       userMessageId: payload.userMessage.id,
       assistantMessageId: expect.stringMatching(/^msg_/)
     });
+  });
+
+  it("POST /agents/runs 在 Redis 运行时不可用时返回运行时依赖错误", async () => {
+    const app = await buildTestApp({
+      agentService: createTestAgentService(),
+      runningStateStore: new FailingRunningMessageStateStore()
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: "/agents/runs",
+      payload: { input: "现在上海时间是多少？" }
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({
+      error: {
+        code: "RUNTIME_DEPENDENCY_ERROR",
+        message: "运行时依赖 Redis 暂不可用，请确认 Redis 已启动并检查 REDIS_URL。"
+      }
+    });
+
+    const sessionsResponse = await app.inject({ method: "GET", url: "/agents/sessions" });
+    const { sessions } = sessionsResponse.json() as { sessions: Array<{ id: string }> };
+    const sessionResponse = await app.inject({ method: "GET", url: `/agents/sessions/${sessions[0]!.id}` });
+    const { messages } = sessionResponse.json() as {
+      messages: Array<{ role: string; status: string; error?: { code: string } }>;
+    };
+
+    expect(messages).toEqual([
+      expect.objectContaining({ role: "user", status: "completed" }),
+      expect.objectContaining({
+        role: "assistant",
+        status: "failed",
+        error: { code: "RUNTIME_DEPENDENCY_ERROR", message: "运行时依赖 Redis 暂不可用，请确认 Redis 已启动并检查 REDIS_URL。" }
+      })
+    ]);
   });
 
   it("buildApp 启动时清理上次进程遗留的 running run", async () => {
@@ -611,7 +634,15 @@ describe("agent routes", () => {
     });
     store.close();
 
-    const app = await buildApp({ databasePath, agentService: createTestAgentService() });
+    const app = await buildApp({
+      databasePath,
+      agentService: createTestAgentService(),
+      runningStateStore: new InMemoryRunningMessageStateStore(),
+      eventBus: new InMemoryAgentEventBus(),
+      runQueue: new CapturingAgentRunQueue(),
+      cancellationStore: new InMemoryAgentCancellationStore(),
+      runLock: new InMemoryAgentRunLock()
+    });
     apps.push(app);
     const response = await app.inject({
       method: "GET",
@@ -619,7 +650,6 @@ describe("agent routes", () => {
     });
     const payload = response.json() as {
       run: { status: string; phase: string; error?: { code: string; message: string } };
-      events: Array<{ event: { type: string; code?: string } }>;
     };
 
     expect(payload.run).toMatchObject({
@@ -630,10 +660,9 @@ describe("agent routes", () => {
         message: "服务重启后清理遗留运行"
       }
     });
-    expect(payload.events.map((event) => event.event.type)).toContain("error");
   });
 
-  it("GET /agents/runs/:runId/events 返回当前 assistant message snapshot", async () => {
+  it("GET /agents/runs/:runId/stream 返回当前 assistant message snapshot", async () => {
     const app = await buildTestApp({ agentService: createTestAgentService() });
     const createResponse = await app.inject({
       method: "POST",
@@ -642,11 +671,11 @@ describe("agent routes", () => {
     });
     const { run } = createResponse.json() as { run: { id: string } };
 
-    await waitForRun(app, run.id);
+    await executeNextQueuedRun(app);
 
     const response = await app.inject({
       method: "GET",
-      url: `/agents/runs/${run.id}/events?after=0`
+      url: `/agents/runs/${run.id}/stream`
     });
 
     expect(response.statusCode).toBe(200);
@@ -655,7 +684,6 @@ describe("agent routes", () => {
 
     expect(events).toEqual([
       expect.objectContaining({
-        seq: 0,
         runId: run.id,
         event: expect.objectContaining({
           type: "message.snapshot",
@@ -670,46 +698,7 @@ describe("agent routes", () => {
     expect(response.body).toContain(`"runId":"${run.id}"`);
   });
 
-  it("GET /agents/messages/:messageId/debug/events 根据 assistant messageId 反查 run events", async () => {
-    const app = await buildTestApp({ agentService: createTestAgentService() });
-    const createResponse = await app.inject({
-      method: "POST",
-      url: "/agents/runs",
-      payload: { input: "你好" }
-    });
-    const { run } = createResponse.json() as { run: { id: string } };
-    const completed = await waitForRun(app, run.id);
-    const assistantMessageId = completed.run.assistantMessageId as string;
-
-    const response = await app.inject({
-      method: "GET",
-      url: `/agents/messages/${assistantMessageId}/debug/events`
-    });
-    const payload = response.json() as {
-      message: { id: string };
-      runs: Array<{ id: string; assistantMessageId?: string }>;
-      messageEvents: Array<{ id: string; runId?: string; messageId?: string; event: { type: string } }>;
-      runEvents: Array<{ id: string; runId?: string; messageId?: string; event: { type: string } }>;
-      events: Array<{ id: string; runId?: string; messageId?: string; event: { type: string } }>;
-    };
-
-    expect(response.statusCode).toBe(200);
-    expect(payload.message.id).toBe(assistantMessageId);
-    expect(payload.runs).toEqual([
-      expect.objectContaining({
-        id: run.id,
-        assistantMessageId
-      })
-    ]);
-    expect(payload.messageEvents.map((event) => event.event.type)).toContain("run_completed");
-    expect(payload.messageEvents.every((event) => event.messageId === assistantMessageId)).toBe(true);
-    expect(payload.runEvents.map((event) => event.event.type)).toContain("run_completed");
-    expect(payload.runEvents.every((event) => event.runId === run.id)).toBe(true);
-    expect(new Set(payload.events.map((event) => event.id)).size).toBe(payload.events.length);
-    expect(payload.events.map((event) => event.event.type)).toEqual(payload.runEvents.map((event) => event.event.type));
-  });
-
-  it("POST /agents/sessions/:sessionId/messages 不返回压缩 prelude，摘要在 message 完成后静默刷新", async () => {
+  it("POST /agents/sessions/:sessionId/runs 不返回压缩 prelude，压缩进度通过 run 持久化", async () => {
     let answerCount = 0;
     const registry = new ToolRegistry();
     const answerProvider: LlmProvider = {
@@ -750,31 +739,31 @@ describe("agent routes", () => {
     try {
       const firstResponse = await app.inject({
         method: "POST",
-        url: "/agents/messages",
+        url: "/agents/runs",
         payload: { input: "第一轮问题" }
       });
       const firstPayload = firstResponse.json() as {
         session: { id: string };
-        assistantMessage: { id: string };
+        run: { id: string };
       };
-      await waitForMessage(app, firstPayload.assistantMessage.id);
+      await waitForRun(app, firstPayload.run.id);
 
       const secondResponse = await app.inject({
         method: "POST",
-        url: `/agents/sessions/${firstPayload.session.id}/messages`,
+        url: `/agents/sessions/${firstPayload.session.id}/runs`,
         payload: { input: "第二轮问题" }
       });
-      const secondPayload = secondResponse.json() as { assistantMessage: { id: string } };
-      await waitForMessage(app, secondPayload.assistantMessage.id);
+      const secondPayload = secondResponse.json() as { run: { id: string } };
+      await waitForRun(app, secondPayload.run.id);
 
       const thirdResponse = await app.inject({
         method: "POST",
-        url: `/agents/sessions/${firstPayload.session.id}/messages`,
+        url: `/agents/sessions/${firstPayload.session.id}/runs`,
         payload: { input: "第三轮问题" }
       });
       const thirdPayload = thirdResponse.json() as {
         userMessage: { role: string; parts: Array<{ type: string; value: string }> };
-        assistantMessage: { id: string; role: string; status: string };
+        run: { id: string; status: string };
         preludeMessages?: unknown[];
         preludeEvents?: unknown[];
       };
@@ -786,12 +775,26 @@ describe("agent routes", () => {
         role: "user",
         parts: [{ type: "text", value: "第三轮问题" }]
       });
-      expect(thirdPayload.assistantMessage).toMatchObject({
-        role: "assistant",
+      expect(thirdPayload.run).toMatchObject({
         status: "running"
       });
+      const completedThirdRun = await waitForRun(app, thirdPayload.run.id) as {
+        run: { status: string; phase: string; systemMessageId?: string };
+      };
+      const systemMessage = store
+        .getMessagesBySession(firstPayload.session.id)
+        .find((message) => message.id === completedThirdRun.run.systemMessageId);
+
       expect(store.getSessionSummary(firstPayload.session.id)).toBeDefined();
-      expect(store.getMessagesBySession(firstPayload.session.id).some((message) => message.role === "system")).toBe(false);
+      expect(completedThirdRun.run).toMatchObject({
+        status: "completed",
+        phase: "completed"
+      });
+      expect(systemMessage).toMatchObject({
+        role: "system",
+        status: "completed",
+        parts: [{ type: "text", value: "上下文已自动压缩" }]
+      });
     } finally {
       store.close();
     }
@@ -814,7 +817,7 @@ describe("agent routes", () => {
 
     await app.inject({
       method: "POST",
-      url: `/agents/sessions/${firstSession.session.id}/messages`,
+      url: `/agents/sessions/${firstSession.session.id}/runs`,
       payload: { input: "让第一段会话更新" }
     });
 
@@ -826,100 +829,6 @@ describe("agent routes", () => {
 
     expect(response.statusCode).toBe(200);
     expect(payload.sessions.map((session) => session.id)).toEqual([firstSession.session.id, secondSession.session.id]);
-  });
-
-  it("GET /agents/messages/:messageId/events 建连时先返回 message snapshot", async () => {
-    const app = await buildTestApp({ agentService: createTestAgentService() });
-    const createResponse = await app.inject({
-      method: "POST",
-      url: "/agents/messages",
-      payload: { input: "你好" }
-    });
-    const { assistantMessage } = createResponse.json() as { assistantMessage: { id: string } };
-
-    await waitForMessage(app, assistantMessage.id);
-
-    const response = await app.inject({
-      method: "GET",
-      url: `/agents/messages/${assistantMessage.id}/events?after=0`
-    });
-
-    expect(response.statusCode).toBe(200);
-    expect(response.headers["content-type"]).toContain("text/event-stream");
-    const events = parseSseEvents(response.body);
-
-    expect(events[0]).toMatchObject({
-      seq: 0,
-      messageId: assistantMessage.id,
-      event: {
-        type: "message.snapshot",
-        message: {
-          id: assistantMessage.id,
-          status: "completed",
-          parts: [{ type: "text", value: "测试回答" }]
-        },
-        resources: []
-      }
-    });
-    expect(events.map((event) => event.event.type)).toEqual(["message.snapshot"]);
-  });
-
-  it("GET /agents/messages/:messageId/events 在运行中使用 running draft 返回 snapshot", async () => {
-    const firstDeltaReceived = createDeferred<void>();
-    const allowFinish = createDeferred<void>();
-    const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async () => {
-        throw new Error("streaming path should be used");
-      },
-      completeStream: async (_request, onDelta) => {
-        await onDelta("正在生成");
-        firstDeltaReceived.resolve();
-        await allowFinish.promise;
-        await onDelta("完成");
-        return { content: "正在生成完成" };
-      }
-    };
-    const app = await buildTestApp({
-      agentService: createAgentService(provider, registry)
-    });
-    const createResponse = await app.inject({
-      method: "POST",
-      url: "/agents/messages",
-      payload: { input: "写一段话" }
-    });
-    const { assistantMessage } = createResponse.json() as { assistantMessage: { id: string } };
-
-    try {
-      await firstDeltaReceived.promise;
-
-      const eventsResponsePromise = app.inject({
-        method: "GET",
-        url: `/agents/messages/${assistantMessage.id}/events?after=0`
-      });
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      allowFinish.resolve();
-
-      const response = await eventsResponsePromise;
-      const events = parseSseEvents(response.body);
-
-      expect(events[0]).toMatchObject({
-        seq: 0,
-        messageId: assistantMessage.id,
-        event: {
-          type: "message.snapshot",
-          version: 1,
-          message: {
-            id: assistantMessage.id,
-            status: "running",
-            parts: [{ type: "text", value: "正在生成" }]
-          }
-        }
-      });
-    } finally {
-      allowFinish.resolve();
-      await waitForMessage(app, assistantMessage.id);
-    }
   });
 
   it("POST /agents/messages/:messageId/regenerate 会基于旧 assistant 重新创建 run", async () => {
@@ -972,94 +881,6 @@ describe("agent routes", () => {
     store.close();
   });
 
-  it("GET /agents/messages/:messageId 只持久化关键事件，不持久化 message part delta", async () => {
-    const deltaParts = ["这", "是", "一", "段", "需", "要", "合", "并", "的", "流", "式", "回", "答"];
-    const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async () => {
-        throw new Error("streaming path should be used");
-      },
-      completeStream: async (_request, onDelta) => {
-        for (const part of deltaParts) {
-          await onDelta(part);
-        }
-
-        return { content: deltaParts.join("") };
-      }
-    };
-    const app = await buildTestApp({
-      agentService: createAgentService(provider, registry)
-    });
-    const createResponse = await app.inject({
-      method: "POST",
-      url: "/agents/messages",
-      payload: { input: "生成一段话" }
-    });
-    const { assistantMessage } = createResponse.json() as { assistantMessage: { id: string } };
-
-    await waitForMessage(app, assistantMessage.id);
-
-    const snapshotResponse = await app.inject({
-      method: "GET",
-      url: `/agents/messages/${assistantMessage.id}`
-    });
-    const snapshot = snapshotResponse.json() as {
-      events: Array<{ event: { type: string; delta?: string } }>;
-    };
-    const answerDeltaEvents = snapshot.events.filter((event) => event.event.type === "answer_delta");
-    const partDeltaEvents = snapshot.events.filter((event) => event.event.type === "message.part.delta");
-
-    expect(answerDeltaEvents).toEqual([]);
-    expect(partDeltaEvents).toEqual([]);
-    expect(snapshot.events.map((event) => event.event.type)).toContain("final_answer");
-  });
-
-  it("POST /agents/messages/:messageId/cancel 会中断运行中的 assistant message", async () => {
-    const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async () => {
-        throw new Error("streaming path should be used");
-      },
-      completeStream: async (request) => {
-        const signal = (request as { signal?: AbortSignal }).signal;
-
-        await new Promise((_resolve, reject) => {
-          signal?.addEventListener("abort", () => {
-            reject(new DOMException("Aborted", "AbortError"));
-          });
-        });
-
-        return { content: "不应该返回" };
-      }
-    };
-    const app = await buildTestApp({
-      agentService: createAgentService(provider, registry)
-    });
-    const createResponse = await app.inject({
-      method: "POST",
-      url: "/agents/messages",
-      payload: { input: "生成一段长回答" }
-    });
-    const { assistantMessage } = createResponse.json() as { assistantMessage: { id: string } };
-
-    const cancelResponse = await app.inject({
-      method: "POST",
-      url: `/agents/messages/${assistantMessage.id}/cancel`
-    });
-    const snapshotResponse = await app.inject({
-      method: "GET",
-      url: `/agents/messages/${assistantMessage.id}`
-    });
-    const snapshot = snapshotResponse.json() as {
-      message: { status: string };
-      events: Array<{ event: { type: string; label?: string; code?: string } }>;
-    };
-
-    expect(cancelResponse.statusCode).toBe(200);
-    expect(snapshot.message.status).toBe("cancelled");
-    expect(snapshot.events.map((event) => event.event.type)).toContain("cancelled");
-  });
-
   it("同一 session 的后续 assistant message 会带上历史消息", async () => {
     const calls: string[][] = [];
     const registry = new ToolRegistry();
@@ -1075,24 +896,26 @@ describe("agent routes", () => {
 
     const firstResponse = await app.inject({
       method: "POST",
-      url: "/agents/messages",
+      url: "/agents/runs",
       payload: { input: "第一轮问题" }
     });
     const firstPayload = firstResponse.json() as {
       session: { id: string };
-      assistantMessage: { id: string };
+      run: { id: string };
     };
-    await waitForMessage(app, firstPayload.assistantMessage.id);
+    await executeNextQueuedRun(app);
+    await waitForRun(app, firstPayload.run.id);
 
     const secondResponse = await app.inject({
       method: "POST",
-      url: `/agents/sessions/${firstPayload.session.id}/messages`,
+      url: `/agents/sessions/${firstPayload.session.id}/runs`,
       payload: { input: "第二轮问题" }
     });
     const secondPayload = secondResponse.json() as {
-      assistantMessage: { id: string };
+      run: { id: string };
     };
-    await waitForMessage(app, secondPayload.assistantMessage.id);
+    await executeNextQueuedRun(app);
+    await waitForRun(app, secondPayload.run.id);
 
     expect(calls[1]).toEqual([
       expect.stringMatching(/^system:/),
@@ -1160,15 +983,16 @@ describe("agent routes", () => {
     });
     const createResponse = await app.inject({
       method: "POST",
-      url: "/agents/messages",
+      url: "/agents/runs",
       payload: { input: "帮我生成小猪图" }
     });
     const created = createResponse.json() as {
       session: { id: string };
-      assistantMessage: { id: string };
+      run: { id: string; assistantMessageId: string };
     };
 
-    await waitForMessage(app, created.assistantMessage.id);
+    await executeNextQueuedRun(app);
+    await waitForRun(app, created.run.id);
 
     const sessionResponse = await app.inject({
       method: "GET",
@@ -1212,7 +1036,7 @@ describe("agent routes", () => {
     };
 
     expect(sessionResponse.statusCode).toBe(200);
-    const assistant = payload.messages.find((message) => message.id === created.assistantMessage.id);
+    const assistant = payload.messages.find((message) => message.id === created.run.assistantMessageId);
     const mediaPart = assistant?.parts.find((part) => part.type === "media");
     const resourceId = mediaPart?.extra?.resource?.id;
 
@@ -1229,7 +1053,7 @@ describe("agent routes", () => {
     expect(payload.resources).toEqual([
       expect.objectContaining({
         id: resourceId,
-        messageId: created.assistantMessage.id,
+        messageId: created.run.assistantMessageId,
         type: "image",
         mime: "image/png",
         status: "succeeded",
@@ -1244,7 +1068,7 @@ describe("agent routes", () => {
         parts: [{ type: "text", value: "帮我生成小猪图" }]
       }),
       expect.objectContaining({
-        id: created.assistantMessage.id,
+        id: created.run.assistantMessageId,
         role: "assistant",
         status: "completed",
         parts: [
@@ -1284,24 +1108,26 @@ describe("agent routes", () => {
     });
     const firstResponse = await app.inject({
       method: "POST",
-      url: "/agents/messages",
+      url: "/agents/runs",
       payload: { input: "第 1 轮问题" }
     });
     const firstPayload = firstResponse.json() as {
       session: { id: string };
-      assistantMessage: { id: string };
+      run: { id: string };
     };
 
-    await waitForMessage(app, firstPayload.assistantMessage.id);
+    await executeNextQueuedRun(app);
+    await waitForRun(app, firstPayload.run.id);
 
     for (const round of [2, 3, 4]) {
       const response = await app.inject({
         method: "POST",
-        url: `/agents/sessions/${firstPayload.session.id}/messages`,
+        url: `/agents/sessions/${firstPayload.session.id}/runs`,
         payload: { input: `第 ${round} 轮问题` }
       });
-      const payload = response.json() as { assistantMessage: { id: string } };
-      await waitForMessage(app, payload.assistantMessage.id);
+      const payload = response.json() as { run: { id: string } };
+      await executeNextQueuedRun(app);
+      await waitForRun(app, payload.run.id);
     }
 
     const recentResponse = await app.inject({

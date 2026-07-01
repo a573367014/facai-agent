@@ -23,6 +23,8 @@ export interface RedisRunningMessageStateStoreOptions {
 const defaultKeyPrefix = "agent";
 const defaultTtlSeconds = 2 * 60 * 60;
 
+// delta 追加和 parts 替换必须原子更新 version/updatedAt/TTL。
+// 如果用 get -> JS 修改 -> set，两个 Worker 或重试执行交错时可能覆盖彼此的 draft。
 const appendTextDeltaScript = `
 local key = KEYS[1]
 local delta = ARGV[1]
@@ -94,6 +96,8 @@ export class RedisRunningMessageStateStore implements RunningMessageStateStore {
   }
 
   async init(input: InitRunningMessageStateInput): Promise<RunningMessageState> {
+    // 这里保存的是“生成中的 assistant 草稿”，不是最终消息。
+    // 完成后 coordinator 会把最终 parts 写回 SQLite message，并删除这个 Redis key。
     const timestamp = this.now();
     const state: RunningMessageState = {
       messageId: input.messageId,
@@ -115,6 +119,8 @@ export class RedisRunningMessageStateStore implements RunningMessageStateStore {
   }
 
   async appendTextDelta(messageId: string, delta: string): Promise<RunningMessageDeltaResult | undefined> {
+    // 流式文本走 appendTextDelta，只更新 Redis draft 并递增 version。
+    // 前端收到 delta 或 snapshot 时可以用 version 判断乱序和重复。
     const rawResult = await this.options.client.eval(
       appendTextDeltaScript,
       1,

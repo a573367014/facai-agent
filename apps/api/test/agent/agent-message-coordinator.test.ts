@@ -8,6 +8,11 @@ import { AgentMessageCoordinator } from "../../src/agent/agent-message-coordinat
 import { AgentSummaryService } from "../../src/agent/agent-summary-service.js";
 import { SqliteAgentStore } from "../../src/agent/sqlite-agent-store.js";
 import { AgentService } from "../../src/agent/agent-service.js";
+import type { AgentRunQueue, AgentRunJobPayload } from "../../src/agent/agent-run-queue.js";
+import type { AgentEventBus } from "../../src/agent/agent-event-bus.js";
+import type { AgentEventListener, StoredAgentEvent } from "../../src/agent/agent-store.js";
+import type { AgentCancellationStore } from "../../src/agent/agent-cancellation-store.js";
+import type { AgentRunLock, AgentRunLockLease } from "../../src/agent/agent-run-lock.js";
 import type { LlmProvider } from "../../src/providers/types.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
 import { ToolRegistry } from "../../src/tools/registry.js";
@@ -55,6 +60,39 @@ async function waitForRun(coordinator: AgentMessageCoordinator, runId: string) {
   throw new Error("run did not finish in time");
 }
 
+async function waitForRunAssistantMessageId(coordinator: AgentMessageCoordinator, runId: string) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const { run } = coordinator.getRun(runId);
+
+    if (run.assistantMessageId) {
+      return run.assistantMessageId;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
+  throw new Error("run did not create assistant message in time");
+}
+
+async function startRunAndWait(
+  coordinator: AgentMessageCoordinator,
+  input: Parameters<AgentMessageCoordinator["startRun"]>[0]
+) {
+  const started = await coordinator.startRun(input);
+  const run = await waitForRun(coordinator, started.run.id);
+  const assistantMessageId = run.assistantMessageId;
+
+  if (!assistantMessageId) {
+    throw new Error("completed run is missing assistant message");
+  }
+
+  return {
+    ...started,
+    run,
+    assistantMessage: coordinator.getMessage(assistantMessageId).message
+  };
+}
+
 async function waitForSessionSummary(store: SqliteAgentStore, sessionId: string) {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const summary = store.getSessionSummary(sessionId);
@@ -67,20 +105,6 @@ async function waitForSessionSummary(store: SqliteAgentStore, sessionId: string)
   }
 
   throw new Error("summary did not finish in time");
-}
-
-async function waitForEventType(store: SqliteAgentStore, messageId: string, eventType: string) {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    const event = store.getEvents(messageId).find((storedEvent) => storedEvent.event.type === eventType);
-
-    if (event) {
-      return event.event;
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-
-  throw new Error(`event ${eventType} did not appear in time`);
 }
 
 function createDeferred<T>() {
@@ -103,7 +127,435 @@ function createAgentService(provider: LlmProvider, registry: ToolRegistry) {
   });
 }
 
+class FakeAgentEventBus implements AgentEventBus {
+  private readonly runListeners = new Map<string, Set<AgentEventListener>>();
+
+  async publishRunEvent(runId: string, event: StoredAgentEvent): Promise<void> {
+    for (const listener of this.runListeners.get(runId) ?? []) {
+      listener(event);
+    }
+  }
+
+  async subscribeRun(runId: string, listener: AgentEventListener): Promise<() => void> {
+    return this.addListener(this.runListeners, runId, listener);
+  }
+
+  private addListener(listenersById: Map<string, Set<AgentEventListener>>, id: string, listener: AgentEventListener) {
+    const listeners = listenersById.get(id) ?? new Set<AgentEventListener>();
+    listeners.add(listener);
+    listenersById.set(id, listeners);
+
+    return () => {
+      listeners.delete(listener);
+    };
+  }
+}
+
+class FailingAgentEventBus implements AgentEventBus {
+  async publishRunEvent(): Promise<void> {
+    throw new Error("redis publish failed");
+  }
+
+  async subscribeRun(): Promise<() => void> {
+    return () => {};
+  }
+}
+
+class FakeAgentCancellationStore implements AgentCancellationStore {
+  readonly cancelledRunIds = new Set<string>();
+
+  async cancelRun(runId: string): Promise<void> {
+    this.cancelledRunIds.add(runId);
+  }
+
+  async isRunCancelled(runId: string): Promise<boolean> {
+    return this.cancelledRunIds.has(runId);
+  }
+
+  async clearRun(runId: string): Promise<void> {
+    this.cancelledRunIds.delete(runId);
+  }
+}
+
 describe("AgentMessageCoordinator", () => {
+  it("event bus 发布失败不影响 run 创建，也不会产生未处理拒绝", async () => {
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => {
+      unhandledRejections.push(reason);
+    };
+    const registry = new ToolRegistry();
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const runQueue: AgentRunQueue = {
+      enqueueRun: async () => {}
+    };
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService({ complete: async () => ({ content: "不会在 API 执行" }) }, registry),
+      store,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { eventBus: new FailingAgentEventBus(), runQueue }
+    );
+
+    process.on("unhandledRejection", onUnhandledRejection);
+
+    try {
+      const started = await coordinator.startRun({ input: "排队执行" });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(started.run.status).toBe("running");
+      expect(unhandledRejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+      store.close();
+    }
+  });
+
+  it("queue worker 写入的 run 终态事件会通过 event bus 推给 API 订阅者", async () => {
+    const registry = new ToolRegistry();
+    const provider: LlmProvider = {
+      complete: async () => ({ content: "队列任务完成" })
+    };
+    const enqueuedRuns: AgentRunJobPayload[] = [];
+    const runQueue: AgentRunQueue = {
+      enqueueRun: async (payload) => {
+        enqueuedRuns.push(payload);
+      }
+    };
+    const eventBus = new FakeAgentEventBus();
+    const databasePath = createTempDatabasePath();
+    const apiStore = await SqliteAgentStore.create({ databasePath });
+    const workerStore = await SqliteAgentStore.create({ databasePath });
+    const apiCoordinator = new AgentMessageCoordinator(
+      createAgentService({ complete: async () => ({ content: "API 不执行" }) }, registry),
+      apiStore,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { eventBus, runQueue }
+    );
+    const workerCoordinator = new AgentMessageCoordinator(
+      createAgentService(provider, registry),
+      workerStore,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { eventBus }
+    );
+    const receivedEvents: StoredAgentEvent[] = [];
+
+    try {
+      const started = await apiCoordinator.startRun({ input: "排队执行" });
+      const unsubscribe = await apiCoordinator.subscribeRun(started.run.id, (event) => {
+        receivedEvents.push(event);
+      });
+
+      try {
+        await workerCoordinator.executeQueuedRun(enqueuedRuns[0]!);
+      } finally {
+        await unsubscribe();
+      }
+
+      expect(receivedEvents.map((event) => event.event.type)).toContain("run_completed");
+    } finally {
+      apiStore.close();
+      workerStore.close();
+    }
+  });
+
+  it("queue 模式 startRun 只创建记录并投递任务，不在 API 进程内执行 Agent", async () => {
+    const registry = new ToolRegistry();
+    let providerCalls = 0;
+    const provider: LlmProvider = {
+      complete: async () => {
+        providerCalls += 1;
+        return { content: "不应该在 API 进程内生成" };
+      }
+    };
+    const enqueuedRuns: AgentRunJobPayload[] = [];
+    const runQueue: AgentRunQueue = {
+      enqueueRun: async (payload) => {
+        enqueuedRuns.push(payload);
+      }
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService(provider, registry),
+      store,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { runQueue }
+    );
+
+    try {
+      const started = await coordinator.startRun({ input: "生成一张图片" });
+
+      expect(providerCalls).toBe(0);
+      expect(started.run).toMatchObject({
+        status: "running",
+        phase: "answering",
+        assistantMessageId: expect.any(String)
+      });
+      expect(enqueuedRuns).toEqual([
+        {
+          runId: started.run.id,
+          sessionId: started.session.id,
+          userMessageId: started.userMessage.id,
+          assistantMessageId: started.run.assistantMessageId!
+        }
+      ]);
+      expect(store.getMessage(started.run.assistantMessageId!)).toMatchObject({
+        role: "assistant",
+        status: "running",
+        parts: []
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("executeQueuedRun 会执行已入队 run 并复用 API 侧创建的 assistant message", async () => {
+    const registry = new ToolRegistry();
+    const provider: LlmProvider = {
+      complete: async () => ({ content: "队列任务已完成" })
+    };
+    const enqueuedRuns: AgentRunJobPayload[] = [];
+    const runQueue: AgentRunQueue = {
+      enqueueRun: async (payload) => {
+        enqueuedRuns.push(payload);
+      }
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService(provider, registry),
+      store,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { runQueue }
+    );
+
+    try {
+      const started = await coordinator.startRun({ input: "排队执行" });
+
+      await coordinator.executeQueuedRun(enqueuedRuns[0]!);
+
+      const completedRun = coordinator.getRun(started.run.id).run;
+      const completedMessage = store.getMessage(started.run.assistantMessageId!);
+
+      expect(completedRun).toMatchObject({
+        status: "completed",
+        phase: "completed",
+        assistantMessageId: started.run.assistantMessageId
+      });
+      expect(completedMessage).toMatchObject({
+        id: started.run.assistantMessageId,
+        status: "completed",
+        parts: [{ type: "text", value: "队列任务已完成" }]
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("cancelRun 会写入跨进程取消标记", async () => {
+    const registry = new ToolRegistry();
+    const provider: LlmProvider = {
+      complete: async () => ({ content: "不会在 queue 模式执行" })
+    };
+    const cancellationStore = new FakeAgentCancellationStore();
+    const runQueue: AgentRunQueue = {
+      enqueueRun: async () => {}
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService(provider, registry),
+      store,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { cancellationStore, runQueue }
+    );
+
+    try {
+      const started = await coordinator.startRun({ input: "生成长任务" });
+
+      await coordinator.cancelRun(started.run.id);
+
+      expect(await cancellationStore.isRunCancelled(started.run.id)).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("executeQueuedRun 拿不到 run lock 时不会执行 provider", async () => {
+    const registry = new ToolRegistry();
+    let providerCalls = 0;
+    const provider: LlmProvider = {
+      complete: async () => {
+        providerCalls += 1;
+        return { content: "不应该执行" };
+      }
+    };
+    const enqueuedRuns: AgentRunJobPayload[] = [];
+    const runQueue: AgentRunQueue = {
+      enqueueRun: async (payload) => {
+        enqueuedRuns.push(payload);
+      }
+    };
+    const runLock: AgentRunLock = {
+      acquire: async () => undefined
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService(provider, registry),
+      store,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { runQueue, runLock }
+    );
+
+    try {
+      await coordinator.startRun({ input: "排队执行" });
+      await coordinator.executeQueuedRun(enqueuedRuns[0]!);
+
+      expect(providerCalls).toBe(0);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("executeQueuedRun 执行完成后释放 run lock", async () => {
+    const registry = new ToolRegistry();
+    const provider: LlmProvider = {
+      complete: async () => ({ content: "锁内执行完成" })
+    };
+    const enqueuedRuns: AgentRunJobPayload[] = [];
+    const runQueue: AgentRunQueue = {
+      enqueueRun: async (payload) => {
+        enqueuedRuns.push(payload);
+      }
+    };
+    let released = false;
+    const lease: AgentRunLockLease = {
+      release: async () => {
+        released = true;
+      }
+    };
+    const runLock: AgentRunLock = {
+      acquire: async () => lease
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService(provider, registry),
+      store,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { runQueue, runLock }
+    );
+
+    try {
+      await coordinator.startRun({ input: "排队执行" });
+      await coordinator.executeQueuedRun(enqueuedRuns[0]!);
+
+      expect(released).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("executeQueuedRun 被其他进程取消后，不会继续执行后续工具调用", async () => {
+    const registry = new ToolRegistry();
+    let toolExecutions = 0;
+    registry.register({
+      name: "expensive_tool",
+      description: "昂贵工具",
+      parameters: {
+        type: "object",
+        properties: {}
+      },
+      argumentSchema: z.object({}),
+      execute: () => {
+        toolExecutions += 1;
+        return { ok: true };
+      }
+    });
+    const cancellationStore = new FakeAgentCancellationStore();
+    const enqueuedRuns: AgentRunJobPayload[] = [];
+    const runQueue: AgentRunQueue = {
+      enqueueRun: async (payload) => {
+        enqueuedRuns.push(payload);
+      }
+    };
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    let apiCoordinator!: AgentMessageCoordinator;
+    let providerCalls = 0;
+    const workerProvider: LlmProvider = {
+      complete: async () => {
+        providerCalls += 1;
+
+        if (providerCalls === 1) {
+          await apiCoordinator.cancelRun(enqueuedRuns[0]!.runId);
+          return {
+            toolCalls: [
+              {
+                id: "call_expensive_tool",
+                name: "expensive_tool",
+                arguments: {}
+              }
+            ]
+          };
+        }
+
+        return { content: "不应该继续生成" };
+      }
+    };
+    apiCoordinator = new AgentMessageCoordinator(
+      createAgentService({ complete: async () => ({ content: "API 进程不执行" }) }, registry),
+      store,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { cancellationStore, runQueue }
+    );
+    const workerCoordinator = new AgentMessageCoordinator(
+      createAgentService(workerProvider, registry),
+      store,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { cancellationStore }
+    );
+
+    try {
+      const started = await apiCoordinator.startRun({ input: "执行昂贵任务" });
+
+      await workerCoordinator.executeQueuedRun(enqueuedRuns[0]!);
+
+      expect(providerCalls).toBe(1);
+      expect(toolExecutions).toBe(0);
+      expect(workerCoordinator.getRun(started.run.id).run).toMatchObject({
+        status: "cancelled",
+        phase: "cancelled"
+      });
+    } finally {
+      store.close();
+    }
+  });
+
   it("启动恢复会把上次进程遗留的 running run 收敛为 failed", async () => {
     const registry = new ToolRegistry();
     const provider: LlmProvider = {
@@ -221,9 +673,6 @@ describe("AgentMessageCoordinator", () => {
         completedAt: expect.any(String)
       })
     ]);
-    expect(store.getRunEvents(run.id).map((event) => event.event.type)).toEqual(
-      expect.arrayContaining(["process.step.updated", "error", "session.message.updated"])
-    );
     store.close();
   });
 
@@ -252,24 +701,6 @@ describe("AgentMessageCoordinator", () => {
       phase: "cancelled",
       completedAt: expect.any(String)
     });
-    expect(snapshot.events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          event: {
-            type: "session.message.created",
-            message: expect.objectContaining({
-              id: started.userMessage.id
-            })
-          }
-        }),
-        expect.objectContaining({
-          event: {
-            type: "cancelled",
-            reason: "服务关闭"
-          }
-        })
-      ])
-    );
     store.close();
   });
 
@@ -321,23 +752,13 @@ describe("AgentMessageCoordinator", () => {
       const third = await coordinator.startRun({ sessionId: first.session.id, input: "第三轮问题" });
       await waitForRun(coordinator, third.run.id);
 
-      const thirdSnapshot = coordinator.getRun(third.run.id);
-      const thirdEvents = thirdSnapshot.events.map((event) => event.event);
-      const thirdEventTypes = thirdEvents.map((event) => event.type);
       const systemMessage = store.getMessagesBySession(first.session.id).find((message) => message.role === "system");
-      const assistantCreatedIndex = thirdEventTypes.findIndex(
-        (type, index) => type === "session.message.created" && thirdEvents[index]?.type === "session.message.created" && thirdEvents[index].message.role === "assistant"
-      );
-      const summaryCompletedIndex = thirdEventTypes.indexOf("summary_completed");
 
       expect(systemMessage).toMatchObject({
         role: "system",
         status: "completed",
         parts: [{ type: "text", value: "上下文已自动压缩" }]
       });
-      expect(thirdEventTypes).toEqual(expect.arrayContaining(["summary_start", "summary_completed", "final_answer", "run_completed"]));
-      expect(summaryCompletedIndex).toBeGreaterThanOrEqual(0);
-      expect(assistantCreatedIndex).toBeGreaterThan(summaryCompletedIndex);
       expect(summaryCalls).toHaveLength(1);
       expect(summaryCalls[0]?.join("\n")).toContain("第一轮问题");
       expect(summaryCalls[0]?.join("\n")).not.toContain("第三轮问题");
@@ -865,201 +1286,6 @@ describe("AgentMessageCoordinator", () => {
     }
   });
 
-  it("消息完成后滚动生成结构化摘要，后续上下文使用摘要加最近原文", async () => {
-    const answerCalls: string[][] = [];
-    const summaryCalls: string[][] = [];
-    const registry = new ToolRegistry();
-    const answerProvider: LlmProvider = {
-      complete: async ({ messages }) => {
-        answerCalls.push(messages.map((message) => `${message.role}:${"content" in message ? message.content : ""}`));
-        return { content: `第 ${answerCalls.length} 轮回答` };
-      }
-    };
-    const summaryProvider: LlmProvider = {
-      complete: async ({ messages }) => {
-        summaryCalls.push(messages.map((message) => `${message.role}:${"content" in message ? message.content : ""}`));
-        return {
-          content: JSON.stringify({
-            userGoal: "理解 Agent 上下文压缩",
-            currentTask: "实现阶段 2",
-            decisions: ["使用结构化摘要加最近原文"],
-            preferences: ["中文解释"],
-            constraints: [],
-            importantFacts: ["第一轮问题已经回答"],
-            openQuestions: [],
-            recentProgress: ["已压缩第一轮对话"]
-          })
-        };
-      }
-    };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
-    const coordinator = new AgentMessageCoordinator(
-      createAgentService(answerProvider, registry),
-      store,
-      new AgentContextBuilder({ maxHistoryMessages: 10 }),
-      new AgentSummaryService({
-        provider: summaryProvider,
-        triggerMessageCount: 3,
-        keepRecentMessages: 2,
-        triggerCharacterCount: 0
-      })
-    );
-
-    try {
-      const first = await coordinator.startMessage({ input: "第一轮问题" });
-      await waitForMessage(coordinator, first.assistantMessage.id);
-      const second = await coordinator.startMessage({ sessionId: first.session.id, input: "第二轮问题" });
-      await waitForMessage(coordinator, second.assistantMessage.id);
-      const summary = await waitForSessionSummary(store, first.session.id);
-      const third = await coordinator.startMessage({ sessionId: first.session.id, input: "第三轮问题" });
-      await waitForMessage(coordinator, third.assistantMessage.id);
-
-      expect(summary.coveredMessageId).toBe(first.assistantMessage.id);
-      expect(summary.summary.decisions).toEqual(["使用结构化摘要加最近原文"]);
-      expect(summaryCalls.length).toBeGreaterThanOrEqual(1);
-      expect(summaryCalls[0]?.join("\n")).toContain("第一轮问题");
-      expect(answerCalls[2]).toEqual([
-        expect.stringMatching(/^system:/),
-        expect.stringContaining("以下是此前对话的结构化摘要"),
-        "user:第二轮问题",
-        "assistant:第 2 轮回答",
-        "user:第三轮问题"
-      ]);
-    } finally {
-      store.close();
-    }
-  });
-
-  it("摘要刷新保持静默，不插入可见 system 状态消息，也不写入 assistant 事件", async () => {
-    const answerCalls: string[][] = [];
-    const summaryCalls: string[][] = [];
-    const registry = new ToolRegistry();
-    const answerProvider: LlmProvider = {
-      complete: async ({ messages }) => {
-        answerCalls.push(messages.map((message) => `${message.role}:${"content" in message ? message.content : ""}`));
-        return { content: `第 ${answerCalls.length} 轮回答` };
-      }
-    };
-    const summaryProvider: LlmProvider = {
-      complete: async ({ messages }) => {
-        summaryCalls.push(messages.map((message) => `${message.role}:${"content" in message ? message.content : ""}`));
-        return {
-          content: JSON.stringify({
-            userGoal: "理解上下文压缩",
-            currentTask: "让压缩过程静默执行",
-            decisions: ["摘要只写入 session summary"],
-            preferences: ["中文"],
-            constraints: ["摘要过程不插入可见 system 状态消息"],
-            importantFacts: ["第二轮后触发摘要"],
-            openQuestions: [],
-            recentProgress: ["已刷新 session summary"]
-          })
-        };
-      }
-    };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
-    const coordinator = new AgentMessageCoordinator(
-      createAgentService(answerProvider, registry),
-      store,
-      new AgentContextBuilder({ maxHistoryMessages: 10 }),
-      new AgentSummaryService({
-        provider: summaryProvider,
-        triggerMessageCount: 3,
-        keepRecentMessages: 2,
-        triggerCharacterCount: 0
-      })
-    );
-
-    try {
-      const first = await coordinator.startMessage({ input: "第一轮问题" });
-      await waitForMessage(coordinator, first.assistantMessage.id);
-      const second = await coordinator.startMessage({ sessionId: first.session.id, input: "第二轮问题" });
-      await waitForMessage(coordinator, second.assistantMessage.id);
-      await waitForSessionSummary(store, first.session.id);
-      const third = await coordinator.startMessage({ sessionId: first.session.id, input: "第三轮问题" });
-      await waitForMessage(coordinator, third.assistantMessage.id);
-
-      const sessionMessages = store.getMessagesBySession(first.session.id);
-      const secondEventTypes = store.getEvents(second.assistantMessage.id).map((event) => event.event.type);
-      const thirdEventTypes = store.getEvents(third.assistantMessage.id).map((event) => event.event.type);
-
-      expect(sessionMessages.some((message) => message.role === "system")).toBe(false);
-      expect(secondEventTypes).toEqual(expect.arrayContaining(["message.part.updated", "final_answer", "run_completed"]));
-      expect(secondEventTypes).not.toContain("session.message.created");
-      expect(secondEventTypes).not.toContain("summary_start");
-      expect(secondEventTypes).not.toContain("session.message.updated");
-      expect(secondEventTypes).not.toContain("summary_completed");
-      expect(thirdEventTypes).toEqual(expect.arrayContaining(["message.part.updated", "final_answer", "run_completed"]));
-      expect(summaryCalls[0]?.join("\n")).not.toContain("上下文自动压缩");
-
-      expect(answerCalls[2]?.join("\n")).not.toContain("上下文自动压缩");
-    } finally {
-      store.close();
-    }
-  });
-
-  it("摘要仍在运行时 assistant 已完成，摘要完成后才用 run_completed 收口", async () => {
-    const summaryContent = JSON.stringify({
-      userGoal: "理解上下文压缩",
-      currentTask: "验证摘要静默收口",
-      decisions: ["助手回复完成后刷新摘要"],
-      preferences: ["中文"],
-      constraints: [],
-      importantFacts: ["摘要可能比回答慢"],
-      openQuestions: [],
-      recentProgress: ["等待摘要完成后再发送 run_completed"]
-    });
-    const summaryGate = createDeferred<string>();
-    const registry = new ToolRegistry();
-    const answerProvider: LlmProvider = {
-      complete: async () => ({ content: "固定回答" })
-    };
-    const summaryProvider: LlmProvider = {
-      complete: async () => ({
-        content: await summaryGate.promise
-      })
-    };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
-    const coordinator = new AgentMessageCoordinator(
-      createAgentService(answerProvider, registry),
-      store,
-      new AgentContextBuilder({ maxHistoryMessages: 10 }),
-      new AgentSummaryService({
-        provider: summaryProvider,
-        triggerMessageCount: 3,
-        keepRecentMessages: 2,
-        triggerCharacterCount: 0
-      })
-    );
-
-    let secondMessageId = "";
-
-    try {
-      const first = await coordinator.startMessage({ input: "第一轮问题" });
-      await waitForMessage(coordinator, first.assistantMessage.id);
-      const second = await coordinator.startMessage({ sessionId: first.session.id, input: "第二轮问题" });
-      secondMessageId = second.assistantMessage.id;
-      await waitForEventType(store, second.assistantMessage.id, "final_answer");
-
-      const messageDuringSummary = store.getMessage(second.assistantMessage.id);
-      const eventTypesDuringSummary = store.getEvents(second.assistantMessage.id).map((event) => event.event.type);
-
-      expect(messageDuringSummary?.status).toBe("completed");
-      expect(eventTypesDuringSummary).toContain("final_answer");
-      expect(eventTypesDuringSummary).not.toContain("run_completed");
-      expect(store.getMessagesBySession(first.session.id).some((message) => message.role === "system")).toBe(false);
-
-      summaryGate.resolve(summaryContent);
-      await waitForEventType(store, second.assistantMessage.id, "run_completed");
-    } finally {
-      summaryGate.resolve(summaryContent);
-      if (secondMessageId) {
-        await waitForMessage(coordinator, secondMessageId);
-      }
-      store.close();
-    }
-  });
-
   it("启动同一 session 的新 assistant message 时使用历史 messages 构造上下文", async () => {
     const calls: string[][] = [];
     const registry = new ToolRegistry();
@@ -1077,11 +1303,11 @@ describe("AgentMessageCoordinator", () => {
     );
 
     try {
-      const first = await coordinator.startMessage({ input: "第一轮问题" });
+      const first = await startRunAndWait(coordinator, { input: "第一轮问题" });
       await waitForMessage(coordinator, first.assistantMessage.id);
-      const second = await coordinator.startMessage({ sessionId: first.session.id, input: "第二轮问题" });
+      const second = await startRunAndWait(coordinator, { sessionId: first.session.id, input: "第二轮问题" });
       await waitForMessage(coordinator, second.assistantMessage.id);
-      const third = await coordinator.startMessage({ sessionId: first.session.id, input: "第三轮问题" });
+      const third = await startRunAndWait(coordinator, { sessionId: first.session.id, input: "第三轮问题" });
       await waitForMessage(coordinator, third.assistantMessage.id);
 
       expect(calls[2]).toEqual([
@@ -1197,7 +1423,7 @@ describe("AgentMessageCoordinator", () => {
     );
 
     try {
-      const started = await coordinator.startMessage({ input: "生成一张小猪图片" });
+      const started = await startRunAndWait(coordinator, { input: "生成一张小猪图片" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
       const session = coordinator.getSession(started.session.id);
@@ -1319,7 +1545,7 @@ describe("AgentMessageCoordinator", () => {
     );
 
     try {
-      const started = await coordinator.startMessage({ input: "生成一段小猪视频" });
+      const started = await startRunAndWait(coordinator, { input: "生成一段小猪视频" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
       const session = coordinator.getSession(started.session.id);
@@ -1434,7 +1660,7 @@ describe("AgentMessageCoordinator", () => {
     const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
 
     try {
-      const started = await coordinator.startMessage({ input: "把这张小猪图改成水彩风格" });
+      const started = await startRunAndWait(coordinator, { input: "把这张小猪图改成水彩风格" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
       const session = coordinator.getSession(started.session.id);
@@ -1480,7 +1706,7 @@ describe("AgentMessageCoordinator", () => {
     }
   });
 
-  it("流式回答会更新 assistant message 的 text part，但不把 part delta 写入事件表", async () => {
+  it("流式回答会更新 assistant message 的 text part", async () => {
     const registry = new ToolRegistry();
     const provider: LlmProvider = {
       complete: async () => {
@@ -1496,17 +1722,12 @@ describe("AgentMessageCoordinator", () => {
     const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
 
     try {
-      const started = await coordinator.startMessage({ input: "问候一下" });
+      const started = await startRunAndWait(coordinator, { input: "问候一下" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
-      const { message, events } = coordinator.getMessage(started.assistantMessage.id);
+      const { message } = coordinator.getMessage(started.assistantMessage.id);
 
       expect(message.parts).toEqual([{ type: "text", value: "你好世界" }]);
-      expect(
-        events
-          .map((event) => event.event)
-          .filter((event) => event.type === "message.part.delta")
-      ).toEqual([]);
     } finally {
       store.close();
     }
@@ -1532,20 +1753,21 @@ describe("AgentMessageCoordinator", () => {
     const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
 
     try {
-      const started = await coordinator.startMessage({ input: "写一段话" });
+      const started = await coordinator.startRun({ input: "写一段话" });
 
       await firstDeltaReceived.promise;
+      const assistantMessageId = await waitForRunAssistantMessageId(coordinator, started.run.id);
 
-      expect(store.getMessage(started.assistantMessage.id)?.parts).toEqual([]);
+      expect(store.getMessage(assistantMessageId)?.parts).toEqual([]);
 
-      const runningSnapshot = await coordinator.getMessageSnapshot(started.assistantMessage.id);
+      const runningSnapshot = await coordinator.getMessageSnapshot(assistantMessageId);
       expect(runningSnapshot).toMatchObject({ version: 1 });
       expect(runningSnapshot.message.parts).toEqual([{ type: "text", value: "正在生成" }]);
 
       allowFinish.resolve();
-      await waitForMessage(coordinator, started.assistantMessage.id);
+      await waitForRun(coordinator, started.run.id);
 
-      expect(store.getMessage(started.assistantMessage.id)?.parts).toEqual([{ type: "text", value: "正在生成完成" }]);
+      expect(store.getMessage(assistantMessageId)?.parts).toEqual([{ type: "text", value: "正在生成完成" }]);
     } finally {
       allowFinish.resolve();
       store.close();
@@ -1597,10 +1819,10 @@ describe("AgentMessageCoordinator", () => {
     const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
 
     try {
-      const started = await coordinator.startMessage({ input: "生成一张小猪图片" });
+      const started = await startRunAndWait(coordinator, { input: "生成一张小猪图片" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
-      const { message, events } = coordinator.getMessage(started.assistantMessage.id);
+      const { message } = coordinator.getMessage(started.assistantMessage.id);
       const mediaPart = message.parts.find((part) => part.type === "media");
       const resourceId = mediaPart?.extra?.resource?.id;
 
@@ -1629,10 +1851,6 @@ describe("AgentMessageCoordinator", () => {
         }),
         { type: "text", value: "图片已生成。" }
       ]);
-      expect(events.map((event) => event.event.type)).toContain("message.part.created");
-      expect(events.map((event) => event.event.type)).toContain("message.part.updated");
-      expect(events.map((event) => event.event.type)).toContain("resource.created");
-      expect(events.map((event) => event.event.type)).toContain("resource.updated");
     } finally {
       store.close();
     }
@@ -1683,7 +1901,7 @@ describe("AgentMessageCoordinator", () => {
     const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
 
     try {
-      const started = await coordinator.startMessage({ input: "生成一张小猪图片" });
+      const started = await startRunAndWait(coordinator, { input: "生成一张小猪图片" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
       const detail = coordinator.getMessage(started.assistantMessage.id);
@@ -1713,7 +1931,6 @@ describe("AgentMessageCoordinator", () => {
           orderIndex: 2
         })
       ]);
-      expect(detail.events.map((event) => event.event.type)).toEqual(expect.arrayContaining(["process.step.created", "process.step.updated"]));
     } finally {
       store.close();
     }
@@ -1728,7 +1945,7 @@ describe("AgentMessageCoordinator", () => {
     const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
 
     try {
-      const started = await coordinator.startMessage({ input: "解释一下 Agent 流程" });
+      const started = await startRunAndWait(coordinator, { input: "解释一下 Agent 流程" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
       const detail = coordinator.getMessage(started.assistantMessage.id);
@@ -1839,15 +2056,13 @@ describe("AgentMessageCoordinator", () => {
     const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
 
     try {
-      const started = await coordinator.startMessage({ input: "分别生成宝宝和狗狗图片" });
+      const started = await startRunAndWait(coordinator, { input: "分别生成宝宝和狗狗图片" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
       const session = coordinator.getSession(started.session.id);
       const assistant = session.messages.find((message) => message.id === started.assistantMessage.id);
       const mediaParts = assistant?.parts.filter((part) => part.type === "media") ?? [];
       const resourcesById = new Map(session.resources.map((resource) => [resource.id, resource]));
-      const events = coordinator.getMessage(started.assistantMessage.id).events.map((event) => event.event);
-      const mediaCreatedEvents = events.filter((event) => event.type === "message.part.created");
 
       expect(executeCount).toBe(1);
       expect(callCount).toBe(2);
@@ -1879,13 +2094,6 @@ describe("AgentMessageCoordinator", () => {
         undefined,
         "https://example.com/dog.png"
       ]);
-      expect(mediaCreatedEvents).toHaveLength(2);
-      expect(events).not.toContainEqual(
-        expect.objectContaining({
-          type: "tool_start",
-          toolCallId: "call_retry_baby"
-        })
-      );
     } finally {
       store.close();
     }

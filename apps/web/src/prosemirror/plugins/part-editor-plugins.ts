@@ -47,6 +47,8 @@ function isTargetAtomNode(node: ProseMirrorNode | null, nodeNames?: string[]): n
 }
 
 function needsBoundaryCaret(nodeBefore: ProseMirrorNode | null, nodeAfter: ProseMirrorNode | null, nodeNames?: string[]) {
+  // inline atom 后面紧跟非文本节点时，浏览器光标有时没有明显落点。
+  // 插入一个不可见分隔元素，可以让用户知道光标在媒体后面。
   return isTargetAtomNode(nodeBefore, nodeNames) && Boolean(nodeAfter && !nodeAfter.isText);
 }
 
@@ -89,6 +91,8 @@ export function createInlineBoundaryCaretPlugin(options: InlineBoundaryCaretPlug
 export function createDropSelectionPlugin() {
   return new Plugin({
     appendTransaction(transactions, _oldState, newState) {
+      // 拖拽图片/atom 后，ProseMirror 可能保留 NodeSelection。
+      // 这里把选择移动到被拖拽节点后面，让用户可以继续输入文字。
       const hasDropTransaction = transactions.some((transaction) => transaction.getMeta("uiEvent") === "drop");
 
       if (!hasDropTransaction) {
@@ -123,6 +127,8 @@ export function createAtomicMediaDeletePlugin(options: AtomicMediaDeletePluginOp
   return new Plugin({
     props: {
       handleKeyDown(view, event) {
+        // media_part 是 atom 节点，删除时应该整体删掉。
+        // 否则 Backspace/Delete 可能只移动光标，看起来像按键失效。
         if (event.key !== "Backspace" && event.key !== "Delete") {
           return false;
         }
@@ -146,6 +152,8 @@ export function createInlineAtomArrowNavigationPlugin(options: InlineAtomArrowNa
   return new Plugin({
     props: {
       handleKeyDown(view, event) {
+        // 左右方向键遇到 inline atom 时，显式跳过整个节点。
+        // 这比让浏览器猜光标位置更稳定，尤其是图片前后混排文字时。
         const direction = getPlainHorizontalDirection(view, event);
 
         if (!direction) {
@@ -204,6 +212,8 @@ export function createInlineAtomSelectionHighlightPlugin(options: InlineAtomSele
     view(view) {
       const ownerDocument = view.dom.ownerDocument;
       const refreshDomSelectionState = () => {
+        // 浏览器原生 DOM selection 和 ProseMirror state selection 不总是同步到 class。
+        // 每次 selectionchange 主动刷新媒体节点高亮，让拖选/键盘选择的视觉反馈一致。
         syncInlineAtomDomRangeSelection(view, {
           className,
           domSelector,
@@ -319,6 +329,8 @@ export function createClearSelectionOnOutsidePointerPlugin() {
           return;
         }
 
+        // 用户点到编辑器外面后，把内部选区折叠掉。
+        // 这样外部按钮获得焦点时，编辑器里不会还残留一块蓝色选中态。
         const position = Math.min(view.state.selection.to, view.state.doc.content.size);
         const nextSelection = TextSelection.near(view.state.doc.resolve(position), -1);
 
@@ -350,6 +362,8 @@ export function createImageUploadEntryPlugin(options: ImageUploadEntryPluginOpti
     props: {
       handleDOMEvents: {
         paste(view, event) {
+          // 粘贴/拖拽图片文件时直接进入上传流程；
+          // 普通文本粘贴交给 createPlainTextPastePlugin 处理。
           const image = getFirstImageFile((event as ClipboardEvent).clipboardData?.files);
 
           if (!image) {
@@ -399,6 +413,7 @@ export function createPlainTextPastePlugin() {
           const messageParts = parseMessagePartsFromClipboard(clipboard.getData(AGENT_MESSAGE_PARTS_MIME));
 
           if (messageParts?.length) {
+            // 项目内部复制消息时会带自定义 MIME，粘贴回来可以保留媒体 part/extra 等结构化信息。
             const slice = createMessagePartsSlice(view, messageParts);
 
             if (!slice.content.size) {
@@ -411,6 +426,8 @@ export function createPlainTextPastePlugin() {
           }
 
           if (hasClipboardFiles(clipboard) || hasCustomClipboardTypes(clipboard) || hasProseMirrorClipboardHtml(clipboard)) {
+            // 文件、自定义富文本、ProseMirror 自己的 HTML 都交给默认流程或其他插件。
+            // 这里只兜底处理最普通的纯文本，避免把外部富文本误降级。
             return false;
           }
 
@@ -752,6 +769,8 @@ class DropCursorView {
 
     const editorElement = this.editorView.dom as HTMLElement;
     const editorRect = editorElement.getBoundingClientRect();
+    // 页面可能有 CSS transform/zoom，coordsAtPos 返回的是视口坐标。
+    // 用真实 rect 和 offsetWidth 计算缩放比例，拖拽光标才能贴在正确位置。
     const scaleX = editorRect.width / editorElement.offsetWidth || 1;
     const scaleY = editorRect.height / editorElement.offsetHeight || 1;
     const coords = this.editorView.coordsAtPos(this.cursorPosition);

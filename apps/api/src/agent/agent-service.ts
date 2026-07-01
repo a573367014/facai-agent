@@ -189,6 +189,9 @@ export class AgentService {
       await emit({ type: "agent_state", iteration, state: "observing", label: observationLabel });
 
       if (shouldSummarizeMediaFailure) {
+        // 媒体工具可能出现“部分成功”：前端已经能展示成功图片/视频，
+        // 但用户还需要一句自然语言交代失败原因。这里禁止继续带工具调用，
+        // 避免模型看到失败后又自动重试，导致成本和等待时间失控。
         return await this.summarizeMediaFailureWithoutTools(messages, input, iteration, emit);
       }
 

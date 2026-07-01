@@ -33,17 +33,18 @@ import { stripRuntimeFields, type RuntimePart } from "./prosemirror/part-seriali
 import "./styles.css";
 
 const activeRunIdKey = "agent.activeRunId";
-const activeEventSeqKey = "agent.activeEventSeq";
 const runningRunsBySessionKey = "agent.runningRunsBySession";
 const sessionIdQueryKey = "sessionId";
 const defaultMessagePageLimit = 30;
 const defaultSessionPageLimit = 30;
 
 type ResourceMap = Record<string, AgentResourceRecord>;
-type RunningRunState = { runId: string; lastSeq: number };
+type RunningRunState = { runId: string };
 type RunningRunsBySession = Record<string, RunningRunState>;
 
 function readRunningRunsBySession(): RunningRunsBySession {
+  // 这里记录“每个会话当前还在跑的 run”。
+  // 用户切换会话或刷新页面后，前端可以用 runId 重新接上 SSE，而不是丢掉正在生成的回答。
   try {
     const rawValue = localStorage.getItem(runningRunsBySessionKey);
 
@@ -63,8 +64,7 @@ function readRunningRunsBySession(): RunningRunsBySession {
 
       if (typeof candidate.runId === "string") {
         runningRuns[sessionId] = {
-          runId: candidate.runId,
-          lastSeq: typeof candidate.lastSeq === "number" && Number.isFinite(candidate.lastSeq) ? candidate.lastSeq : 0
+          runId: candidate.runId
         };
       }
     }
@@ -160,6 +160,8 @@ function shouldShowSummarySystemMessage(message: ChatMessage, options: { showRun
 }
 
 function normalizeVisibleMessages(messages: ChatMessage[], options: { showRunningSummary?: boolean } = {}): ChatMessage[] {
+  // system 消息主要承载“上下文压缩中/已压缩”这类状态。
+  // 聊天窗口只保留最新一条已完成摘要提示，避免历史里堆一长串系统提示影响阅读。
   const latestSummarySystemMessageId = [...messages].reverse().find((message) => shouldShowSummarySystemMessage(message, options) && isSummarySystemMessage(message))?.id;
 
   return messages.filter((message) => {
@@ -276,6 +278,8 @@ function upsertMessageRecord(currentMessages: ChatMessage[], message: AgentMessa
 function upsertMessageSnapshot(currentMessages: ChatMessage[], event: Extract<AgentStreamEvent, { type: "message.snapshot" }>): ChatMessage[] {
   const existingMessage = currentMessages.find((message) => message.id === event.message.id);
 
+  // snapshot 是后端给前端的“消息当前完整状态”，常用于重连后校准。
+  // 如果本地已经收到更高版本的 part 事件，就不要被旧 snapshot 覆盖。
   if (isOlderSnapshotVersion(existingMessage, event.version)) {
     return currentMessages;
   }
@@ -301,6 +305,8 @@ function isDuplicateOrOlderPartVersion(message: ChatMessage, event: AgentStreamE
     return false;
   }
 
+  // part 事件可能因为重连回放而重复到达。
+  // version 是消息级别的递增号，用它挡住重复/更旧事件，可以避免 delta 被追加两次。
   return typeof event.version === "number" && typeof message.version === "number" && event.version <= message.version;
 }
 
@@ -329,29 +335,71 @@ function markRunMessagesCancelled(currentMessages: ChatMessage[], run: AgentRunR
   }), { showRunningSummary: true });
 }
 
-function setTextPartValue(parts: MessagePart[] = [], value: string): MessagePart[] {
-  const textPartIndex = parts.findIndex((part) => part.type === "text");
+function compactMessageParts(parts: Array<MessagePart | undefined> = []): MessagePart[] {
+  // SSE 事件乱序或缺少前置 part 时，直接 parts[1] = xxx 会制造“空洞数组”。
+  // React 渲染和 final_answer 都会遍历 parts，所以进入核心逻辑前先压成真正连续的数组。
+  return parts.filter((part): part is MessagePart => Boolean(part));
+}
 
-  if (textPartIndex === -1) {
-    return value ? [{ type: "text", value }, ...parts] : parts;
+function createEmptyTextPart(): MessagePart {
+  return { type: "text", value: "" };
+}
+
+function normalizePartIndex(partIndex: number) {
+  return Number.isInteger(partIndex) && partIndex >= 0 ? partIndex : 0;
+}
+
+function padMissingPartsBeforeIndex(parts: MessagePart[] = [], partIndex: number): MessagePart[] {
+  const safePartIndex = normalizePartIndex(partIndex);
+  const nextParts = compactMessageParts(parts);
+
+  // 后端的 partIndex 是“最终消息里的位置”。
+  // 比如视频 partIndex=1 先到，但文本 partIndex=0 还没到，前端先补一个空文本位；
+  // 后面的 final_answer 或 message.part.updated 再把这个空位填成真正正文。
+  while (nextParts.length < safePartIndex) {
+    nextParts.push(createEmptyTextPart());
   }
 
-  return parts.map((part, index) => (index === textPartIndex && part.type === "text" ? { ...part, value } : part));
+  return nextParts;
+}
+
+function setTextPartValue(parts: MessagePart[] = [], value: string): MessagePart[] {
+  const denseParts = compactMessageParts(parts);
+  const textPartIndex = denseParts.findIndex((part) => part.type === "text");
+
+  if (textPartIndex === -1) {
+    return value ? [{ type: "text", value }, ...denseParts] : denseParts;
+  }
+
+  return denseParts.map((part, index) => (index === textPartIndex && part.type === "text" ? { ...part, value } : part));
 }
 
 function applyPartEventToMessage(message: ChatMessage, event: AgentStreamEvent): ChatMessage {
+  // 后端不会每次都重发整条消息：流式文本用 delta，媒体/占位用 created/updated。
+  // 这个函数只负责把“一个 part 事件”折叠到当前 ChatMessage 上。
   if (event.type === "message.part.created") {
-    const parts = [...(message.parts ?? [])];
-    parts.splice(event.partIndex, 0, event.part);
+    const partIndex = normalizePartIndex(event.partIndex);
+    const parts = padMissingPartsBeforeIndex(message.parts, partIndex);
+    parts.splice(partIndex, 0, event.part);
     return { ...message, parts, version: event.version ?? message.version };
   }
 
   if (event.type === "message.part.delta") {
-    const parts = [...(message.parts ?? [])];
-    const targetPart = parts[event.partIndex];
+    const partIndex = normalizePartIndex(event.partIndex);
+    const parts = padMissingPartsBeforeIndex(message.parts, partIndex);
+    const targetPart = parts[partIndex];
 
     if (!targetPart) {
-      parts[event.partIndex] = { type: "text", value: event.delta };
+      parts[partIndex] = { type: "text", value: event.delta };
+      return {
+        ...message,
+        version: event.version ?? message.version,
+        parts
+      };
+    }
+
+    if (targetPart.type !== "text") {
+      parts.splice(partIndex, 0, { type: "text", value: event.delta });
       return {
         ...message,
         version: event.version ?? message.version,
@@ -363,16 +411,17 @@ function applyPartEventToMessage(message: ChatMessage, event: AgentStreamEvent):
       ...message,
       version: event.version ?? message.version,
       parts: parts.map((part, index) =>
-        index === event.partIndex && part.type === "text" ? { ...part, value: part.value + event.delta } : part
+        index === partIndex && part.type === "text" ? { ...part, value: part.value + event.delta } : part
       )
     };
   }
 
   if (event.type === "message.part.updated") {
-    const parts = [...(message.parts ?? [])];
+    const partIndex = normalizePartIndex(event.partIndex);
+    const parts = padMissingPartsBeforeIndex(message.parts, partIndex);
 
-    if (!parts[event.partIndex]) {
-      parts[event.partIndex] = event.part;
+    if (!parts[partIndex]) {
+      parts[partIndex] = event.part;
       return {
         ...message,
         version: event.version ?? message.version,
@@ -383,7 +432,7 @@ function applyPartEventToMessage(message: ChatMessage, event: AgentStreamEvent):
     return {
       ...message,
       version: event.version ?? message.version,
-      parts: parts.map((part, index) => (index === event.partIndex ? event.part : part))
+      parts: parts.map((part, index) => (index === partIndex ? event.part : part))
     };
   }
 
@@ -465,19 +514,21 @@ function buildHistoryItems(sessions: AgentSessionRecord[]): SessionHistoryItem[]
   }));
 }
 
-function appendQuotedImagePart(currentParts: RuntimePart[], quotedImagePart: RuntimePart): RuntimePart[] {
+function appendQuotedMediaPart(currentParts: RuntimePart[], quotedMediaPart: RuntimePart): RuntimePart[] {
   const meaningfulParts = currentParts.filter((part) => part.type === "media" || (part.type === "text" && part.value.trim()));
 
   if (meaningfulParts.length === 0) {
-    return [quotedImagePart];
+    return [quotedMediaPart];
   }
 
-  return [...currentParts, quotedImagePart];
+  return [...currentParts, quotedMediaPart];
 }
 
-function createQuotedImagePart(payload: ToolImageActionPayload): RuntimePart {
+function createQuotedMediaPart(payload: ToolImageActionPayload): RuntimePart {
   const prompt = payload.prompt.trim();
-  const name = prompt || `图片 ${payload.index + 1}`;
+  const mime = payload.mime ?? inferMediaMimeFromUrl(payload.url);
+  const mediaLabel = getMediaLabel(mime);
+  const name = prompt || `${mediaLabel} ${payload.index + 1}`;
   const tool =
     payload.trace.toolName === "media"
       ? undefined
@@ -490,7 +541,7 @@ function createQuotedImagePart(payload: ToolImageActionPayload): RuntimePart {
 
   return {
     type: "media",
-    mime: payload.mime ?? inferImageMimeFromUrl(payload.url),
+    mime,
     url: payload.url,
     name,
     ...(typeof payload.width === "number" ? { width: payload.width } : {}),
@@ -504,8 +555,20 @@ function createQuotedImagePart(payload: ToolImageActionPayload): RuntimePart {
   };
 }
 
-function inferImageMimeFromUrl(url: string) {
+function inferMediaMimeFromUrl(url: string) {
   const pathname = safeUrlPathname(url).toLowerCase();
+
+  if (pathname.endsWith(".mp4")) {
+    return "video/mp4";
+  }
+
+  if (pathname.endsWith(".webm")) {
+    return "video/webm";
+  }
+
+  if (pathname.endsWith(".mov") || pathname.endsWith(".qt")) {
+    return "video/quicktime";
+  }
 
   if (pathname.endsWith(".jpg") || pathname.endsWith(".jpeg")) {
     return "image/jpeg";
@@ -520,6 +583,10 @@ function inferImageMimeFromUrl(url: string) {
   }
 
   return "image/png";
+}
+
+function getMediaLabel(mime: string) {
+  return mime.startsWith("video/") ? "视频" : "图片";
 }
 
 function safeUrlPathname(url: string) {
@@ -553,6 +620,8 @@ export default function App() {
   const activeRunIdRef = useRef<string | null>(null);
   const activeSessionIdRef = useRef<string | undefined>(activeSessionId);
   const runningRunsBySessionRef = useRef<RunningRunsBySession>(readRunningRunsBySession());
+  // 这些 ref 是为了给异步 SSE 回调读“最新状态”。
+  // React state 在闭包里可能是旧值，ref.current 可以避免旧流把事件写进新的会话。
 
   useEffect(() => {
     const controller = new AbortController();
@@ -642,6 +711,8 @@ export default function App() {
     const controller = new AbortController();
 
     async function recoverActiveRun() {
+      // 刷新页面后，如果 localStorage 里还有 activeRunId，先拉 run 快照和会话快照，
+      // 再订阅 SSE live stream。这样刷新不会重新发起模型调用。
       setIsStreaming(true);
       setActiveRun(runId);
       activeStreamControllerRef.current = controller;
@@ -668,16 +739,6 @@ export default function App() {
         setMessagePageInfo(normalizeMessagePageInfo(sessionSnapshot.pageInfo));
         setEvents([]);
 
-        for (const storedEvent of snapshot.events) {
-          if (cancelled) {
-            return;
-          }
-
-          applyStoredRunEvent(storedEvent, runId, snapshot.run.sessionId);
-        }
-
-        const lastEventSeq = snapshot.events[snapshot.events.length - 1]?.seq ?? 0;
-
         if (snapshot.run.status !== "running") {
           forgetRunningRunByRunId(runId);
           clearActiveRun();
@@ -686,7 +747,6 @@ export default function App() {
 
         await streamAgentRunEvents(
           runId,
-          lastEventSeq,
           (storedEvent) => {
             if (!cancelled) {
               applyStoredRunEvent(storedEvent, runId, snapshot.run.sessionId);
@@ -719,7 +779,6 @@ export default function App() {
   function clearActiveRun() {
     activeRunIdRef.current = null;
     localStorage.removeItem(activeRunIdKey);
-    localStorage.removeItem(activeEventSeqKey);
     setActiveRunId(null);
   }
 
@@ -728,26 +787,12 @@ export default function App() {
     setActiveRunId(runId);
   }
 
-  function rememberRunningRun(sessionId: string, runId: string, lastSeq = 0) {
+  function rememberRunningRun(sessionId: string, runId: string) {
     runningRunsBySessionRef.current = {
       ...runningRunsBySessionRef.current,
-      [sessionId]: { runId, lastSeq }
+      [sessionId]: { runId }
     };
     writeRunningRunsBySession(runningRunsBySessionRef.current);
-  }
-
-  function updateRunningRunSeq(sessionId: string | undefined, runId: string, seq: number) {
-    if (!sessionId || seq <= 0) {
-      return;
-    }
-
-    const currentRun = runningRunsBySessionRef.current[sessionId];
-
-    if (!currentRun || currentRun.runId !== runId || currentRun.lastSeq >= seq) {
-      return;
-    }
-
-    rememberRunningRun(sessionId, runId, seq);
   }
 
   function forgetRunningRunByRunId(runId: string | undefined) {
@@ -792,6 +837,8 @@ export default function App() {
       return;
     }
 
+    // run 结束时要同时清三处：内存 ref、React state、localStorage。
+    // 少清任意一处，刷新或切会话时都可能误以为还有流在跑。
     forgetRunningRunByRunId(runId ?? activeRunIdRef.current ?? undefined);
     clearActiveRun();
     activeStreamControllerRef.current = null;
@@ -844,6 +891,8 @@ export default function App() {
   }
 
   function applyAgentEvent(event: AgentStreamEvent, messageId?: string, runId?: string) {
+    // 这是前端的“事件归约器”：后端发来的每个 SSE 事件都会进入这里，
+    // 然后更新 messages/resources/events/error 等 UI 状态。
     if (event.type === "message.snapshot") {
       setMessages((currentMessages) => upsertMessageSnapshot(currentMessages, event));
       setResourcesById((currentResources) => mergeResources(currentResources, event.resources));
@@ -932,6 +981,8 @@ export default function App() {
     }
 
     if (event.type === "error") {
+      // error/cancelled/run_completed 都是 run 生命周期的终点。
+      // 收到终点事件后必须释放 active run，否则发送按钮会一直处于生成中。
       setError(`${event.code}: ${event.message}`);
       forgetRunningRunByRunId(runId ?? activeRunIdRef.current ?? undefined);
       clearActiveRun();
@@ -948,13 +999,12 @@ export default function App() {
   }
 
   function applyStoredEvent(storedEvent: StoredAgentEvent) {
-    if (storedEvent.seq > 0) {
-      localStorage.setItem(activeEventSeqKey, String(storedEvent.seq));
-    }
     applyAgentEvent(storedEvent.event, storedEvent.messageId, storedEvent.runId);
   }
 
   function applyStoredRunEvent(storedEvent: StoredAgentEvent, expectedRunId: string, expectedSessionId?: string) {
+    // SSE 是长连接。用户可能在旧连接还没彻底关闭时切到了别的会话/开启了新 run。
+    // 这里用 activeRunId、sessionId、event.runId 三重校验，防止旧流污染当前界面。
     if (activeRunIdRef.current !== expectedRunId) {
       return;
     }
@@ -967,7 +1017,6 @@ export default function App() {
       return;
     }
 
-    updateRunningRunSeq(expectedSessionId, expectedRunId, storedEvent.seq);
     applyStoredEvent(storedEvent);
   }
 
@@ -995,6 +1044,8 @@ export default function App() {
     const runId = activeRunId;
     const controller = activeStreamControllerRef.current;
 
+    // 先中断本地 SSE 读取，再请求后端取消 run。
+    // 这样 UI 不会继续消费取消前后交错到达的旧流事件。
     controller?.abort();
 
     try {
@@ -1047,11 +1098,12 @@ export default function App() {
     const runId = runningRun.runId;
     const controller = new AbortController();
 
+    // 切回一个仍在生成的会话时，只恢复这个会话自己的 run。
+    // 先校验 run 快照属于该 session，再订阅实时流。
     setIsStreaming(true);
     setActiveRun(runId);
     activeStreamControllerRef.current = controller;
     localStorage.setItem(activeRunIdKey, runId);
-    localStorage.setItem(activeEventSeqKey, String(runningRun.lastSeq));
     setError(null);
 
     try {
@@ -1067,9 +1119,7 @@ export default function App() {
         return;
       }
 
-      const lastEventSeq = snapshot.events[snapshot.events.length - 1]?.seq ?? runningRun.lastSeq;
-      rememberRunningRun(sessionId, runId, lastEventSeq);
-      localStorage.setItem(activeEventSeqKey, String(lastEventSeq));
+      rememberRunningRun(sessionId, runId);
 
       if (snapshot.run.status !== "running") {
         forgetRunningRunByRunId(runId);
@@ -1077,7 +1127,7 @@ export default function App() {
         return;
       }
 
-      await streamAgentRunEvents(runId, lastEventSeq, (storedEvent) => applyStoredRunEvent(storedEvent, runId, sessionId), controller.signal);
+      await streamAgentRunEvents(runId, (storedEvent) => applyStoredRunEvent(storedEvent, runId, sessionId), controller.signal);
     } catch (streamError) {
       if (activeStreamControllerRef.current === controller && !isAbortError(streamError)) {
         setError(streamError instanceof Error ? streamError.message : "流式请求失败");
@@ -1100,6 +1150,8 @@ export default function App() {
     }
 
     if (activeRunId) {
+      // 当前只允许前端界面绑定一个 active run。
+      // 用户提交新消息时先取消旧 run，避免两个 SSE 流同时写同一组 messages。
       await cancelActiveRun({ refreshAfterCancel: false, settleStreaming: false });
     }
 
@@ -1119,10 +1171,9 @@ export default function App() {
       activeStreamControllerRef.current = controller;
       streamControllerAttached = true;
       localStorage.setItem(activeRunIdKey, run.id);
-      localStorage.setItem(activeEventSeqKey, "0");
       setMessages((currentMessages) => appendStartedMessages(currentMessages, userMessage));
       setComposerParts([{ type: "text", value: "" }]);
-      await streamAgentRunEvents(run.id, 0, (storedEvent) => applyStoredRunEvent(storedEvent, run.id, session.id), controller.signal);
+      await streamAgentRunEvents(run.id, (storedEvent) => applyStoredRunEvent(storedEvent, run.id, session.id), controller.signal);
       await refreshSessions();
     } catch (streamError) {
       if (!isAbortError(streamError) && (!streamControllerAttached || activeStreamControllerRef.current === controller)) {
@@ -1141,6 +1192,7 @@ export default function App() {
 
   async function handleRegenerateMessage(messageId: string) {
     if (activeRunId) {
+      // 重新生成本质上也是启动一个新的 run，所以同样先释放旧 run。
       await cancelActiveRun({ refreshAfterCancel: false, settleStreaming: false });
     }
 
@@ -1160,8 +1212,7 @@ export default function App() {
       activeStreamControllerRef.current = controller;
       streamControllerAttached = true;
       localStorage.setItem(activeRunIdKey, run.id);
-      localStorage.setItem(activeEventSeqKey, "0");
-      await streamAgentRunEvents(run.id, 0, (storedEvent) => applyStoredRunEvent(storedEvent, run.id, session.id), controller.signal);
+      await streamAgentRunEvents(run.id, (storedEvent) => applyStoredRunEvent(storedEvent, run.id, session.id), controller.signal);
       await refreshSessions();
     } catch (streamError) {
       if (!isAbortError(streamError) && (!streamControllerAttached || activeStreamControllerRef.current === controller)) {
@@ -1219,7 +1270,7 @@ export default function App() {
       return;
     }
 
-    setComposerParts((currentParts) => appendQuotedImagePart(currentParts, createQuotedImagePart(payload)));
+    setComposerParts((currentParts) => appendQuotedMediaPart(currentParts, createQuotedMediaPart(payload)));
     setComposerFocusToken((currentToken) => currentToken + 1);
   }
 
@@ -1229,6 +1280,8 @@ export default function App() {
     }
 
     if (activeRunId) {
+      // 切会话时不一定取消后端 run，只是把当前前端流解绑。
+      // 如果那个会话还在跑，会记录在 runningRunsBySession，切回来时再恢复。
       detachActiveRun();
     }
 

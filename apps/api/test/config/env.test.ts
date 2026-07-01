@@ -16,53 +16,57 @@ describe("loadEnv", () => {
     expect(env.AGENT_SUMMARY_TRIGGER_MESSAGES).toBe(8);
     expect(env.AGENT_SUMMARY_KEEP_RECENT_MESSAGES).toBe(4);
     expect(env.AGENT_SUMMARY_TRIGGER_CHARS).toBe(1000);
-    expect(env.AGENT_EVENT_RETENTION_DAYS).toBe(3);
-    expect(env.AGENT_EVENT_CLEANUP_HOUR).toBe(3);
-    expect(env.AGENT_EVENT_CLEANUP_BATCH_SIZE).toBe(2000);
-    expect(env.AGENT_EVENT_CLEANUP_MAX_BATCHES).toBe(20);
+    expect(env.AGENT_EVENT_LOG_PATH).toBe("./data/agent-events.jsonl");
     expect(env.AGENT_PUBLIC_BASE_URL).toBeUndefined();
     expect(env.AGENT_TOOL_RESOURCE_MAX_BYTES).toBe(200 * 1024 * 1024);
     expect(env.AGENT_TOOL_RESOURCE_DOWNLOAD_TIMEOUT_MS).toBe(60000);
-    expect(env.VOLCENGINE_IMAGE_EDIT_VERSION).toBe("2022-08-31");
-    expect(env.VOLCENGINE_IMAGE_EDIT_REQ_KEY).toBe("seededit_v3.0");
-    expect(env.VOLCENGINE_VIDEO_REQ_KEY).toBe("jimeng_t2v_v30");
-    expect(env.VOLCENGINE_VIDEO_FIRST_FRAME_REQ_KEY).toBe("jimeng_i2v_first_v30");
-    expect(env.VOLCENGINE_VIDEO_FIRST_LAST_FRAME_REQ_KEY).toBe("jimeng_i2v_first_tail_v30");
-    expect(env.VOLCENGINE_VIDEO_VERSION).toBe("2022-08-31");
-    expect(env.VOLCENGINE_VIDEO_MAX_POLL_ATTEMPTS).toBe(80);
-    expect(env.AGENT_RUNNING_STATE_STORE).toBe("memory");
     expect(env.REDIS_URL).toBe("redis://localhost:6379");
     expect(env.AGENT_RUNNING_STATE_TTL_SECONDS).toBe(7200);
     expect(env.AGENT_RUNNING_STATE_REDIS_KEY_PREFIX).toBe("agent");
+    expect(env.AGENT_QUEUE_NAME).toBe("agent-runs");
+    expect(env.AGENT_WORKER_CONCURRENCY).toBe(2);
+    expect(env.AGENT_RUN_LOCK_TTL_SECONDS).toBe(1800);
+    expect(env.AGENT_CANCEL_TTL_SECONDS).toBe(7200);
     expect(env.CORS_ORIGINS).toBeUndefined();
+    expect("AGENT_RUNNING_STATE_STORE" in env).toBe(false);
+    expect("AGENT_RUN_EXECUTION_MODE" in env).toBe(false);
+    expect("AGENT_EVENT_BUS" in env).toBe(false);
+    expect("VOLCENGINE_IMAGE_ENDPOINT" in env).toBe(false);
+    expect("VOLCENGINE_VIDEO_REQ_KEY" in env).toBe(false);
   });
 
-  it("解析事件清理配置", () => {
+  it("解析本地 agent 事件日志路径", () => {
     const env = loadEnv({
-      AGENT_EVENT_RETENTION_DAYS: "5",
-      AGENT_EVENT_CLEANUP_HOUR: "4",
-      AGENT_EVENT_CLEANUP_BATCH_SIZE: "200",
-      AGENT_EVENT_CLEANUP_MAX_BATCHES: "8"
+      AGENT_EVENT_LOG_PATH: "./tmp/agent-events.jsonl"
     });
 
-    expect(env.AGENT_EVENT_RETENTION_DAYS).toBe(5);
-    expect(env.AGENT_EVENT_CLEANUP_HOUR).toBe(4);
-    expect(env.AGENT_EVENT_CLEANUP_BATCH_SIZE).toBe(200);
-    expect(env.AGENT_EVENT_CLEANUP_MAX_BATCHES).toBe(8);
+    expect(env.AGENT_EVENT_LOG_PATH).toBe("./tmp/agent-events.jsonl");
   });
 
-  it("解析运行态 Redis 配置", () => {
+  it("解析 Redis 连接和 key 配置", () => {
     const env = loadEnv({
-      AGENT_RUNNING_STATE_STORE: "redis",
       REDIS_URL: "redis://redis.internal:6379/2",
       AGENT_RUNNING_STATE_TTL_SECONDS: "3600",
       AGENT_RUNNING_STATE_REDIS_KEY_PREFIX: "facai-agent"
     });
 
-    expect(env.AGENT_RUNNING_STATE_STORE).toBe("redis");
     expect(env.REDIS_URL).toBe("redis://redis.internal:6379/2");
     expect(env.AGENT_RUNNING_STATE_TTL_SECONDS).toBe(3600);
     expect(env.AGENT_RUNNING_STATE_REDIS_KEY_PREFIX).toBe("facai-agent");
+  });
+
+  it("解析 Redis 队列运行时配置", () => {
+    const env = loadEnv({
+      AGENT_QUEUE_NAME: "facai-agent-runs",
+      AGENT_WORKER_CONCURRENCY: "4",
+      AGENT_RUN_LOCK_TTL_SECONDS: "900",
+      AGENT_CANCEL_TTL_SECONDS: "3600"
+    });
+
+    expect(env.AGENT_QUEUE_NAME).toBe("facai-agent-runs");
+    expect(env.AGENT_WORKER_CONCURRENCY).toBe(4);
+    expect(env.AGENT_RUN_LOCK_TTL_SECONDS).toBe(900);
+    expect(env.AGENT_CANCEL_TTL_SECONDS).toBe(3600);
   });
 
   it("解析工具资源转储配置", () => {
@@ -83,5 +87,25 @@ describe("loadEnv", () => {
     });
 
     expect(env.CORS_ORIGINS).toEqual(["https://app.example.com", "http://127.0.0.1:4000"]);
+  });
+
+  it("不再解析火山供应商默认配置", () => {
+    const env = loadEnv({
+      VOLCENGINE_ACCESS_KEY_ID: "ak-test",
+      VOLCENGINE_SECRET_ACCESS_KEY: "sk-test",
+      VOLCENGINE_IMAGE_ENDPOINT: "https://example.com",
+      VOLCENGINE_IMAGE_REQ_KEY: "custom-image",
+      VOLCENGINE_IMAGE_MAX_POLL_ATTEMPTS: "99",
+      VOLCENGINE_VIDEO_REQ_KEY: "custom-video",
+      VOLCENGINE_VIDEO_MAX_POLL_ATTEMPTS: "99"
+    });
+
+    expect(env.VOLCENGINE_ACCESS_KEY_ID).toBe("ak-test");
+    expect(env.VOLCENGINE_SECRET_ACCESS_KEY).toBe("sk-test");
+    expect("VOLCENGINE_IMAGE_ENDPOINT" in env).toBe(false);
+    expect("VOLCENGINE_IMAGE_REQ_KEY" in env).toBe(false);
+    expect("VOLCENGINE_IMAGE_MAX_POLL_ATTEMPTS" in env).toBe(false);
+    expect("VOLCENGINE_VIDEO_REQ_KEY" in env).toBe(false);
+    expect("VOLCENGINE_VIDEO_MAX_POLL_ATTEMPTS" in env).toBe(false);
   });
 });

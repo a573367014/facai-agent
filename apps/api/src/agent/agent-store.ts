@@ -97,8 +97,6 @@ export interface AgentRunRecord {
 
 export interface StoredAgentEvent {
   id: string;
-  // seq > 0 表示持久化事件游标；seq = 0 表示只用于当前连接的 live/snapshot 事件，不参与回放。
-  seq: number;
   messageId?: string;
   runId?: string;
   event: AgentStreamEvent;
@@ -107,19 +105,6 @@ export interface StoredAgentEvent {
 }
 
 export type AgentEventListener = (event: StoredAgentEvent) => void;
-
-export interface PruneAgentEventsResult {
-  messageEvents: number;
-  runEvents: number;
-  batches: number;
-  reachedLimit: boolean;
-}
-
-export interface PruneExpiredAgentEventsInput {
-  nowIso: string;
-  batchSize: number;
-  maxBatches: number;
-}
 
 export interface AgentToolCallRecord {
   id: string;
@@ -344,7 +329,6 @@ export interface AgentStore {
     limit: number
   ): AgentMessageRecord[];
   countContextMessagesBefore(sessionId: string, beforeMessageId: string, afterMessageId?: string): number;
-  pruneExpiredEvents(input: PruneExpiredAgentEventsInput): PruneAgentEventsResult;
   createToolCall(input: CreateAgentToolCallInput): AgentToolCallRecord;
   updateToolCall(toolCallRowId: string, input: UpdateAgentToolCallInput): AgentToolCallRecord | undefined;
   getToolCallByMessageToolCall(messageId: string, toolCallId: string): AgentToolCallRecord | undefined;
@@ -355,12 +339,7 @@ export interface AgentStore {
   createProcessStep(input: CreateAgentProcessStepInput): AgentProcessStepRecord;
   updateProcessStep(stepId: string, input: UpdateAgentProcessStepInput): AgentProcessStepRecord | undefined;
   getProcessStepsByMessages(messageIds: string[]): AgentProcessStepRecord[];
-  appendEvent(messageId: string, event: AgentStreamEvent): StoredAgentEvent | undefined;
-  publishTransientEvent(messageId: string, event: AgentStreamEvent): StoredAgentEvent | undefined;
-  getEvents(messageId: string, after?: number): StoredAgentEvent[];
-  subscribe(messageId: string, listener: AgentEventListener): () => void;
   appendRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): StoredAgentEvent | undefined;
   publishTransientRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): StoredAgentEvent | undefined;
-  getRunEvents(runId: string, after?: number): StoredAgentEvent[];
   subscribeRun(runId: string, listener: AgentEventListener): () => void;
 }

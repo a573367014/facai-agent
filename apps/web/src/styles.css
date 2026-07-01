@@ -823,8 +823,9 @@ button:not(:disabled):hover {
   align-items: center;
   justify-content: center;
   flex: 0 0 auto;
-  width: 18px;
+  min-width: 18px;
   height: 18px;
+  padding: 0 4px;
   border-radius: 4px;
   background: #fffdfa;
   color: var(--eye-muted);

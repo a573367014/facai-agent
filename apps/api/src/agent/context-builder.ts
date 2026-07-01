@@ -25,6 +25,9 @@ export class AgentContextBuilder {
   }
 
   buildConversationHistory(messages: AgentMessageRecord[], summary?: AgentSessionSummaryRecord): AgentMessage[] {
+    // 给 LLM 的上下文不是简单“全量历史塞进去”：
+    // 旧消息先压成 summary，当作一条 system 记忆；summary 覆盖之后的新消息再按时间和字符预算补上。
+    // 这样能让模型记住长期目标，同时避免上下文越来越长、成本越来越高。
     const summaryMessage = summary ? renderSummaryMessage(summary.summary) : undefined;
 
     if (this.maxHistoryMessages === 0) {
@@ -50,6 +53,8 @@ export class AgentContextBuilder {
     const selectedMessages: AgentMessageRecord[] = [];
     let usedCharacters = 0;
 
+    // 从最新消息往前挑，优先保证最近对话完整。
+    // 第一条即使超预算也会保留，否则极端情况下模型会拿不到任何历史。
     for (const message of [...messages].reverse()) {
       const messageCharacters = countMessageCharacters(message);
 
@@ -79,6 +84,8 @@ function sliceMessagesAfterCoveredMessage(messages: AgentMessageRecord[], covere
 }
 
 function renderSummaryMessage(summary: AgentSessionSummary): AgentMessage | undefined {
+  // 摘要以 system 消息注入，是为了让模型把它当“会话记忆”，而不是用户刚刚说的话。
+  // 但提示里明确“以用户最新消息为准”，避免旧摘要压过当前意图。
   const sections = [
     renderSingleLineSection("用户目标", summary.userGoal),
     renderSingleLineSection("当前任务", summary.currentTask),
@@ -123,6 +130,8 @@ function countMessageCharacters(message: AgentMessageRecord): number {
 function toContextMessage(message: AgentMessageRecord): AgentMessage | undefined {
   const content = partsToLlmText(message.parts);
 
+  // 上下文只放 user/assistant。system 状态消息、运行中的 assistant 都不放，
+  // 因为它们更多是 UI/流程状态，直接喂给 LLM 反而容易干扰下一轮推理。
   if (message.role === "user" && content) {
     return { role: "user", content };
   }

@@ -127,16 +127,15 @@ function createStoredSseResponse(messageId: string, events: Array<Record<string,
             ];
         const blocks = eventsWithAssistant
           .map((event, index) => {
-            const seq = index + 1;
+            const eventId = `event_${index + 1}`;
             const storedEvent = {
-              id: `event_${seq}`,
-              seq,
+              id: eventId,
               runId: messageId,
               messageId,
               event,
               createdAt: "2026-06-22T00:00:00.000Z"
             };
-            return `id: ${seq}\ndata: ${JSON.stringify(storedEvent)}\n\n`;
+            return `id: ${eventId}\ndata: ${JSON.stringify(storedEvent)}\n\n`;
           })
           .join("");
         controller.enqueue(encoder.encode(blocks));
@@ -171,16 +170,15 @@ function createStoredRunSseResponse(runId: string, messageId: string, events: Ar
             ];
         const blocks = eventsWithAssistant
           .map((event, index) => {
-            const seq = index + 1;
+            const eventId = `event_${index + 1}`;
             const storedEvent = {
-              id: `event_${seq}`,
-              seq,
+              id: eventId,
               runId,
               messageId,
               event,
               createdAt: "2026-06-22T00:00:00.000Z"
             };
-            return `id: ${seq}\ndata: ${JSON.stringify(storedEvent)}\n\n`;
+            return `id: ${eventId}\ndata: ${JSON.stringify(storedEvent)}\n\n`;
           })
           .join("");
         controller.enqueue(encoder.encode(blocks));
@@ -192,19 +190,19 @@ function createStoredRunSseResponse(runId: string, messageId: string, events: Ar
 
 function createControlledStoredSseResponse(messageId: string) {
   const encoder = new TextEncoder();
-  let seq = 0;
+  let eventIndex = 0;
   let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
   const writeEvent = (event: Record<string, unknown>) => {
-    seq += 1;
+    eventIndex += 1;
+    const eventId = `event_${eventIndex}`;
     const storedEvent = {
-      id: `event_${seq}`,
-      seq,
+      id: eventId,
       runId: messageId,
       messageId,
       event,
       createdAt: "2026-06-22T00:00:00.000Z"
     };
-    streamController?.enqueue(encoder.encode(`id: ${seq}\ndata: ${JSON.stringify(storedEvent)}\n\n`));
+    streamController?.enqueue(encoder.encode(`id: ${eventId}\ndata: ${JSON.stringify(storedEvent)}\n\n`));
   };
   const response = {
     ok: true,
@@ -234,29 +232,27 @@ function createControlledStoredRunSseResponse({
   runId,
   messageId,
   sessionId,
-  startSeq = 0,
   emitInitial = true
 }: {
   runId: string;
   messageId: string;
   sessionId: string;
-  startSeq?: number;
   emitInitial?: boolean;
 }) {
   const encoder = new TextEncoder();
-  let seq = startSeq;
+  let eventIndex = 0;
   let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
   const writeEvent = (event: Record<string, unknown>) => {
-    seq += 1;
+    eventIndex += 1;
+    const eventId = `event_${eventIndex}`;
     const storedEvent = {
-      id: `event_${seq}`,
-      seq,
+      id: eventId,
       runId,
       messageId,
       event,
       createdAt: "2026-06-22T00:00:00.000Z"
     };
-    streamController?.enqueue(encoder.encode(`id: ${seq}\ndata: ${JSON.stringify(storedEvent)}\n\n`));
+    streamController?.enqueue(encoder.encode(`id: ${eventId}\ndata: ${JSON.stringify(storedEvent)}\n\n`));
   };
   const response = {
     ok: true,
@@ -296,16 +292,15 @@ function createMixedStoredSseResponse(
       start(controller) {
         const blocks = events
           .map(({ runId, messageId, event }, index) => {
-            const seq = index + 1;
+            const eventId = `event_${index + 1}`;
             const storedEvent = {
-              id: `event_${seq}`,
-              seq,
+              id: eventId,
               runId,
               messageId,
               event,
               createdAt: "2026-06-22T00:00:00.000Z"
             };
-            return `id: ${seq}\ndata: ${JSON.stringify(storedEvent)}\n\n`;
+            return `id: ${eventId}\ndata: ${JSON.stringify(storedEvent)}\n\n`;
           })
           .join("");
 
@@ -819,7 +814,7 @@ describe("App", () => {
         );
       }
 
-      if (url.endsWith("/agents/runs/run_regen_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/run_regen_1/stream")) {
         return createStoredRunSseResponse("run_regen_1", "msg_assistant_regen", [
           {
             type: "session.message.created",
@@ -853,7 +848,7 @@ describe("App", () => {
       method: "POST"
     });
     expect(globalThis.fetch).toHaveBeenCalledWith(
-      "http://localhost:4001/agents/runs/run_regen_1/events?after=0",
+      "http://localhost:4001/agents/runs/run_regen_1/stream",
       expect.objectContaining({
         headers: {
           accept: "text/event-stream"
@@ -1173,7 +1168,7 @@ describe("App", () => {
         });
       }
 
-      if (url.endsWith("/agents/runs/run_copy_parts/events?after=0")) {
+      if (url.endsWith("/agents/runs/run_copy_parts/stream")) {
         return createStoredRunSseResponse("run_copy_parts", "msg_assistant_new", [{ type: "run_completed", messageId: "msg_assistant_new" }]);
       }
 
@@ -1217,7 +1212,7 @@ describe("App", () => {
         return jsonResponse(createStartMessageResponse({ input: "计算 12 * 9", assistantMessageId: "msg_1" }));
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
         return createStoredSseResponse("msg_1", [
           {
             type: "tool_start",
@@ -1259,7 +1254,7 @@ describe("App", () => {
         return jsonResponse(createStartMessageResponse({ input: "继续生成", assistantMessageId: "msg_1" }));
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
         return createStoredSseResponse("msg_1", [
           {
             type: "message.snapshot",
@@ -1288,7 +1283,7 @@ describe("App", () => {
         return jsonResponse(createStartMessageResponse({ input: "生成图片", assistantMessageId: "msg_1" }));
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
         return createStoredSseResponse("msg_1", [
           {
             type: "process.step.created",
@@ -1347,7 +1342,7 @@ describe("App", () => {
         return jsonResponse(createStartMessageResponse({ input: "继续生成", assistantMessageId: "msg_1" }));
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
         return createStoredSseResponse("msg_1", [
           {
             type: "message.snapshot",
@@ -1384,7 +1379,7 @@ describe("App", () => {
         return jsonResponse(createStartMessageResponse({ input: "继续生成", assistantMessageId: "msg_1" }));
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
         return createStoredSseResponse("msg_1", [
           { type: "message.part.delta", version: 1, messageId: "msg_1", partIndex: 0, delta: "恢复" },
           { type: "message.part.delta", version: 1, messageId: "msg_1", partIndex: 0, delta: "恢复" }
@@ -1607,7 +1602,7 @@ describe("App", () => {
         });
       }
 
-      if (url.endsWith("/agents/runs/run_quote_image/events?after=0")) {
+      if (url.endsWith("/agents/runs/run_quote_image/stream")) {
         return createStoredRunSseResponse("run_quote_image", "msg_assistant_quote_new", [
           { type: "run_completed", messageId: "msg_assistant_quote_new" }
         ]);
@@ -1706,7 +1701,7 @@ describe("App", () => {
         return jsonResponse(createStartMessageResponse({ input: "你好", assistantMessageId: "msg_1" }));
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
         return createStoredSseResponse("msg_1", [
           { type: "iteration_start", iteration: 0 },
           { type: "agent_state", iteration: 0, state: "thinking", label: "模型思考中" },
@@ -1775,7 +1770,7 @@ describe("App", () => {
         return jsonResponse(createStartMessageResponse({ input: "生成粉色小猪", assistantMessageId: "msg_1" }));
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
         return createStoredSseResponse("msg_1", [
           {
             type: "resource.created",
@@ -1864,6 +1859,63 @@ describe("App", () => {
     expect(screen.getByRole("link", { name: "下载图片 1" })).toHaveAttribute("href", "https://example.com/pig.png");
   });
 
+  it("视频 part 先于文本 part 到达时 final_answer 仍能正常补正文", async () => {
+    mockAppFetch((url, init) => {
+      if (url.endsWith("/agents/runs") && init?.method === "POST") {
+        return jsonResponse(createStartMessageResponse({ input: "生成田园小猪视频", assistantMessageId: "msg_1" }));
+      }
+
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
+        return createStoredRunSseResponse("msg_1", "msg_1", [
+          {
+            type: "session.message.created",
+            message: createAssistantMessage("session_1", "", {
+              id: "msg_1",
+              status: "running",
+              parts: []
+            })
+          },
+          {
+            type: "message.part.updated",
+            messageId: "msg_1",
+            partIndex: 1,
+            part: {
+              type: "media",
+              mime: "video/mp4",
+              url: "https://example.com/pig-video.mp4",
+              width: 1280,
+              height: 720,
+              extra: {
+                lifecycle: { state: "succeeded" },
+                resource: { id: "res_video" },
+                tool: {
+                  name: "generate_video",
+                  toolCallId: "call_video",
+                  toolCallRowId: "tool_call_video",
+                  outputIndex: 0
+                },
+                generation: { prompt: "田园小猪视频", provider: "test" }
+              }
+            }
+          },
+          { type: "final_answer", answer: "视频已生成。" },
+          { type: "run_completed", messageId: "msg_1" }
+        ]);
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await userEvent.type(screen.getByLabelText("发消息"), "生成田园小猪视频");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(screen.getByLabelText("田园小猪视频")).toHaveAttribute("src", "https://example.com/pig-video.mp4"));
+    expect(screen.getAllByText("视频已生成。").length).toBeGreaterThan(0);
+    expect(screen.getByRole("link", { name: "下载视频 1" })).toHaveAttribute("href", "https://example.com/pig-video.mp4");
+  });
+
   it("摘要过程会在主消息区和时间线展示", async () => {
     const runningSystemMessage = createSystemMessage("session_1", "上下文自动压缩中...", {
       id: "msg_system_summary",
@@ -1884,7 +1936,7 @@ describe("App", () => {
         return jsonResponse(createStartMessageResponse({ input: "继续深入", assistantMessageId: "msg_1" }));
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
         return createStoredSseResponse("msg_1", [
           { type: "session.message.created", message: runningSystemMessage },
           {
@@ -2029,7 +2081,7 @@ describe("App", () => {
         return jsonResponse(createStartMessageResponse({ input: "继续深入", assistantMessageId: "run_1" }));
       }
 
-      if (url.endsWith("/agents/runs/run_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/run_1/stream")) {
         return createStoredSseResponse("run_1", [
           { type: "session.message.created", message: runningSystemMessage },
           {
@@ -2073,7 +2125,7 @@ describe("App", () => {
         return jsonResponse(createStartMessageResponse({ input: "继续深入", assistantMessageId: "run_1" }));
       }
 
-      if (url.endsWith("/agents/runs/run_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/run_1/stream")) {
         return createStoredSseResponse("run_1", [
           { type: "session.message.created", message: runningSystemMessage },
           {
@@ -2130,12 +2182,12 @@ describe("App", () => {
         );
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
         firstStream = createControlledStoredSseResponse("msg_1");
         return firstStream.response;
       }
 
-      if (url.endsWith("/agents/runs/msg_2/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_2/stream")) {
         return createStoredSseResponse("msg_2", [{ type: "final_answer", answer: "第二轮答案" }]);
       }
 
@@ -2182,7 +2234,7 @@ describe("App", () => {
         );
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
         firstStream = createControlledStoredSseResponse("msg_1");
         return firstStream.response;
       }
@@ -2203,7 +2255,7 @@ describe("App", () => {
         });
       }
 
-      if (url.endsWith("/agents/runs/msg_2/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_2/stream")) {
         return createMixedStoredSseResponse([
           {
             runId: "msg_1",
@@ -2260,7 +2312,7 @@ describe("App", () => {
         return jsonResponse(createStartMessageResponse({ input: "写一段很长的内容", assistantMessageId: "msg_1" }));
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
         return createOpenSseResponse();
       }
 
@@ -2335,7 +2387,7 @@ describe("App", () => {
         return jsonResponse(createStartMessageResponse({ input: "写一段很长的内容", assistantMessageId: "msg_1" }));
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
         runningStream = createControlledStoredSseResponse("msg_1");
         return runningStream.response;
       }
@@ -2424,13 +2476,18 @@ describe("App", () => {
         return jsonResponse(createStartMessageResponse({ sessionId: "session_other", input, assistantMessageId: "msg_2" }));
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
-        firstStream = createControlledStoredRunSseResponse({
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
+        const stream = createControlledStoredRunSseResponse({
           runId: "msg_1",
           messageId: "msg_1",
           sessionId: "session_1"
         });
-        return firstStream.response;
+        if (!firstStream) {
+          firstStream = stream;
+        } else {
+          resumedFirstStream = stream;
+        }
+        return stream.response;
       }
 
       if (url.endsWith("/agents/sessions/session_other")) {
@@ -2447,7 +2504,7 @@ describe("App", () => {
         });
       }
 
-      if (url.endsWith("/agents/runs/msg_2/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_2/stream")) {
         secondStream = createControlledStoredRunSseResponse({
           runId: "msg_2",
           messageId: "msg_2",
@@ -2488,7 +2545,6 @@ describe("App", () => {
           events: [
             {
               id: "event_1",
-              seq: 1,
               runId: "msg_1",
               messageId: "msg_1",
               event: {
@@ -2499,17 +2555,6 @@ describe("App", () => {
             }
           ]
         });
-      }
-
-      if (url.endsWith("/agents/runs/msg_1/events?after=1")) {
-        resumedFirstStream = createControlledStoredRunSseResponse({
-          runId: "msg_1",
-          messageId: "msg_1",
-          sessionId: "session_1",
-          startSeq: 1,
-          emitInitial: false
-        });
-        return resumedFirstStream.response;
       }
 
       return undefined;
@@ -2556,7 +2601,7 @@ describe("App", () => {
         return jsonResponse(createStartMessageResponse({ input: body.parts[0]?.value ?? "", assistantMessageId: messageId }));
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
         firstStream = createControlledStoredSseResponse("msg_1");
         return firstStream.response;
       }
@@ -2577,7 +2622,7 @@ describe("App", () => {
         });
       }
 
-      if (url.endsWith("/agents/runs/msg_2/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_2/stream")) {
         return createStoredSseResponse("msg_2", [
           { type: "message.part.delta", messageId: "msg_2", partIndex: 0, delta: "第二轮答案" },
           { type: "final_answer", answer: "第二轮答案" }
@@ -2647,7 +2692,7 @@ describe("App", () => {
         return jsonResponse(createStartMessageResponse({ input: "用户问题", assistantMessageId: "msg_1" }));
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
         return createStoredSseResponse("msg_1", [
           { type: "iteration_start", iteration: 0 },
           { type: "agent_state", iteration: 0, state: "thinking", label: "模型思考中" },
@@ -2682,7 +2727,7 @@ describe("App", () => {
         });
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
         return createStoredSseResponse("msg_1", [
           { type: "message.part.delta", messageId: "msg_1", partIndex: 0, delta: "新协议答案" },
           { type: "final_answer", answer: "新协议答案" }
@@ -2706,7 +2751,7 @@ describe("App", () => {
         return jsonResponse(createStartMessageResponse({ input: "用户问题", assistantMessageId: "msg_1" }));
       }
 
-      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+      if (url.endsWith("/agents/runs/msg_1/stream")) {
         return createMixedStoredSseResponse([
           {
             runId: "msg_1",
@@ -2756,7 +2801,6 @@ describe("App", () => {
           events: [
             {
               id: "event_1",
-              seq: 1,
               runId: "msg_1",
               messageId: "msg_1",
               event: { type: "iteration_start", iteration: 0 },
@@ -2764,7 +2808,6 @@ describe("App", () => {
             },
             {
               id: "event_2",
-              seq: 2,
               runId: "msg_1",
               messageId: "msg_1",
               event: { type: "message.part.delta", messageId: "msg_1", partIndex: 0, delta: "恢复" },
@@ -2772,7 +2815,6 @@ describe("App", () => {
             },
             {
               id: "event_3",
-              seq: 3,
               runId: "msg_1",
               messageId: "msg_1",
               event: { type: "final_answer", answer: "恢复" },
