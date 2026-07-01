@@ -58,9 +58,6 @@ const runParamsSchema = z.object({
 const sessionParamsSchema = z.object({
   sessionId: z.string().min(1)
 });
-const eventsQuerySchema = z.object({
-  after: z.coerce.number().int().min(0).optional()
-});
 const sessionMessagesQuerySchema = z.object({
   before: z.string().min(1).optional(),
   limit: z.coerce.number().int().min(1).max(100).optional()
@@ -166,16 +163,6 @@ function parseSessionsQuery(query: unknown) {
   return parsed.data;
 }
 
-function parseEventsQuery(query: unknown) {
-  const parsed = eventsQuerySchema.safeParse(query);
-
-  if (!parsed.success) {
-    throw new AppError("VALIDATION_ERROR", "after 必须是大于等于 0 的整数", 400);
-  }
-
-  return parsed.data;
-}
-
 function parseSessionMessagesQuery(query: unknown) {
   const parsed = sessionMessagesQuerySchema.safeParse(query);
 
@@ -187,8 +174,7 @@ function parseSessionMessagesQuery(query: unknown) {
 }
 
 function formatStoredSseEvent(event: StoredAgentEvent): string {
-  const eventId = event.seq > 0 ? event.seq : event.id;
-  return `id: ${eventId}\ndata: ${JSON.stringify(event)}\n\n`;
+  return `id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`;
 }
 
 function isTerminalStoredEvent(event: StoredAgentEvent): boolean {
@@ -218,7 +204,6 @@ function createLiveSseEvent(input: {
 }): StoredAgentEvent {
   return {
     id: `event_live_${randomUUID()}`,
-    seq: 0,
     messageId: input.messageId,
     runId: input.runId,
     event: input.event,
@@ -341,11 +326,6 @@ export async function registerAgentRoutes(
     return coordinator.getMessageSnapshot(messageId);
   });
 
-  app.get("/agents/messages/:messageId/debug/events", async (request) => {
-    const { messageId } = parseMessageParams(request.params);
-    return coordinator.getMessageDebugEvents(messageId);
-  });
-
   app.get("/agents/runs/:runId", async (request) => {
     const { runId } = parseRunParams(request.params);
     return coordinator.getRun(runId);
@@ -361,9 +341,8 @@ export async function registerAgentRoutes(
     reply.status(202).send(await coordinator.regenerateMessage(messageId));
   });
 
-  app.get("/agents/runs/:runId/events", async (request, reply) => {
+  app.get("/agents/runs/:runId/stream", async (request, reply) => {
     const { runId } = parseRunParams(request.params);
-    parseEventsQuery(request.query);
     coordinator.getRun(runId);
 
     reply.raw.writeHead(200, buildSseHeaders(reply.getHeaders()));
@@ -372,7 +351,6 @@ export async function registerAgentRoutes(
     // 因此这里不只订阅 live event，还会在订阅后主动补一个 message.snapshot：
     // - running 时 snapshot 从 Redis draft 读，能恢复当前生成中的 parts；
     // - completed/failed/cancelled 时 snapshot 从 SQLite message 读，展示最终状态。
-    const sentEventSeqs = new Set<number>();
     let ended = false;
     let unsubscribe: () => void | Promise<void> = () => {};
     const finish = () => {
@@ -387,14 +365,6 @@ export async function registerAgentRoutes(
     const writeStoredEvent = (event: StoredAgentEvent) => {
       if (ended) {
         return;
-      }
-
-      if (event.seq > 0 && sentEventSeqs.has(event.seq)) {
-        return;
-      }
-
-      if (event.seq > 0) {
-        sentEventSeqs.add(event.seq);
       }
 
       reply.raw.write(formatStoredSseEvent(event));

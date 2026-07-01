@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -161,7 +161,6 @@ function parseSseEvents(body: string) {
 
       return JSON.parse(dataLine.slice("data: ".length)) as {
         id: string;
-        seq: number;
         messageId?: string;
         runId?: string;
         event: {
@@ -176,66 +175,33 @@ function parseSseEvents(body: string) {
 }
 
 describe("agent routes", () => {
-  it("启动后不会立即清理事件，会在配置的凌晨窗口清理过期事件", async () => {
-    vi.useFakeTimers();
-    const databasePath = createTempDatabasePath();
-    const store = await SqliteAgentStore.create({ databasePath, eventRetentionDays: 3 });
-
-    vi.setSystemTime(new Date(2026, 5, 20, 0, 0, 0, 0));
-    const session = store.createSession("事件清理");
-    const assistantMessage = store.createMessage({
-      sessionId: session.id,
-      role: "assistant",
-      status: "completed",
-      parts: [{ type: "text", value: "已有回答" }],
-      completedAt: "2026-06-22T00:00:01.000Z"
-    });
-    store.appendEvent(assistantMessage.id, { type: "final_answer", answer: "已有回答" });
-    store.close();
-
-    vi.setSystemTime(new Date(2026, 5, 24, 2, 30, 0, 0));
-    const app = await buildApp({
+  it("执行 run 会把 agent 过程事件写入本地 JSONL 日志", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-event-log-"));
+    tempDirs.push(dir);
+    const eventLogPath = join(dir, "agent-events.jsonl");
+    const app = await buildTestApp({
       agentService: createTestAgentService(),
-      databasePath,
-      runningStateStore: new InMemoryRunningMessageStateStore(),
-      eventBus: new InMemoryAgentEventBus(),
-      runQueue: new CapturingAgentRunQueue(),
-      cancellationStore: new InMemoryAgentCancellationStore(),
-      runLock: new InMemoryAgentRunLock(),
-      eventCleanupHour: 3,
-      eventCleanupBatchSize: 10,
-      eventCleanupMaxBatches: 2
+      agentEventLogPath: eventLogPath
     });
-    apps.push(app);
-
-    const beforeResponse = await app.inject({
-      method: "GET",
-      url: `/agents/messages/${assistantMessage.id}`
+    const createResponse = await app.inject({
+      method: "POST",
+      url: "/agents/runs",
+      payload: { input: "你好" }
     });
+    const { run } = createResponse.json() as { run: { id: string } };
 
-    expect(beforeResponse.json()).toMatchObject({
-      events: [expect.objectContaining({ event: { type: "final_answer", answer: "已有回答" } })]
-    });
+    await executeNextQueuedRun(app);
 
-    await vi.advanceTimersByTimeAsync(29 * 60 * 1000);
+    expect(existsSync(eventLogPath)).toBe(true);
+    const logLines = readFileSync(eventLogPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { kind: string; eventType: string; runId: string });
 
-    const stillBeforeCleanupResponse = await app.inject({
-      method: "GET",
-      url: `/agents/messages/${assistantMessage.id}`
-    });
-
-    expect(stillBeforeCleanupResponse.json()).toMatchObject({
-      events: [expect.objectContaining({ event: { type: "final_answer", answer: "已有回答" } })]
-    });
-
-    await vi.advanceTimersByTimeAsync(60 * 1000);
-
-    const afterResponse = await app.inject({
-      method: "GET",
-      url: `/agents/messages/${assistantMessage.id}`
-    });
-
-    expect(afterResponse.json()).toMatchObject({ events: [] });
+    expect(logLines.map((line) => line.eventType)).toEqual(
+      expect.arrayContaining(["session.message.created", "final_answer", "session.message.updated", "run_completed"])
+    );
+    expect(logLines.every((line) => line.kind === "agent_event" && line.runId === run.id)).toBe(true);
   });
 
   it("GET /health 返回 ok", async () => {
@@ -427,10 +393,6 @@ describe("agent routes", () => {
       url: `/agents/sessions/${session.id}/messages`,
       payload: { input: "你好" }
     });
-    const eventResponse = await app.inject({
-      method: "GET",
-      url: "/agents/messages/msg_legacy/events?after=0"
-    });
     const cancelResponse = await app.inject({
       method: "POST",
       url: "/agents/messages/msg_legacy/cancel"
@@ -438,7 +400,6 @@ describe("agent routes", () => {
 
     expect(rootResponse.statusCode).toBe(404);
     expect(sessionResponse.statusCode).toBe(404);
-    expect(eventResponse.statusCode).toBe(404);
     expect(cancelResponse.statusCode).toBe(404);
   });
 
@@ -689,7 +650,6 @@ describe("agent routes", () => {
     });
     const payload = response.json() as {
       run: { status: string; phase: string; error?: { code: string; message: string } };
-      events: Array<{ event: { type: string; code?: string } }>;
     };
 
     expect(payload.run).toMatchObject({
@@ -700,10 +660,9 @@ describe("agent routes", () => {
         message: "服务重启后清理遗留运行"
       }
     });
-    expect(payload.events.map((event) => event.event.type)).toContain("error");
   });
 
-  it("GET /agents/runs/:runId/events 返回当前 assistant message snapshot", async () => {
+  it("GET /agents/runs/:runId/stream 返回当前 assistant message snapshot", async () => {
     const app = await buildTestApp({ agentService: createTestAgentService() });
     const createResponse = await app.inject({
       method: "POST",
@@ -716,7 +675,7 @@ describe("agent routes", () => {
 
     const response = await app.inject({
       method: "GET",
-      url: `/agents/runs/${run.id}/events?after=0`
+      url: `/agents/runs/${run.id}/stream`
     });
 
     expect(response.statusCode).toBe(200);
@@ -725,7 +684,6 @@ describe("agent routes", () => {
 
     expect(events).toEqual([
       expect.objectContaining({
-        seq: 0,
         runId: run.id,
         event: expect.objectContaining({
           type: "message.snapshot",
@@ -738,46 +696,6 @@ describe("agent routes", () => {
       })
     ]);
     expect(response.body).toContain(`"runId":"${run.id}"`);
-  });
-
-  it("GET /agents/messages/:messageId/debug/events 根据 assistant messageId 反查 run events", async () => {
-    const app = await buildTestApp({ agentService: createTestAgentService() });
-    const createResponse = await app.inject({
-      method: "POST",
-      url: "/agents/runs",
-      payload: { input: "你好" }
-    });
-    const { run } = createResponse.json() as { run: { id: string } };
-    await executeNextQueuedRun(app);
-    await waitForRun(app, run.id);
-    const assistantMessageId = run.assistantMessageId;
-
-    const response = await app.inject({
-      method: "GET",
-      url: `/agents/messages/${assistantMessageId}/debug/events`
-    });
-    const payload = response.json() as {
-      message: { id: string };
-      runs: Array<{ id: string; assistantMessageId?: string }>;
-      messageEvents: Array<{ id: string; runId?: string; messageId?: string; event: { type: string } }>;
-      runEvents: Array<{ id: string; runId?: string; messageId?: string; event: { type: string } }>;
-      events: Array<{ id: string; runId?: string; messageId?: string; event: { type: string } }>;
-    };
-
-    expect(response.statusCode).toBe(200);
-    expect(payload.message.id).toBe(assistantMessageId);
-    expect(payload.runs).toEqual([
-      expect.objectContaining({
-        id: run.id,
-        assistantMessageId
-      })
-    ]);
-    expect(payload.messageEvents.map((event) => event.event.type)).toContain("run_completed");
-    expect(payload.messageEvents.every((event) => event.messageId === assistantMessageId)).toBe(true);
-    expect(payload.runEvents.map((event) => event.event.type)).toContain("run_completed");
-    expect(payload.runEvents.every((event) => event.runId === run.id)).toBe(true);
-    expect(new Set(payload.events.map((event) => event.id)).size).toBe(payload.events.length);
-    expect(payload.events.map((event) => event.event.type)).toEqual(payload.runEvents.map((event) => event.event.type));
   });
 
   it("POST /agents/sessions/:sessionId/runs 不返回压缩 prelude，压缩进度通过 run 持久化", async () => {
@@ -862,7 +780,6 @@ describe("agent routes", () => {
       });
       const completedThirdRun = await waitForRun(app, thirdPayload.run.id) as {
         run: { status: string; phase: string; systemMessageId?: string };
-        events: Array<{ event: { type: string } }>;
       };
       const systemMessage = store
         .getMessagesBySession(firstPayload.session.id)
@@ -878,9 +795,6 @@ describe("agent routes", () => {
         status: "completed",
         parts: [{ type: "text", value: "上下文已自动压缩" }]
       });
-      expect(completedThirdRun.events.map((event) => event.event.type)).toEqual(
-        expect.arrayContaining(["summary_start", "summary_completed", "final_answer", "run_completed"])
-      );
     } finally {
       store.close();
     }
@@ -965,50 +879,6 @@ describe("agent routes", () => {
     await waitForRun(app, payload.run.id);
     expect(store.getMessagesBySession(session.id).filter((message) => message.role === "assistant")).toHaveLength(2);
     store.close();
-  });
-
-  it("GET /agents/messages/:messageId 只持久化关键事件，不持久化 message part delta", async () => {
-    const deltaParts = ["这", "是", "一", "段", "需", "要", "合", "并", "的", "流", "式", "回", "答"];
-    const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async () => {
-        throw new Error("streaming path should be used");
-      },
-      completeStream: async (_request, onDelta) => {
-        for (const part of deltaParts) {
-          await onDelta(part);
-        }
-
-        return { content: deltaParts.join("") };
-      }
-    };
-    const app = await buildTestApp({
-      agentService: createAgentService(provider, registry)
-    });
-    const createResponse = await app.inject({
-      method: "POST",
-      url: "/agents/runs",
-      payload: { input: "生成一段话" }
-    });
-    const { run } = createResponse.json() as { run: { id: string; assistantMessageId: string } };
-
-    await executeNextQueuedRun(app);
-    const completed = await waitForRun(app, run.id);
-    const assistantMessageId = completed.run.assistantMessageId as string;
-
-    const snapshotResponse = await app.inject({
-      method: "GET",
-      url: `/agents/messages/${assistantMessageId}`
-    });
-    const snapshot = snapshotResponse.json() as {
-      events: Array<{ event: { type: string; delta?: string } }>;
-    };
-    const answerDeltaEvents = snapshot.events.filter((event) => event.event.type === "answer_delta");
-    const partDeltaEvents = snapshot.events.filter((event) => event.event.type === "message.part.delta");
-
-    expect(answerDeltaEvents).toEqual([]);
-    expect(partDeltaEvents).toEqual([]);
-    expect(snapshot.events.map((event) => event.event.type)).toContain("final_answer");
   });
 
   it("同一 session 的后续 assistant message 会带上历史消息", async () => {

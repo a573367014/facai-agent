@@ -5,6 +5,7 @@ import { Queue } from "bullmq";
 import Fastify from "fastify";
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
+import { JsonlAgentEventLogger, type AgentEventLogger } from "./agent/agent-event-logger.js";
 import { AgentService } from "./agent/agent-service.js";
 import { AgentMessageCoordinator } from "./agent/agent-message-coordinator.js";
 import { RedisAgentCancellationStore, type AgentCancellationStore } from "./agent/agent-cancellation-store.js";
@@ -39,10 +40,8 @@ export interface BuildAppOptions {
   agentService?: AgentService;
   coordinator?: AgentMessageCoordinator;
   databasePath?: string;
-  eventRetentionDays?: number;
-  eventCleanupHour?: number;
-  eventCleanupBatchSize?: number;
-  eventCleanupMaxBatches?: number;
+  agentEventLogPath?: string;
+  agentEventLogger?: AgentEventLogger;
   runningStateStore?: RunningMessageStateStore;
   eventBus?: AgentEventBus;
   runQueue?: AgentRunQueue;
@@ -56,17 +55,6 @@ export interface BuildAppOptions {
 export type AgentRuntimeFastifyInstance = Awaited<ReturnType<typeof buildApp>> & {
   agentCoordinator?: AgentMessageCoordinator;
 };
-
-function getDelayUntilNextCleanupHour(now: Date, cleanupHour: number) {
-  const nextCleanupAt = new Date(now);
-  nextCleanupAt.setHours(cleanupHour, 0, 0, 0);
-
-  if (nextCleanupAt.getTime() <= now.getTime()) {
-    nextCleanupAt.setDate(nextCleanupAt.getDate() + 1);
-  }
-
-  return nextCleanupAt.getTime() - now.getTime();
-}
 
 export async function buildApp(options: BuildAppOptions = {}) {
   const app = Fastify({ logger: true });
@@ -172,14 +160,12 @@ export async function buildApp(options: BuildAppOptions = {}) {
   let coordinator = options.coordinator;
 
   if (!coordinator) {
-    const eventRetentionDays = options.eventRetentionDays ?? env.AGENT_EVENT_RETENTION_DAYS;
     const agentStore = await SqliteAgentStore.create({
-      databasePath: options.databasePath ?? env.AGENT_SQLITE_PATH,
-      eventRetentionDays
+      databasePath: options.databasePath ?? env.AGENT_SQLITE_PATH
     });
-    const eventCleanupHour = options.eventCleanupHour ?? env.AGENT_EVENT_CLEANUP_HOUR;
-    const eventCleanupBatchSize = options.eventCleanupBatchSize ?? env.AGENT_EVENT_CLEANUP_BATCH_SIZE;
-    const eventCleanupMaxBatches = options.eventCleanupMaxBatches ?? env.AGENT_EVENT_CLEANUP_MAX_BATCHES;
+    const agentEventLogger =
+      options.agentEventLogger ??
+      new JsonlAgentEventLogger(resolve(options.agentEventLogPath ?? env.AGENT_EVENT_LOG_PATH));
     let redisRuntime: RedisRuntime | undefined;
     let runQueueClient: { close(): Promise<void> } | undefined;
 
@@ -248,45 +234,6 @@ export async function buildApp(options: BuildAppOptions = {}) {
         maxBytes: env.AGENT_TOOL_RESOURCE_MAX_BYTES,
         timeoutMs: env.AGENT_TOOL_RESOURCE_DOWNLOAD_TIMEOUT_MS
       });
-    const cleanupExpiredEvents = () => {
-      const nowIso = new Date().toISOString();
-
-      try {
-        const result = agentStore.pruneExpiredEvents({
-          nowIso,
-          batchSize: eventCleanupBatchSize,
-          maxBatches: eventCleanupMaxBatches
-        });
-        const deletedEvents = result.messageEvents + result.runEvents;
-
-        if (deletedEvents > 0) {
-          app.log.info(
-            { nowIso, eventCleanupBatchSize, eventCleanupMaxBatches, ...result },
-            "expired agent events pruned"
-          );
-        }
-
-        if (result.reachedLimit) {
-          app.log.warn(
-            { nowIso, eventCleanupBatchSize, eventCleanupMaxBatches, ...result },
-            "expired agent event cleanup reached batch limit"
-          );
-        }
-      } catch (error) {
-        app.log.warn({ error }, "failed to prune expired agent events");
-      }
-    };
-    let eventCleanupTimer: NodeJS.Timeout | undefined;
-    const scheduleNextEventCleanup = () => {
-      const delayMs = getDelayUntilNextCleanupHour(new Date(), eventCleanupHour);
-      eventCleanupTimer = setTimeout(() => {
-        cleanupExpiredEvents();
-        scheduleNextEventCleanup();
-      }, delayMs);
-      eventCleanupTimer.unref?.();
-    };
-    scheduleNextEventCleanup();
-
     coordinator = new AgentMessageCoordinator(
       agentService,
       agentStore,
@@ -308,16 +255,14 @@ export async function buildApp(options: BuildAppOptions = {}) {
         eventBus,
         runQueue,
         cancellationStore,
-        runLock
+        runLock,
+        agentEventLogger
       }
     );
     (app as typeof app & { agentCoordinator?: AgentMessageCoordinator }).agentCoordinator = coordinator;
 
     app.addHook("onClose", async () => {
       await coordinator?.shutdown("服务关闭");
-      if (eventCleanupTimer) {
-        clearTimeout(eventCleanupTimer);
-      }
       // 关闭顺序从“还可能产生任务/事件的上层”到“底层连接”：先停 queue，再断 Redis，最后关 SQLite。
       await runQueueClient?.close();
       redisRuntime?.close();

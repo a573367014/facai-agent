@@ -314,10 +314,6 @@ describe("AgentMessageCoordinator", () => {
         status: "running",
         parts: []
       });
-      expect(store.getRunEvents(started.run.id).map((event) => event.event.type)).toEqual([
-        "session.message.created",
-        "session.message.created"
-      ]);
     } finally {
       store.close();
     }
@@ -677,9 +673,6 @@ describe("AgentMessageCoordinator", () => {
         completedAt: expect.any(String)
       })
     ]);
-    expect(store.getRunEvents(run.id).map((event) => event.event.type)).toEqual(
-      expect.arrayContaining(["process.step.updated", "error", "session.message.updated"])
-    );
     store.close();
   });
 
@@ -708,24 +701,6 @@ describe("AgentMessageCoordinator", () => {
       phase: "cancelled",
       completedAt: expect.any(String)
     });
-    expect(snapshot.events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          event: {
-            type: "session.message.created",
-            message: expect.objectContaining({
-              id: started.userMessage.id
-            })
-          }
-        }),
-        expect.objectContaining({
-          event: {
-            type: "cancelled",
-            reason: "服务关闭"
-          }
-        })
-      ])
-    );
     store.close();
   });
 
@@ -777,23 +752,13 @@ describe("AgentMessageCoordinator", () => {
       const third = await coordinator.startRun({ sessionId: first.session.id, input: "第三轮问题" });
       await waitForRun(coordinator, third.run.id);
 
-      const thirdSnapshot = coordinator.getRun(third.run.id);
-      const thirdEvents = thirdSnapshot.events.map((event) => event.event);
-      const thirdEventTypes = thirdEvents.map((event) => event.type);
       const systemMessage = store.getMessagesBySession(first.session.id).find((message) => message.role === "system");
-      const assistantCreatedIndex = thirdEventTypes.findIndex(
-        (type, index) => type === "session.message.created" && thirdEvents[index]?.type === "session.message.created" && thirdEvents[index].message.role === "assistant"
-      );
-      const summaryCompletedIndex = thirdEventTypes.indexOf("summary_completed");
 
       expect(systemMessage).toMatchObject({
         role: "system",
         status: "completed",
         parts: [{ type: "text", value: "上下文已自动压缩" }]
       });
-      expect(thirdEventTypes).toEqual(expect.arrayContaining(["summary_start", "summary_completed", "final_answer", "run_completed"]));
-      expect(summaryCompletedIndex).toBeGreaterThanOrEqual(0);
-      expect(assistantCreatedIndex).toBeGreaterThan(summaryCompletedIndex);
       expect(summaryCalls).toHaveLength(1);
       expect(summaryCalls[0]?.join("\n")).toContain("第一轮问题");
       expect(summaryCalls[0]?.join("\n")).not.toContain("第三轮问题");
@@ -1741,7 +1706,7 @@ describe("AgentMessageCoordinator", () => {
     }
   });
 
-  it("流式回答会更新 assistant message 的 text part，但不把 part delta 写入事件表", async () => {
+  it("流式回答会更新 assistant message 的 text part", async () => {
     const registry = new ToolRegistry();
     const provider: LlmProvider = {
       complete: async () => {
@@ -1760,14 +1725,9 @@ describe("AgentMessageCoordinator", () => {
       const started = await startRunAndWait(coordinator, { input: "问候一下" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
-      const { message, events } = coordinator.getMessage(started.assistantMessage.id);
+      const { message } = coordinator.getMessage(started.assistantMessage.id);
 
       expect(message.parts).toEqual([{ type: "text", value: "你好世界" }]);
-      expect(
-        events
-          .map((event) => event.event)
-          .filter((event) => event.type === "message.part.delta")
-      ).toEqual([]);
     } finally {
       store.close();
     }
@@ -1862,7 +1822,7 @@ describe("AgentMessageCoordinator", () => {
       const started = await startRunAndWait(coordinator, { input: "生成一张小猪图片" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
-      const { message, events } = coordinator.getMessage(started.assistantMessage.id);
+      const { message } = coordinator.getMessage(started.assistantMessage.id);
       const mediaPart = message.parts.find((part) => part.type === "media");
       const resourceId = mediaPart?.extra?.resource?.id;
 
@@ -1891,10 +1851,6 @@ describe("AgentMessageCoordinator", () => {
         }),
         { type: "text", value: "图片已生成。" }
       ]);
-      expect(events.map((event) => event.event.type)).toContain("message.part.created");
-      expect(events.map((event) => event.event.type)).toContain("message.part.updated");
-      expect(events.map((event) => event.event.type)).toContain("resource.created");
-      expect(events.map((event) => event.event.type)).toContain("resource.updated");
     } finally {
       store.close();
     }
@@ -1975,7 +1931,6 @@ describe("AgentMessageCoordinator", () => {
           orderIndex: 2
         })
       ]);
-      expect(detail.events.map((event) => event.event.type)).toEqual(expect.arrayContaining(["process.step.created", "process.step.updated"]));
     } finally {
       store.close();
     }
@@ -2108,8 +2063,6 @@ describe("AgentMessageCoordinator", () => {
       const assistant = session.messages.find((message) => message.id === started.assistantMessage.id);
       const mediaParts = assistant?.parts.filter((part) => part.type === "media") ?? [];
       const resourcesById = new Map(session.resources.map((resource) => [resource.id, resource]));
-      const events = coordinator.getMessage(started.assistantMessage.id).events.map((event) => event.event);
-      const mediaCreatedEvents = events.filter((event) => event.type === "message.part.created");
 
       expect(executeCount).toBe(1);
       expect(callCount).toBe(2);
@@ -2141,13 +2094,6 @@ describe("AgentMessageCoordinator", () => {
         undefined,
         "https://example.com/dog.png"
       ]);
-      expect(mediaCreatedEvents).toHaveLength(2);
-      expect(events).not.toContainEqual(
-        expect.objectContaining({
-          type: "tool_start",
-          toolCallId: "call_retry_baby"
-        })
-      );
     } finally {
       store.close();
     }

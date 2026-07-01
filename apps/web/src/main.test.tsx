@@ -15,7 +15,6 @@ function createStoredSseResponse(messageId: string): Response {
   const encoder = new TextEncoder();
   const storedEvent = {
     id: "event_1",
-    seq: 1,
     runId: messageId,
     messageId,
     event: { type: "answer_delta", iteration: 0, delta: "恢复中" },
@@ -26,7 +25,7 @@ function createStoredSseResponse(messageId: string): Response {
     ok: true,
     body: new ReadableStream({
       start(controller) {
-        controller.enqueue(encoder.encode(`id: 1\ndata: ${JSON.stringify(storedEvent)}\n\n`));
+        controller.enqueue(encoder.encode(`id: event_1\ndata: ${JSON.stringify(storedEvent)}\n\n`));
         controller.close();
       }
     })
@@ -75,7 +74,6 @@ describe("main", () => {
             events: [
               {
                 id: "event_1",
-                seq: 1,
                 runId: "msg_1",
                 messageId: "msg_1",
                 event: { type: "answer_delta", iteration: 0, delta: "恢复中" },
@@ -127,7 +125,7 @@ describe("main", () => {
     await waitFor(() => {
       const eventCalls = vi
         .mocked(globalThis.fetch)
-        .mock.calls.filter(([url]) => String(url).includes("/agents/runs/msg_1/events?after=1"));
+        .mock.calls.filter(([url]) => String(url).includes("/agents/runs/msg_1/stream"));
       expect(eventCalls.length).toBeGreaterThan(0);
     });
 
@@ -135,7 +133,7 @@ describe("main", () => {
 
     const eventCalls = vi
       .mocked(globalThis.fetch)
-      .mock.calls.filter(([url]) => String(url).includes("/agents/runs/msg_1/events?after=1"));
+      .mock.calls.filter(([url]) => String(url).includes("/agents/runs/msg_1/stream"));
     expect(eventCalls).toHaveLength(1);
   });
 });

@@ -33,19 +33,18 @@ import { stripRuntimeFields, type RuntimePart } from "./prosemirror/part-seriali
 import "./styles.css";
 
 const activeRunIdKey = "agent.activeRunId";
-const activeEventSeqKey = "agent.activeEventSeq";
 const runningRunsBySessionKey = "agent.runningRunsBySession";
 const sessionIdQueryKey = "sessionId";
 const defaultMessagePageLimit = 30;
 const defaultSessionPageLimit = 30;
 
 type ResourceMap = Record<string, AgentResourceRecord>;
-type RunningRunState = { runId: string; lastSeq: number };
+type RunningRunState = { runId: string };
 type RunningRunsBySession = Record<string, RunningRunState>;
 
 function readRunningRunsBySession(): RunningRunsBySession {
   // 这里记录“每个会话当前还在跑的 run”。
-  // 用户切换会话或刷新页面后，前端可以用 runId + lastSeq 重新接上 SSE，而不是丢掉正在生成的回答。
+  // 用户切换会话或刷新页面后，前端可以用 runId 重新接上 SSE，而不是丢掉正在生成的回答。
   try {
     const rawValue = localStorage.getItem(runningRunsBySessionKey);
 
@@ -65,8 +64,7 @@ function readRunningRunsBySession(): RunningRunsBySession {
 
       if (typeof candidate.runId === "string") {
         runningRuns[sessionId] = {
-          runId: candidate.runId,
-          lastSeq: typeof candidate.lastSeq === "number" && Number.isFinite(candidate.lastSeq) ? candidate.lastSeq : 0
+          runId: candidate.runId
         };
       }
     }
@@ -714,7 +712,7 @@ export default function App() {
 
     async function recoverActiveRun() {
       // 刷新页面后，如果 localStorage 里还有 activeRunId，先拉 run 快照和会话快照，
-      // 再从最后 seq 继续订阅 SSE。这样刷新不会重新发起模型调用。
+      // 再订阅 SSE live stream。这样刷新不会重新发起模型调用。
       setIsStreaming(true);
       setActiveRun(runId);
       activeStreamControllerRef.current = controller;
@@ -741,16 +739,6 @@ export default function App() {
         setMessagePageInfo(normalizeMessagePageInfo(sessionSnapshot.pageInfo));
         setEvents([]);
 
-        for (const storedEvent of snapshot.events) {
-          if (cancelled) {
-            return;
-          }
-
-          applyStoredRunEvent(storedEvent, runId, snapshot.run.sessionId);
-        }
-
-        const lastEventSeq = snapshot.events[snapshot.events.length - 1]?.seq ?? 0;
-
         if (snapshot.run.status !== "running") {
           forgetRunningRunByRunId(runId);
           clearActiveRun();
@@ -759,7 +747,6 @@ export default function App() {
 
         await streamAgentRunEvents(
           runId,
-          lastEventSeq,
           (storedEvent) => {
             if (!cancelled) {
               applyStoredRunEvent(storedEvent, runId, snapshot.run.sessionId);
@@ -792,7 +779,6 @@ export default function App() {
   function clearActiveRun() {
     activeRunIdRef.current = null;
     localStorage.removeItem(activeRunIdKey);
-    localStorage.removeItem(activeEventSeqKey);
     setActiveRunId(null);
   }
 
@@ -801,27 +787,12 @@ export default function App() {
     setActiveRunId(runId);
   }
 
-  function rememberRunningRun(sessionId: string, runId: string, lastSeq = 0) {
+  function rememberRunningRun(sessionId: string, runId: string) {
     runningRunsBySessionRef.current = {
       ...runningRunsBySessionRef.current,
-      [sessionId]: { runId, lastSeq }
+      [sessionId]: { runId }
     };
     writeRunningRunsBySession(runningRunsBySessionRef.current);
-  }
-
-  function updateRunningRunSeq(sessionId: string | undefined, runId: string, seq: number) {
-    if (!sessionId || seq <= 0) {
-      return;
-    }
-
-    const currentRun = runningRunsBySessionRef.current[sessionId];
-
-    // lastSeq 只前进不后退，避免旧事件把断点游标覆盖成更小的值。
-    if (!currentRun || currentRun.runId !== runId || currentRun.lastSeq >= seq) {
-      return;
-    }
-
-    rememberRunningRun(sessionId, runId, seq);
   }
 
   function forgetRunningRunByRunId(runId: string | undefined) {
@@ -1028,11 +999,6 @@ export default function App() {
   }
 
   function applyStoredEvent(storedEvent: StoredAgentEvent) {
-    if (storedEvent.seq > 0) {
-      // seq 同时写 localStorage 和 runningRunsBySession：
-      // activeEventSeqKey 服务当前页面刷新，runningRunsBySession 服务切会话后恢复。
-      localStorage.setItem(activeEventSeqKey, String(storedEvent.seq));
-    }
     applyAgentEvent(storedEvent.event, storedEvent.messageId, storedEvent.runId);
   }
 
@@ -1051,7 +1017,6 @@ export default function App() {
       return;
     }
 
-    updateRunningRunSeq(expectedSessionId, expectedRunId, storedEvent.seq);
     applyStoredEvent(storedEvent);
   }
 
@@ -1134,12 +1099,11 @@ export default function App() {
     const controller = new AbortController();
 
     // 切回一个仍在生成的会话时，只恢复这个会话自己的 run。
-    // 先校验 run 快照属于该 session，再从 lastSeq 继续订阅。
+    // 先校验 run 快照属于该 session，再订阅实时流。
     setIsStreaming(true);
     setActiveRun(runId);
     activeStreamControllerRef.current = controller;
     localStorage.setItem(activeRunIdKey, runId);
-    localStorage.setItem(activeEventSeqKey, String(runningRun.lastSeq));
     setError(null);
 
     try {
@@ -1155,9 +1119,7 @@ export default function App() {
         return;
       }
 
-      const lastEventSeq = snapshot.events[snapshot.events.length - 1]?.seq ?? runningRun.lastSeq;
-      rememberRunningRun(sessionId, runId, lastEventSeq);
-      localStorage.setItem(activeEventSeqKey, String(lastEventSeq));
+      rememberRunningRun(sessionId, runId);
 
       if (snapshot.run.status !== "running") {
         forgetRunningRunByRunId(runId);
@@ -1165,7 +1127,7 @@ export default function App() {
         return;
       }
 
-      await streamAgentRunEvents(runId, lastEventSeq, (storedEvent) => applyStoredRunEvent(storedEvent, runId, sessionId), controller.signal);
+      await streamAgentRunEvents(runId, (storedEvent) => applyStoredRunEvent(storedEvent, runId, sessionId), controller.signal);
     } catch (streamError) {
       if (activeStreamControllerRef.current === controller && !isAbortError(streamError)) {
         setError(streamError instanceof Error ? streamError.message : "流式请求失败");
@@ -1209,10 +1171,9 @@ export default function App() {
       activeStreamControllerRef.current = controller;
       streamControllerAttached = true;
       localStorage.setItem(activeRunIdKey, run.id);
-      localStorage.setItem(activeEventSeqKey, "0");
       setMessages((currentMessages) => appendStartedMessages(currentMessages, userMessage));
       setComposerParts([{ type: "text", value: "" }]);
-      await streamAgentRunEvents(run.id, 0, (storedEvent) => applyStoredRunEvent(storedEvent, run.id, session.id), controller.signal);
+      await streamAgentRunEvents(run.id, (storedEvent) => applyStoredRunEvent(storedEvent, run.id, session.id), controller.signal);
       await refreshSessions();
     } catch (streamError) {
       if (!isAbortError(streamError) && (!streamControllerAttached || activeStreamControllerRef.current === controller)) {
@@ -1251,8 +1212,7 @@ export default function App() {
       activeStreamControllerRef.current = controller;
       streamControllerAttached = true;
       localStorage.setItem(activeRunIdKey, run.id);
-      localStorage.setItem(activeEventSeqKey, "0");
-      await streamAgentRunEvents(run.id, 0, (storedEvent) => applyStoredRunEvent(storedEvent, run.id, session.id), controller.signal);
+      await streamAgentRunEvents(run.id, (storedEvent) => applyStoredRunEvent(storedEvent, run.id, session.id), controller.signal);
       await refreshSessions();
     } catch (streamError) {
       if (!isAbortError(streamError) && (!streamControllerAttached || activeStreamControllerRef.current === controller)) {

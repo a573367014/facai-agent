@@ -76,7 +76,7 @@ export class RedisAgentEventBus implements AgentEventBus {
   }
 
   async publishRunEvent(runId: string, event: StoredAgentEvent): Promise<void> {
-    // Pub/Sub 只负责实时扇出，不保证离线回放；断线恢复依赖 SQLite run events 和 snapshot。
+    // Pub/Sub 只负责实时扇出，不保证离线回放；断线恢复依赖 message snapshot。
     await this.options.publisher.publish(this.getRunChannel(runId), JSON.stringify(event));
   }
 

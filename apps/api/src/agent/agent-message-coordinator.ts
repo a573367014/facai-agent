@@ -31,6 +31,7 @@ import type {
 } from "./agent-store.js";
 import type { AgentRunJobPayload, AgentRunQueue } from "./agent-run-queue.js";
 import type { AgentEventBus } from "./agent-event-bus.js";
+import type { AgentEventLogger } from "./agent-event-logger.js";
 import type { AgentCancellationStore } from "./agent-cancellation-store.js";
 import type { AgentRunLock } from "./agent-run-lock.js";
 import { toRuntimeDependencyAppError } from "../errors/runtime-dependency-error.js";
@@ -39,8 +40,7 @@ import { AgentProcessStepProjector } from "./agent-process-step-projector.js";
 import { AgentMediaOutputProjector } from "./agent-media-output-projector.js";
 import {
   isMediaOutputToolName,
-  summarizeToolResult,
-  uniqueStoredEvents
+  summarizeToolResult
 } from "./agent-message-projection-utils.js";
 import { AgentRunCleanupService, type StaleRunningCleanupResult } from "./agent-run-cleanup-service.js";
 
@@ -59,6 +59,7 @@ export interface AgentMessageCoordinatorOptions {
   eventBus?: AgentEventBus;
   cancellationStore?: AgentCancellationStore;
   runLock?: AgentRunLock;
+  agentEventLogger?: AgentEventLogger;
 }
 
 function toErrorDetail(error: unknown): AgentErrorDetail {
@@ -463,8 +464,7 @@ export class AgentMessageCoordinator {
     const run = this.ensureRun(runId);
 
     return {
-      run,
-      events: this.store.getRunEvents(runId)
+      run
     };
   }
 
@@ -517,26 +517,6 @@ export class AgentMessageCoordinator {
     return this.getRun(run.id);
   }
 
-  getMessageDebugEvents(messageId: string) {
-    const message = this.ensureMessage(messageId);
-    const messageEvents = this.store.getEvents(messageId);
-    const runs = this.store.getRunsByMessageId(messageId);
-    const runEvents = runs.flatMap((run) => this.store.getRunEvents(run.id));
-
-    return {
-      message,
-      runs,
-      messageEvents,
-      runEvents,
-      events: uniqueStoredEvents([...messageEvents, ...runEvents])
-    };
-  }
-
-  getRunEvents(runId: string, after = 0) {
-    this.ensureRun(runId);
-    return this.store.getRunEvents(runId, after);
-  }
-
   async subscribeRun(runId: string, listener: AgentEventListener) {
     this.ensureRun(runId);
     // 本进程 store.subscribeRun 能接到当前 API 进程写入的事件；
@@ -586,8 +566,7 @@ export class AgentMessageCoordinator {
     return {
       message,
       resources: this.getResourcesForMessages([message]),
-      processSteps: this.getProcessStepsForMessages([message]),
-      events: this.store.getEvents(messageId)
+      processSteps: this.getProcessStepsForMessages([message])
     };
   }
 
@@ -598,7 +577,6 @@ export class AgentMessageCoordinator {
       message,
       resources: this.getResourcesForMessages([message]),
       processSteps: this.getProcessStepsForMessages([message]),
-      events: this.store.getEvents(messageId),
       version
     };
   }
@@ -952,10 +930,15 @@ export class AgentMessageCoordinator {
   }
 
   private appendRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): StoredAgentEvent | undefined {
-    // 持久化事件先写 SQLite，保证刷新和断线重连有短期回放；随后再发布到 Redis Pub/Sub 做实时推送。
+    // 事件不再写 SQLite：当前连接通过 store/Redis live fanout 接收，历史排查写本地 JSONL 日志。
     const storedEvent = this.store.appendRunEvent(runId, event, messageId);
 
     if (storedEvent) {
+      try {
+        this.options.agentEventLogger?.log(storedEvent);
+      } catch {
+        // 日志写入是观测能力，不能反向影响用户 run 的状态机。
+      }
       this.publishStoredEvent(storedEvent);
     }
 
@@ -978,7 +961,7 @@ export class AgentMessageCoordinator {
 
   private publishStoredEvent(event: StoredAgentEvent) {
     if (event.runId) {
-      // Pub/Sub 是实时推送通道，可靠回放已经写在 SQLite run events。
+      // Pub/Sub 是实时推送通道；断线恢复靠 message snapshot，排查靠本地 JSONL 日志。
       // Redis 短暂不可用时不能让这个 best-effort 发布变成未处理 Promise rejection。
       void this.options.eventBus?.publishRunEvent(event.runId, event).catch(() => {});
     }

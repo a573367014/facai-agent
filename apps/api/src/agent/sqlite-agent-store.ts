@@ -24,8 +24,6 @@ import type {
   AgentProcessStepRecord,
   AgentResourceRecord,
   ListAgentSessionsOptions,
-  PruneExpiredAgentEventsInput,
-  PruneAgentEventsResult,
   StoredAgentEvent,
   UpdateAgentMessageInput,
   UpdateAgentProcessStepInput,
@@ -49,7 +47,6 @@ type SqlJsModule = Awaited<ReturnType<typeof initSqlJs>>;
 
 interface SqliteAgentStoreOptions {
   databasePath: string;
-  eventRetentionDays?: number;
 }
 
 type SqlRow = Record<string, SqlValue>;
@@ -73,18 +70,8 @@ function now() {
   return new Date().toISOString();
 }
 
-function addDaysIso(iso: string, days: number) {
-  const date = new Date(iso);
-  date.setUTCDate(date.getUTCDate() + days);
-  return date.toISOString();
-}
-
 function normalizeLimit(limit: number): number {
   return Math.max(0, Math.floor(limit));
-}
-
-function normalizePositiveInteger(value: number): number {
-  return Math.max(1, Math.floor(value));
 }
 
 const contextMessageFilter = "(role = 'user' OR (role = 'assistant' AND status IN ('completed', 'failed')))";
@@ -124,11 +111,9 @@ function parseJson<T>(value: SqlValue | undefined): T | undefined {
 }
 
 export class SqliteAgentStore implements AgentStore {
-  // 这个 store 负责“长期事实”：会话、消息、run、工具调用、资源、事件回放都落在 SQLite。
-  // Redis 只做运行时协调，进程重启后最终仍以 SQLite 里的记录和事件为准。
-  private readonly subscribers = new Map<string, Set<AgentEventListener>>();
+  // 这个 store 负责“长期事实”：会话、消息、run、工具调用、资源和任务进度落在 SQLite。
+  // Redis 只做运行时协调；实时事件只通知当前 run 的在线订阅者。
   private readonly runSubscribers = new Map<string, Set<AgentEventListener>>();
-  private readonly eventRetentionDays: number;
   private lastLoadedMtimeMs: number;
   private transactionDepth = 0;
   private hasUnpersistedChanges = false;
@@ -137,9 +122,8 @@ export class SqliteAgentStore implements AgentStore {
     private readonly databasePath: string,
     private database: SqlDatabase,
     private readonly SQL: SqlJsModule,
-    options: { eventRetentionDays: number; lastLoadedMtimeMs: number }
+    options: { lastLoadedMtimeMs: number }
   ) {
-    this.eventRetentionDays = options.eventRetentionDays;
     this.lastLoadedMtimeMs = options.lastLoadedMtimeMs;
   }
 
@@ -150,7 +134,6 @@ export class SqliteAgentStore implements AgentStore {
     const data = databaseExists ? readFileSync(options.databasePath) : undefined;
     const database = new SQL.Database(data) as SqlDatabase;
     const store = new SqliteAgentStore(options.databasePath, database, SQL, {
-      eventRetentionDays: normalizePositiveInteger(options.eventRetentionDays ?? 3),
       lastLoadedMtimeMs: databaseExists ? statSync(options.databasePath).mtimeMs : 0
     });
 
@@ -226,21 +209,12 @@ export class SqliteAgentStore implements AgentStore {
       return false;
     }
 
-    const messageIds = this.queryMany(`SELECT id FROM agent_messages WHERE session_id = ?`, [sessionId]).map((row) =>
-      requiredString(row.id, "id")
-    );
     const runIds = this.queryMany(`SELECT id FROM agent_runs WHERE session_id = ?`, [sessionId]).map((row) =>
       requiredString(row.id, "id")
     );
 
     this.run("BEGIN TRANSACTION");
     try {
-      this.run(
-        `DELETE FROM agent_events
-         WHERE run_id IN (SELECT id FROM agent_runs WHERE session_id = ?)
-            OR message_id IN (SELECT id FROM agent_messages WHERE session_id = ?)`,
-        [sessionId, sessionId]
-      );
       this.run(`DELETE FROM agent_resources WHERE session_id = ?`, [sessionId]);
       this.run(`DELETE FROM agent_tool_calls WHERE session_id = ?`, [sessionId]);
       this.run(`DELETE FROM agent_session_summaries WHERE session_id = ?`, [sessionId]);
@@ -251,10 +225,6 @@ export class SqliteAgentStore implements AgentStore {
     } catch (error) {
       this.run("ROLLBACK");
       throw error;
-    }
-
-    for (const messageId of messageIds) {
-      this.subscribers.delete(messageId);
     }
 
     for (const runId of runIds) {
@@ -1082,45 +1052,6 @@ export class SqliteAgentStore implements AgentStore {
     return optionalNumber(row?.message_count) ?? 0;
   }
 
-  pruneExpiredEvents(input: PruneExpiredAgentEventsInput): PruneAgentEventsResult {
-    const batchSize = normalizePositiveInteger(input.batchSize);
-    const maxBatches = normalizePositiveInteger(input.maxBatches);
-    let messageEvents = 0;
-    let runEvents = 0;
-    let batches = 0;
-
-    // agent_events 是给 SSE 断线重连/刷新恢复用的回放日志，不需要永久保存。
-    // 这里分批删除，避免一次 DELETE 太大导致 UI 请求被长时间阻塞。
-    while (batches < maxBatches) {
-      const deletedEvents = this.deleteExpiredEventBatch(input.nowIso, batchSize);
-      const deletedMessageEvents = deletedEvents.messageEvents;
-      const deletedRunEvents = deletedEvents.runEvents;
-
-      if (deletedEvents.total === 0) {
-        break;
-      }
-
-      messageEvents += deletedMessageEvents;
-      runEvents += deletedRunEvents;
-      batches += 1;
-
-      if (deletedEvents.total < batchSize) {
-        break;
-      }
-    }
-
-    if (messageEvents > 0 || runEvents > 0) {
-      this.persist();
-    }
-
-    return {
-      messageEvents,
-      runEvents,
-      batches,
-      reachedLimit: batches >= maxBatches && this.hasExpiredEvents(input.nowIso)
-    };
-  }
-
   createToolCall(input: CreateAgentToolCallInput): AgentToolCallRecord {
     const timestamp = now();
     // tool_call 是审计和 UI trace 的结构化记录：它和原始 stream event 不一样，
@@ -1532,39 +1463,6 @@ export class SqliteAgentStore implements AgentStore {
     ).map((row) => this.toProcessStepRecord(row));
   }
 
-  appendEvent(messageId: string, event: AgentStreamEvent): StoredAgentEvent | undefined {
-    return this.appendStoredEvent({ messageId, event });
-  }
-
-  publishTransientEvent(messageId: string, event: AgentStreamEvent): StoredAgentEvent | undefined {
-    const storedEvent = this.createTransientStoredEvent(event, { messageId });
-    this.publish(storedEvent);
-    return storedEvent;
-  }
-
-  getEvents(messageId: string, after = 0): StoredAgentEvent[] {
-    return this.queryMany(
-      `SELECT id, seq, run_id, message_id, payload_json, created_at
-       FROM agent_events
-       WHERE message_id = ? AND seq > ?
-       ORDER BY seq ASC`,
-      [messageId, after]
-    ).map((row) => this.toStoredEvent(row));
-  }
-
-  subscribe(messageId: string, listener: AgentEventListener): () => void {
-    const listeners = this.subscribers.get(messageId) ?? new Set<AgentEventListener>();
-    listeners.add(listener);
-    this.subscribers.set(messageId, listeners);
-
-    return () => {
-      listeners.delete(listener);
-      if (listeners.size === 0) {
-        this.subscribers.delete(messageId);
-      }
-    };
-  }
-
   appendRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): StoredAgentEvent | undefined {
     return this.appendStoredEvent({ runId, messageId, event });
   }
@@ -1573,16 +1471,6 @@ export class SqliteAgentStore implements AgentStore {
     const storedEvent = this.createTransientStoredEvent(event, { runId, messageId });
     this.publishRun(storedEvent);
     return storedEvent;
-  }
-
-  getRunEvents(runId: string, after = 0): StoredAgentEvent[] {
-    return this.queryMany(
-      `SELECT id, seq, run_id, message_id, payload_json, created_at
-       FROM agent_events
-       WHERE run_id = ? AND seq > ?
-       ORDER BY seq ASC`,
-      [runId, after]
-    ).map((row) => this.toStoredEvent(row));
   }
 
   subscribeRun(runId: string, listener: AgentEventListener): () => void {
@@ -1609,7 +1497,7 @@ export class SqliteAgentStore implements AgentStore {
   private initializeSchema() {
     // schema 放在代码里初始化，方便本地 demo 零迁移启动。
     // 重要表可以按职责读：
-    // sessions/messages 是聊天主数据；runs 是一次执行；events 是 SSE 回放；
+    // sessions/messages 是聊天主数据；runs 是一次执行；
     // tool_calls/resources/process_steps 是工具审计、媒体产物和可视化进度。
     this.run(`
       CREATE TABLE IF NOT EXISTS agent_sessions (
@@ -1630,18 +1518,6 @@ export class SqliteAgentStore implements AgentStore {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         completed_at TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS agent_events (
-        id TEXT PRIMARY KEY,
-        run_id TEXT,
-        message_id TEXT,
-        seq INTEGER NOT NULL,
-        type TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        expires_at TEXT NOT NULL,
-        CHECK (run_id IS NOT NULL OR message_id IS NOT NULL)
       );
 
       CREATE TABLE IF NOT EXISTS agent_runs (
@@ -1727,9 +1603,6 @@ export class SqliteAgentStore implements AgentStore {
       CREATE INDEX IF NOT EXISTS idx_agent_messages_session_id_created_at
         ON agent_messages (session_id, created_at);
 
-      CREATE INDEX IF NOT EXISTS idx_agent_events_message_id_seq
-        ON agent_events (message_id, seq);
-
       CREATE INDEX IF NOT EXISTS idx_agent_runs_session_id_created_at
         ON agent_runs (session_id, created_at);
 
@@ -1748,58 +1621,15 @@ export class SqliteAgentStore implements AgentStore {
       CREATE INDEX IF NOT EXISTS idx_agent_process_steps_message_order
         ON agent_process_steps (message_id, order_index);
     `);
-    this.ensureUnifiedEventSchema();
     this.ensureCurrentSchemaIndexes();
   }
 
   private ensureCurrentSchemaIndexes() {
     this.run(`
-      DROP INDEX IF EXISTS idx_agent_run_events_run_id_seq;
-      DROP INDEX IF EXISTS idx_agent_run_events_expires_at;
-
       CREATE INDEX IF NOT EXISTS idx_agent_session_summaries_session_version
         ON agent_session_summaries (session_id, version);
 
-      CREATE INDEX IF NOT EXISTS idx_agent_events_run_id_seq
-        ON agent_events (run_id, seq);
-
-      CREATE INDEX IF NOT EXISTS idx_agent_events_message_id_seq
-        ON agent_events (message_id, seq);
-
-      CREATE INDEX IF NOT EXISTS idx_agent_events_expires_at
-        ON agent_events (expires_at);
     `);
-  }
-
-  private ensureUnifiedEventSchema() {
-    const eventColumns = this.getTableColumns("agent_events");
-    const isLegacyMessageEventTable = eventColumns.length > 0 && !eventColumns.includes("run_id");
-
-    // 旧版本事件按 message 存，新版本按 run 订阅 SSE，同时保留 message_id 方便定位消息。
-    // 这里做一次兼容清理，避免历史表结构和新查询混用。
-    if (isLegacyMessageEventTable) {
-      this.run(`DROP TABLE IF EXISTS agent_events`);
-    }
-
-    this.run(`
-      DROP TABLE IF EXISTS agent_run_events;
-
-      CREATE TABLE IF NOT EXISTS agent_events (
-        id TEXT PRIMARY KEY,
-        run_id TEXT,
-        message_id TEXT,
-        seq INTEGER NOT NULL,
-        type TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        expires_at TEXT NOT NULL,
-        CHECK (run_id IS NOT NULL OR message_id IS NOT NULL)
-      );
-    `);
-  }
-
-  private getTableColumns(tableName: string): string[] {
-    return this.queryMany(`PRAGMA table_info(${tableName})`).map((row) => requiredString(row.name, "name"));
   }
 
   private getToolCall(toolCallRowId: string): AgentToolCallRecord | undefined {
@@ -1879,44 +1709,16 @@ export class SqliteAgentStore implements AgentStore {
     return row ? this.toProcessStepRecord(row) : undefined;
   }
 
-  private appendStoredEvent(input: { event: AgentStreamEvent; messageId?: string; runId?: string }): StoredAgentEvent {
-    if (!input.messageId && !input.runId) {
-      throw new Error("SQLite 事件缺少 messageId 或 runId");
-    }
-
-    const eventId = createId("event");
-    const eventSeq = input.runId ? this.nextRunEventSeq(input.runId) : this.nextMessageEventSeq(input.messageId!);
-    const timestamp = now();
-    const expiresAt = addDaysIso(timestamp, this.eventRetentionDays);
-    // seq 是客户端断线续传的游标：浏览器记住最后收到的 seq，
-    // 重连时只请求 seq 之后的事件，就不会重复回放整条流。
+  private appendStoredEvent(input: { event: AgentStreamEvent; messageId?: string; runId: string }): StoredAgentEvent {
     const storedEvent: StoredAgentEvent = {
-      id: eventId,
-      seq: eventSeq,
+      id: createId("event_live"),
       messageId: input.messageId,
       runId: input.runId,
       event: input.event,
-      createdAt: timestamp
+      createdAt: now(),
+      transient: true
     };
 
-    this.run(
-      `INSERT INTO agent_events (id, run_id, message_id, seq, type, payload_json, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        eventId,
-        input.runId ?? null,
-        input.messageId ?? null,
-        eventSeq,
-        input.event.type,
-        JSON.stringify(input.event),
-        timestamp,
-        expiresAt
-      ]
-    );
-    this.persist();
-    // 写库后同时通知内存订阅者。这样当前连接能实时收到事件，
-    // 断线后的新连接又能从 SQLite 读到同一批事件。
-    this.publish(storedEvent);
     this.publishRun(storedEvent);
     return storedEvent;
   }
@@ -1927,35 +1729,12 @@ export class SqliteAgentStore implements AgentStore {
   ): StoredAgentEvent {
     return {
       id: createId("event_live"),
-      seq: 0,
       messageId: scope.messageId,
       runId: scope.runId,
       event,
       createdAt: now(),
       transient: true
     };
-  }
-
-  private nextMessageEventSeq(messageId: string): number {
-    const row = this.queryOne(
-      `SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
-       FROM agent_events
-       WHERE message_id = ? AND run_id IS NULL`,
-      [messageId]
-    );
-
-    return optionalNumber(row?.next_seq) ?? 1;
-  }
-
-  private nextRunEventSeq(runId: string): number {
-    const row = this.queryOne(
-      `SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
-       FROM agent_events
-       WHERE run_id = ?`,
-      [runId]
-    );
-
-    return optionalNumber(row?.next_seq) ?? 1;
   }
 
   private getMessageCursor(messageId: string): MessageCursor | undefined {
@@ -1993,22 +1772,6 @@ export class SqliteAgentStore implements AgentStore {
       updatedAt: requiredString(row.updated_at, "updated_at"),
       rowid: optionalNumber(row.rowid) ?? 0
     };
-  }
-
-  private publish(event: StoredAgentEvent) {
-    if (!event.messageId) {
-      return;
-    }
-
-    const listeners = this.subscribers.get(event.messageId);
-
-    if (!listeners) {
-      return;
-    }
-
-    for (const listener of listeners) {
-      listener(event);
-    }
   }
 
   private publishRun(event: StoredAgentEvent) {
@@ -2121,61 +1884,6 @@ export class SqliteAgentStore implements AgentStore {
 
   private getSqlCommand(sql: string): string {
     return sql.trim().split(/\s+/, 1)[0]?.toUpperCase() ?? "";
-  }
-
-  private deleteExpiredEventBatch(nowIso: string, limit: number): { messageEvents: number; runEvents: number; total: number } {
-    const expiredMessageEvents = this.queryMany(
-      `SELECT id, run_id
-       FROM agent_events
-       WHERE expires_at <= ?
-         AND run_id IS NULL
-       ORDER BY expires_at ASC, created_at ASC, seq ASC, id ASC
-       LIMIT ?`,
-      [nowIso, limit]
-    );
-    const expiredRunEvents = this.queryMany(
-      `SELECT id, run_id
-       FROM agent_events
-       WHERE expires_at <= ?
-         AND run_id IS NOT NULL
-       ORDER BY expires_at ASC, created_at ASC, seq ASC, id ASC
-       LIMIT ?`,
-      [nowIso, limit]
-    );
-    const expiredEvents = [...expiredMessageEvents, ...expiredRunEvents];
-
-    if (expiredEvents.length === 0) {
-      return { messageEvents: 0, runEvents: 0, total: 0 };
-    }
-
-    const ids = expiredEvents.map((row) => requiredString(row.id, "id"));
-    const placeholders = ids.map(() => "?").join(", ");
-
-    this.run(
-      `DELETE FROM agent_events
-       WHERE id IN (${placeholders})`,
-      ids
-    );
-
-    const runEvents = expiredEvents.filter((row) => optionalString(row.run_id)).length;
-
-    return {
-      messageEvents: expiredMessageEvents.length,
-      runEvents,
-      total: expiredEvents.length
-    };
-  }
-
-  private hasExpiredEvents(nowIso: string): boolean {
-    const row = this.queryOne(
-      `SELECT id
-       FROM agent_events
-       WHERE expires_at <= ?
-       LIMIT 1`,
-      [nowIso]
-    );
-
-    return Boolean(row);
   }
 
   private toSessionRecord(row: SqlRow): AgentSessionRecord {
@@ -2298,22 +2006,6 @@ export class SqliteAgentStore implements AgentStore {
     };
   }
 
-  private toStoredEvent(row: SqlRow): StoredAgentEvent {
-    const event = parseJson<AgentStreamEvent>(row.payload_json);
-
-    if (!event) {
-      throw new Error("SQLite 事件 payload_json 为空");
-    }
-
-    return {
-      id: requiredString(row.id, "id"),
-      seq: optionalNumber(row.seq) ?? 0,
-      messageId: optionalString(row.message_id),
-      runId: optionalString(row.run_id),
-      event,
-      createdAt: requiredString(row.created_at, "created_at")
-    };
-  }
 }
 
 function assertValidMessageTransition(from: AgentMessageStatus, to: AgentMessageStatus) {

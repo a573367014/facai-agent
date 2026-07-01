@@ -1,6 +1,6 @@
 import type { AgentStreamEvent } from "./types.js";
 import type { GeneratedImagePartInput, MessagePart } from "./message-parts.js";
-import type { AgentProcessStepRecord, AgentStore, StoredAgentEvent } from "./agent-store.js";
+import type { AgentProcessStepRecord, AgentStore } from "./agent-store.js";
 import type { JsonObject } from "../tools/types.js";
 
 // 这个文件只放“无副作用”的投影辅助函数：
@@ -112,25 +112,6 @@ export function isVideoToolResultWithId(
   event: AgentStreamEvent
 ): event is Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: string; toolCallId: string } {
   return event.type === "tool_result" && isVideoOutputToolName(event.toolName) && typeof event.toolCallId === "string";
-}
-
-export function sortStoredEvents(events: StoredAgentEvent[]): StoredAgentEvent[] {
-  // 事件回放必须稳定：先按创建时间，再按自增 seq。
-  // 重连时前端靠这个顺序还原消息、资源、进度步骤的变化。
-  return [...events].sort((leftEvent, rightEvent) => {
-    const createdAtOrder = leftEvent.createdAt.localeCompare(rightEvent.createdAt);
-
-    if (createdAtOrder !== 0) {
-      return createdAtOrder;
-    }
-
-    return leftEvent.seq - rightEvent.seq;
-  });
-}
-
-export function uniqueStoredEvents(events: StoredAgentEvent[]): StoredAgentEvent[] {
-  // 某些查询会同时从 run/message 两条路径拿事件，按 id 去重后再排序，避免 SSE 回放重复。
-  return sortStoredEvents([...new Map(events.map((event) => [event.id, event])).values()]);
 }
 
 export function getProcessStepCompletionPatch(

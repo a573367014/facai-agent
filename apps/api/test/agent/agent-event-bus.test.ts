@@ -31,7 +31,6 @@ class FakeRedisEventBusClient extends EventEmitter implements RedisEventBusClien
 function createStoredEvent(type = "llm_start"): StoredAgentEvent {
   return {
     id: "event_1",
-    seq: 1,
     messageId: "msg_1",
     runId: "run_1",
     event: { type, iteration: 0 } as StoredAgentEvent["event"],

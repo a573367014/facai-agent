@@ -234,7 +234,6 @@ export type AgentStreamEvent =
 
 export interface StoredAgentEvent {
   id: string;
-  seq: number;
   messageId?: string;
   runId?: string;
   event: AgentStreamEvent;
@@ -279,13 +278,11 @@ export interface AgentMessageDetailResponse {
   message: AgentMessageRecord;
   resources?: AgentResourceRecord[];
   processSteps?: AgentProcessStepRecord[];
-  events: StoredAgentEvent[];
   version?: number;
 }
 
 export interface AgentRunDetailResponse {
   run: AgentRunRecord;
-  events: StoredAgentEvent[];
 }
 
 export interface CancelAgentRunResponse {
@@ -344,7 +341,7 @@ export const apiBaseUrl = resolveApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
 
 function parseSseBlock<T>(block: string): T | null {
   // 后端 SSE 每个事件块形如：
-  // data: {"seq":1,"event":...}
+  // data: {"id":"event_live_...","event":...}
   // 这里先只解析 data 行，event/id/retry 这些字段当前业务不依赖。
   const dataLine = block
     .split("\n")
@@ -527,13 +524,10 @@ export async function uploadAgentImage(file: File): Promise<MediaPart> {
 
 export async function streamAgentRunEvents(
   runId: string,
-  after: number,
   onEvent: (event: StoredAgentEvent) => void,
   signal?: AbortSignal
 ): Promise<void> {
-  // after 是断点续传游标：浏览器记录最后收到的 seq，刷新/重连时从这个 seq 之后继续读。
-  // 所以即使网络断一下，也不需要重新发起一次模型调用。
-  const response = await fetch(`${apiBaseUrl}/agents/runs/${runId}/events?after=${after}`, {
+  const response = await fetch(`${apiBaseUrl}/agents/runs/${runId}/stream`, {
     signal,
     headers: {
       accept: "text/event-stream"
