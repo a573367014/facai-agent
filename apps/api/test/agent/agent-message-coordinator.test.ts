@@ -151,6 +151,16 @@ class FakeAgentEventBus implements AgentEventBus {
   }
 }
 
+class FailingAgentEventBus implements AgentEventBus {
+  async publishRunEvent(): Promise<void> {
+    throw new Error("redis publish failed");
+  }
+
+  async subscribeRun(): Promise<() => void> {
+    return () => {};
+  }
+}
+
 class FakeAgentCancellationStore implements AgentCancellationStore {
   readonly cancelledRunIds = new Set<string>();
 
@@ -168,6 +178,40 @@ class FakeAgentCancellationStore implements AgentCancellationStore {
 }
 
 describe("AgentMessageCoordinator", () => {
+  it("event bus 发布失败不影响 run 创建，也不会产生未处理拒绝", async () => {
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => {
+      unhandledRejections.push(reason);
+    };
+    const registry = new ToolRegistry();
+    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const runQueue: AgentRunQueue = {
+      enqueueRun: async () => {}
+    };
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService({ complete: async () => ({ content: "不会在 API 执行" }) }, registry),
+      store,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { eventBus: new FailingAgentEventBus(), runQueue }
+    );
+
+    process.on("unhandledRejection", onUnhandledRejection);
+
+    try {
+      const started = await coordinator.startRun({ input: "排队执行" });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(started.run.status).toBe("running");
+      expect(unhandledRejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+      store.close();
+    }
+  });
+
   it("queue worker 写入的 run 终态事件会通过 event bus 推给 API 订阅者", async () => {
     const registry = new ToolRegistry();
     const provider: LlmProvider = {

@@ -843,7 +843,7 @@ describe("AgentConversation", () => {
     expect(gallery).not.toHaveTextContent("Request Has Reached API Concurrent Limit");
   });
 
-  it("renders assistant video media from message parts", () => {
+  it("renders assistant video media from message parts", async () => {
     const messages: ChatMessage[] = [
       {
         id: "msg_1:assistant",
@@ -892,6 +892,12 @@ describe("AgentConversation", () => {
     expect(screen.getByText("视频已生成。")).toBeInTheDocument();
     expect(screen.getByLabelText("田园小猪视频")).toHaveAttribute("src", "https://example.com/part-video.mp4");
     expect(screen.getByRole("link", { name: "下载视频 1" })).toHaveAttribute("href", "https://example.com/part-video.mp4");
+
+    await userEvent.click(screen.getByRole("button", { name: "更多视频操作 1" }));
+
+    expect(screen.getByRole("menuitem", { name: "复制视频链接 1" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "引用视频 1" })).not.toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "打开原视频 1" })).toHaveAttribute("href", "https://example.com/part-video.mp4");
   });
 
   it("按 assistant message parts 原始顺序渲染媒体和后续文本", () => {

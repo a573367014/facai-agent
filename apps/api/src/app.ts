@@ -26,6 +26,7 @@ import { LocalToolResourceStorage, type ToolResourceStorage } from "./agent/tool
 import { createCorsOriginChecker } from "./config/cors.js";
 import { loadEnv } from "./config/env.js";
 import { AppError } from "./errors/app-error.js";
+import { toRuntimeDependencyAppError } from "./errors/runtime-dependency-error.js";
 import { OpenAiCompatibleProvider } from "./providers/openai-compatible-provider.js";
 import { createRedisRuntime, toBullMqRedisConnectionOptions, type RedisRuntime } from "./redis/runtime.js";
 import { registerAgentRoutes } from "./routes/agent-routes.js";
@@ -100,6 +101,18 @@ export async function buildApp(options: BuildAppOptions = {}) {
         error: {
           code: error.code,
           message: error.message
+        }
+      });
+      return;
+    }
+
+    const runtimeDependencyError = toRuntimeDependencyAppError(error);
+
+    if (runtimeDependencyError) {
+      reply.status(runtimeDependencyError.statusCode).send({
+        error: {
+          code: runtimeDependencyError.code,
+          message: runtimeDependencyError.message
         }
       });
       return;

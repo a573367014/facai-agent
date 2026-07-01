@@ -244,6 +244,56 @@ describe("PartComposer", () => {
     expect(onUploadImage).not.toHaveBeenCalled();
   });
 
+  it("视频 media part 在输入框里显示为视频占位，不把 mp4 当图片缩略图", () => {
+    const { container } = render(
+      <PartComposer
+        parts={[
+          {
+            type: "media",
+            mime: "video/mp4",
+            url: "http://localhost:4001/uploads/resources/videos/demo.mp4",
+            name: "节日主图动态视频"
+          }
+        ]}
+        onCancel={vi.fn()}
+        onChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />
+    );
+
+    const mediaPart = screen.getByText("节日主图动态视频").closest(".pm-part--media");
+    expect(mediaPart).toBeInstanceOf(HTMLElement);
+    expect(mediaPart).toHaveTextContent("视频");
+    expect(mediaPart).toHaveAttribute("data-mime", "video/mp4");
+    expect(container.querySelector('img.pm-part-media-thumb[src$=".mp4"]')).toBeNull();
+  });
+
+  it("点击视频 media part 不会打开图片选择器", async () => {
+    render(
+      <PartComposer
+        parts={[
+          {
+            type: "media",
+            mime: "video/mp4",
+            url: "http://localhost:4001/uploads/resources/videos/demo.mp4",
+            name: "节日主图动态视频"
+          }
+        ]}
+        onCancel={vi.fn()}
+        onChange={vi.fn()}
+        onSubmit={vi.fn()}
+        onUploadImage={vi.fn()}
+      />
+    );
+
+    const imageInput = screen.getByLabelText("选择图片") as HTMLInputElement;
+    const inputClick = vi.spyOn(imageInput, "click");
+
+    await userEvent.click(screen.getByText("节日主图动态视频"));
+
+    expect(inputClick).not.toHaveBeenCalled();
+  });
+
   it("media part 不使用外部 margin，并让拖选态和文本选区颜色一致", () => {
     const styles = readFileSync(stylesPath, "utf8");
 

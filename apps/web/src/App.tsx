@@ -337,31 +337,71 @@ function markRunMessagesCancelled(currentMessages: ChatMessage[], run: AgentRunR
   }), { showRunningSummary: true });
 }
 
-function setTextPartValue(parts: MessagePart[] = [], value: string): MessagePart[] {
-  const textPartIndex = parts.findIndex((part) => part.type === "text");
+function compactMessageParts(parts: Array<MessagePart | undefined> = []): MessagePart[] {
+  // SSE 事件乱序或缺少前置 part 时，直接 parts[1] = xxx 会制造“空洞数组”。
+  // React 渲染和 final_answer 都会遍历 parts，所以进入核心逻辑前先压成真正连续的数组。
+  return parts.filter((part): part is MessagePart => Boolean(part));
+}
 
-  if (textPartIndex === -1) {
-    return value ? [{ type: "text", value }, ...parts] : parts;
+function createEmptyTextPart(): MessagePart {
+  return { type: "text", value: "" };
+}
+
+function normalizePartIndex(partIndex: number) {
+  return Number.isInteger(partIndex) && partIndex >= 0 ? partIndex : 0;
+}
+
+function padMissingPartsBeforeIndex(parts: MessagePart[] = [], partIndex: number): MessagePart[] {
+  const safePartIndex = normalizePartIndex(partIndex);
+  const nextParts = compactMessageParts(parts);
+
+  // 后端的 partIndex 是“最终消息里的位置”。
+  // 比如视频 partIndex=1 先到，但文本 partIndex=0 还没到，前端先补一个空文本位；
+  // 后面的 final_answer 或 message.part.updated 再把这个空位填成真正正文。
+  while (nextParts.length < safePartIndex) {
+    nextParts.push(createEmptyTextPart());
   }
 
-  return parts.map((part, index) => (index === textPartIndex && part.type === "text" ? { ...part, value } : part));
+  return nextParts;
+}
+
+function setTextPartValue(parts: MessagePart[] = [], value: string): MessagePart[] {
+  const denseParts = compactMessageParts(parts);
+  const textPartIndex = denseParts.findIndex((part) => part.type === "text");
+
+  if (textPartIndex === -1) {
+    return value ? [{ type: "text", value }, ...denseParts] : denseParts;
+  }
+
+  return denseParts.map((part, index) => (index === textPartIndex && part.type === "text" ? { ...part, value } : part));
 }
 
 function applyPartEventToMessage(message: ChatMessage, event: AgentStreamEvent): ChatMessage {
   // 后端不会每次都重发整条消息：流式文本用 delta，媒体/占位用 created/updated。
   // 这个函数只负责把“一个 part 事件”折叠到当前 ChatMessage 上。
   if (event.type === "message.part.created") {
-    const parts = [...(message.parts ?? [])];
-    parts.splice(event.partIndex, 0, event.part);
+    const partIndex = normalizePartIndex(event.partIndex);
+    const parts = padMissingPartsBeforeIndex(message.parts, partIndex);
+    parts.splice(partIndex, 0, event.part);
     return { ...message, parts, version: event.version ?? message.version };
   }
 
   if (event.type === "message.part.delta") {
-    const parts = [...(message.parts ?? [])];
-    const targetPart = parts[event.partIndex];
+    const partIndex = normalizePartIndex(event.partIndex);
+    const parts = padMissingPartsBeforeIndex(message.parts, partIndex);
+    const targetPart = parts[partIndex];
 
     if (!targetPart) {
-      parts[event.partIndex] = { type: "text", value: event.delta };
+      parts[partIndex] = { type: "text", value: event.delta };
+      return {
+        ...message,
+        version: event.version ?? message.version,
+        parts
+      };
+    }
+
+    if (targetPart.type !== "text") {
+      parts.splice(partIndex, 0, { type: "text", value: event.delta });
       return {
         ...message,
         version: event.version ?? message.version,
@@ -373,16 +413,17 @@ function applyPartEventToMessage(message: ChatMessage, event: AgentStreamEvent):
       ...message,
       version: event.version ?? message.version,
       parts: parts.map((part, index) =>
-        index === event.partIndex && part.type === "text" ? { ...part, value: part.value + event.delta } : part
+        index === partIndex && part.type === "text" ? { ...part, value: part.value + event.delta } : part
       )
     };
   }
 
   if (event.type === "message.part.updated") {
-    const parts = [...(message.parts ?? [])];
+    const partIndex = normalizePartIndex(event.partIndex);
+    const parts = padMissingPartsBeforeIndex(message.parts, partIndex);
 
-    if (!parts[event.partIndex]) {
-      parts[event.partIndex] = event.part;
+    if (!parts[partIndex]) {
+      parts[partIndex] = event.part;
       return {
         ...message,
         version: event.version ?? message.version,
@@ -393,7 +434,7 @@ function applyPartEventToMessage(message: ChatMessage, event: AgentStreamEvent):
     return {
       ...message,
       version: event.version ?? message.version,
-      parts: parts.map((part, index) => (index === event.partIndex ? event.part : part))
+      parts: parts.map((part, index) => (index === partIndex ? event.part : part))
     };
   }
 
@@ -475,19 +516,21 @@ function buildHistoryItems(sessions: AgentSessionRecord[]): SessionHistoryItem[]
   }));
 }
 
-function appendQuotedImagePart(currentParts: RuntimePart[], quotedImagePart: RuntimePart): RuntimePart[] {
+function appendQuotedMediaPart(currentParts: RuntimePart[], quotedMediaPart: RuntimePart): RuntimePart[] {
   const meaningfulParts = currentParts.filter((part) => part.type === "media" || (part.type === "text" && part.value.trim()));
 
   if (meaningfulParts.length === 0) {
-    return [quotedImagePart];
+    return [quotedMediaPart];
   }
 
-  return [...currentParts, quotedImagePart];
+  return [...currentParts, quotedMediaPart];
 }
 
-function createQuotedImagePart(payload: ToolImageActionPayload): RuntimePart {
+function createQuotedMediaPart(payload: ToolImageActionPayload): RuntimePart {
   const prompt = payload.prompt.trim();
-  const name = prompt || `图片 ${payload.index + 1}`;
+  const mime = payload.mime ?? inferMediaMimeFromUrl(payload.url);
+  const mediaLabel = getMediaLabel(mime);
+  const name = prompt || `${mediaLabel} ${payload.index + 1}`;
   const tool =
     payload.trace.toolName === "media"
       ? undefined
@@ -500,7 +543,7 @@ function createQuotedImagePart(payload: ToolImageActionPayload): RuntimePart {
 
   return {
     type: "media",
-    mime: payload.mime ?? inferImageMimeFromUrl(payload.url),
+    mime,
     url: payload.url,
     name,
     ...(typeof payload.width === "number" ? { width: payload.width } : {}),
@@ -514,8 +557,20 @@ function createQuotedImagePart(payload: ToolImageActionPayload): RuntimePart {
   };
 }
 
-function inferImageMimeFromUrl(url: string) {
+function inferMediaMimeFromUrl(url: string) {
   const pathname = safeUrlPathname(url).toLowerCase();
+
+  if (pathname.endsWith(".mp4")) {
+    return "video/mp4";
+  }
+
+  if (pathname.endsWith(".webm")) {
+    return "video/webm";
+  }
+
+  if (pathname.endsWith(".mov") || pathname.endsWith(".qt")) {
+    return "video/quicktime";
+  }
 
   if (pathname.endsWith(".jpg") || pathname.endsWith(".jpeg")) {
     return "image/jpeg";
@@ -530,6 +585,10 @@ function inferImageMimeFromUrl(url: string) {
   }
 
   return "image/png";
+}
+
+function getMediaLabel(mime: string) {
+  return mime.startsWith("video/") ? "视频" : "图片";
 }
 
 function safeUrlPathname(url: string) {
@@ -1251,7 +1310,7 @@ export default function App() {
       return;
     }
 
-    setComposerParts((currentParts) => appendQuotedImagePart(currentParts, createQuotedImagePart(payload)));
+    setComposerParts((currentParts) => appendQuotedMediaPart(currentParts, createQuotedMediaPart(payload)));
     setComposerFocusToken((currentToken) => currentToken + 1);
   }
 

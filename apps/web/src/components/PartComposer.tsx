@@ -264,6 +264,12 @@ function createEditorState(input: {
               const replacementRange = findMediaReplacementRange(view, target);
               input.pendingReplacementRangeRef.current = replacementRange;
               clearMediaClickSelection(view, replacementRange);
+
+              if (isVideoMediaElement(target)) {
+                event.preventDefault();
+                return true;
+              }
+
               input.imageInputRef.current?.click();
               event.preventDefault();
               return true;
@@ -327,6 +333,10 @@ function closestMediaPartElement(target: EventTarget | null): HTMLElement | null
   }
 
   return null;
+}
+
+function isVideoMediaElement(element: HTMLElement) {
+  return element.dataset.mime?.startsWith("video/") ?? false;
 }
 
 function closestMediaRemoveButtonElement(target: EventTarget | null): HTMLElement | null {

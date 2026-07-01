@@ -1864,6 +1864,63 @@ describe("App", () => {
     expect(screen.getByRole("link", { name: "下载图片 1" })).toHaveAttribute("href", "https://example.com/pig.png");
   });
 
+  it("视频 part 先于文本 part 到达时 final_answer 仍能正常补正文", async () => {
+    mockAppFetch((url, init) => {
+      if (url.endsWith("/agents/runs") && init?.method === "POST") {
+        return jsonResponse(createStartMessageResponse({ input: "生成田园小猪视频", assistantMessageId: "msg_1" }));
+      }
+
+      if (url.endsWith("/agents/runs/msg_1/events?after=0")) {
+        return createStoredRunSseResponse("msg_1", "msg_1", [
+          {
+            type: "session.message.created",
+            message: createAssistantMessage("session_1", "", {
+              id: "msg_1",
+              status: "running",
+              parts: []
+            })
+          },
+          {
+            type: "message.part.updated",
+            messageId: "msg_1",
+            partIndex: 1,
+            part: {
+              type: "media",
+              mime: "video/mp4",
+              url: "https://example.com/pig-video.mp4",
+              width: 1280,
+              height: 720,
+              extra: {
+                lifecycle: { state: "succeeded" },
+                resource: { id: "res_video" },
+                tool: {
+                  name: "generate_video",
+                  toolCallId: "call_video",
+                  toolCallRowId: "tool_call_video",
+                  outputIndex: 0
+                },
+                generation: { prompt: "田园小猪视频", provider: "test" }
+              }
+            }
+          },
+          { type: "final_answer", answer: "视频已生成。" },
+          { type: "run_completed", messageId: "msg_1" }
+        ]);
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await userEvent.type(screen.getByLabelText("发消息"), "生成田园小猪视频");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(screen.getByLabelText("田园小猪视频")).toHaveAttribute("src", "https://example.com/pig-video.mp4"));
+    expect(screen.getAllByText("视频已生成。").length).toBeGreaterThan(0);
+    expect(screen.getByRole("link", { name: "下载视频 1" })).toHaveAttribute("href", "https://example.com/pig-video.mp4");
+  });
+
   it("摘要过程会在主消息区和时间线展示", async () => {
     const runningSystemMessage = createSystemMessage("session_1", "上下文自动压缩中...", {
       id: "msg_system_summary",

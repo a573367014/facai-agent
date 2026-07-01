@@ -286,10 +286,12 @@ function renderImageFrame(
             <Copy size={14} />
             复制链接
           </MenuItem>
-          <MenuItem aria-label={`引用${mediaLabel} ${index + 1}`} onClick={() => quoteImage(item, index)}>
-            <Quote size={14} />
-            引用
-          </MenuItem>
+          {!isVideo ? (
+            <MenuItem aria-label={`引用${mediaLabel} ${index + 1}`} onClick={() => quoteImage(item, index)}>
+              <Quote size={14} />
+              引用
+            </MenuItem>
+          ) : null}
           <MenuItem
             component="a"
             href={item.url}

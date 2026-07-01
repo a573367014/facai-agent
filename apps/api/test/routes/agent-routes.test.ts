@@ -56,16 +56,22 @@ async function buildTestApp(options: Parameters<typeof buildApp>[0]) {
   const testRunQueue = new CapturingAgentRunQueue();
   const app = await buildApp({
     ...options,
-    runningStateStore: new InMemoryRunningMessageStateStore(),
-    eventBus: new InMemoryAgentEventBus(),
+    runningStateStore: options.runningStateStore ?? new InMemoryRunningMessageStateStore(),
+    eventBus: options.eventBus ?? new InMemoryAgentEventBus(),
     runQueue: testRunQueue,
-    cancellationStore: new InMemoryAgentCancellationStore(),
-    runLock: new InMemoryAgentRunLock(),
+    cancellationStore: options.cancellationStore ?? new InMemoryAgentCancellationStore(),
+    runLock: options.runLock ?? new InMemoryAgentRunLock(),
     databasePath: createTempDatabasePath()
   }) as TestFastifyApp;
   app.testRunQueue = testRunQueue;
   apps.push(app);
   return app;
+}
+
+class FailingRunningMessageStateStore extends InMemoryRunningMessageStateStore {
+  async init(): ReturnType<InMemoryRunningMessageStateStore["init"]> {
+    throw new Error('Reached the max retries per request limit (which is 2). Refer to "maxRetriesPerRequest" option for details.');
+  }
 }
 
 async function executeNextQueuedRun(app: TestFastifyApp) {
@@ -604,6 +610,42 @@ describe("agent routes", () => {
       userMessageId: payload.userMessage.id,
       assistantMessageId: expect.stringMatching(/^msg_/)
     });
+  });
+
+  it("POST /agents/runs 在 Redis 运行时不可用时返回运行时依赖错误", async () => {
+    const app = await buildTestApp({
+      agentService: createTestAgentService(),
+      runningStateStore: new FailingRunningMessageStateStore()
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: "/agents/runs",
+      payload: { input: "现在上海时间是多少？" }
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({
+      error: {
+        code: "RUNTIME_DEPENDENCY_ERROR",
+        message: "运行时依赖 Redis 暂不可用，请确认 Redis 已启动并检查 REDIS_URL。"
+      }
+    });
+
+    const sessionsResponse = await app.inject({ method: "GET", url: "/agents/sessions" });
+    const { sessions } = sessionsResponse.json() as { sessions: Array<{ id: string }> };
+    const sessionResponse = await app.inject({ method: "GET", url: `/agents/sessions/${sessions[0]!.id}` });
+    const { messages } = sessionResponse.json() as {
+      messages: Array<{ role: string; status: string; error?: { code: string } }>;
+    };
+
+    expect(messages).toEqual([
+      expect.objectContaining({ role: "user", status: "completed" }),
+      expect.objectContaining({
+        role: "assistant",
+        status: "failed",
+        error: { code: "RUNTIME_DEPENDENCY_ERROR", message: "运行时依赖 Redis 暂不可用，请确认 Redis 已启动并检查 REDIS_URL。" }
+      })
+    ]);
   });
 
   it("buildApp 启动时清理上次进程遗留的 running run", async () => {
