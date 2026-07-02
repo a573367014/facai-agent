@@ -2,8 +2,16 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import initSqlJs from "sql.js";
+import { cosineSimilarity } from "../knowledge/vector.js";
 import type { AgentStreamEvent } from "./types.js";
 import type { MessagePart } from "./message-parts.js";
+import type {
+  CreateKnowledgeChunkInput,
+  CreateKnowledgeDocumentInput,
+  KnowledgeChunkSearchResult,
+  KnowledgeDocumentRecord,
+  UpdateKnowledgeDocumentInput
+} from "../knowledge/types.js";
 import type {
   AgentEventListener,
   AgentMessageRecord,
@@ -503,7 +511,7 @@ export class SqliteAgentStore implements AgentStore {
   }
 
   createMessage(input: CreateAgentMessageInput): AgentMessageRecord {
-    const timestamp = now();
+    const timestamp = input.createdAt ?? now();
     const message: AgentMessageRecord = {
       id: createId("msg"),
       sessionId: input.sessionId,
@@ -1463,6 +1471,232 @@ export class SqliteAgentStore implements AgentStore {
     ).map((row) => this.toProcessStepRecord(row));
   }
 
+  createKnowledgeDocument(input: CreateKnowledgeDocumentInput): KnowledgeDocumentRecord {
+    const timestamp = now();
+    const document: KnowledgeDocumentRecord = {
+      id: createId("knowledge_doc"),
+      name: input.name,
+      mimeType: input.mimeType,
+      sourcePath: input.sourcePath,
+      status: input.status ?? "pending",
+      contentHash: input.contentHash,
+      chunkCount: 0,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+
+    this.run(
+      `INSERT INTO knowledge_documents (
+         id,
+         name,
+         mime_type,
+         source_path,
+         status,
+         error_message,
+         content_hash,
+         chunk_count,
+         created_at,
+         updated_at,
+         indexed_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        document.id,
+        document.name,
+        document.mimeType,
+        document.sourcePath,
+        document.status,
+        document.errorMessage ?? null,
+        document.contentHash,
+        document.chunkCount,
+        document.createdAt,
+        document.updatedAt,
+        document.indexedAt ?? null
+      ]
+    );
+    this.persist();
+    return document;
+  }
+
+  updateKnowledgeDocument(documentId: string, input: UpdateKnowledgeDocumentInput): KnowledgeDocumentRecord | undefined {
+    const existingDocument = this.getKnowledgeDocument(documentId);
+
+    if (!existingDocument) {
+      return undefined;
+    }
+
+    const timestamp = now();
+
+    this.run(
+      `UPDATE knowledge_documents
+       SET status = ?,
+           error_message = ?,
+           chunk_count = ?,
+           updated_at = ?,
+           indexed_at = ?
+       WHERE id = ?`,
+      [
+        input.status ?? existingDocument.status,
+        input.errorMessage !== undefined ? input.errorMessage : existingDocument.errorMessage ?? null,
+        input.chunkCount ?? existingDocument.chunkCount,
+        timestamp,
+        input.indexedAt !== undefined ? input.indexedAt : existingDocument.indexedAt ?? null,
+        documentId
+      ]
+    );
+    this.persist();
+    return this.getKnowledgeDocument(documentId);
+  }
+
+  getKnowledgeDocument(documentId: string): KnowledgeDocumentRecord | undefined {
+    const row = this.queryOne(
+      `SELECT
+         id,
+         name,
+         mime_type,
+         source_path,
+         status,
+         error_message,
+         content_hash,
+         chunk_count,
+         created_at,
+         updated_at,
+         indexed_at
+       FROM knowledge_documents
+       WHERE id = ?`,
+      [documentId]
+    );
+
+    return row ? this.toKnowledgeDocumentRecord(row) : undefined;
+  }
+
+  listKnowledgeDocuments(): KnowledgeDocumentRecord[] {
+    return this.queryMany(
+      `SELECT
+         id,
+         name,
+         mime_type,
+         source_path,
+         status,
+         error_message,
+         content_hash,
+         chunk_count,
+         created_at,
+         updated_at,
+         indexed_at
+       FROM knowledge_documents
+       ORDER BY updated_at DESC, rowid DESC`
+    ).map((row) => this.toKnowledgeDocumentRecord(row));
+  }
+
+  deleteKnowledgeDocument(documentId: string): boolean {
+    const existingDocument = this.getKnowledgeDocument(documentId);
+
+    if (!existingDocument) {
+      return false;
+    }
+
+    this.run("BEGIN TRANSACTION");
+    try {
+      this.run(`DELETE FROM knowledge_chunks WHERE document_id = ?`, [documentId]);
+      this.run(`DELETE FROM knowledge_documents WHERE id = ?`, [documentId]);
+      this.run("COMMIT");
+    } catch (error) {
+      this.run("ROLLBACK");
+      throw error;
+    }
+
+    this.persist();
+    return true;
+  }
+
+  replaceKnowledgeChunks(documentId: string, chunks: CreateKnowledgeChunkInput[]): void {
+    const timestamp = now();
+
+    this.run("BEGIN TRANSACTION");
+    try {
+      this.run(`DELETE FROM knowledge_chunks WHERE document_id = ?`, [documentId]);
+
+      for (const chunk of chunks) {
+        this.run(
+          `INSERT INTO knowledge_chunks (
+             id,
+             document_id,
+             chunk_index,
+             content,
+             source_label,
+             embedding_model,
+             embedding_json,
+             metadata_json,
+             created_at
+           )
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            createId("knowledge_chunk"),
+            documentId,
+            chunk.chunkIndex,
+            chunk.content,
+            chunk.sourceLabel,
+            chunk.embeddingModel,
+            JSON.stringify(chunk.embedding),
+            chunk.metadata ? JSON.stringify(chunk.metadata) : null,
+            timestamp
+          ]
+        );
+      }
+
+      this.run("COMMIT");
+    } catch (error) {
+      this.run("ROLLBACK");
+      throw error;
+    }
+
+    this.persist();
+  }
+
+  searchKnowledgeChunks(input: { queryEmbedding: number[]; limit: number }): KnowledgeChunkSearchResult[] {
+    const limit = normalizeLimit(input.limit);
+
+    if (limit === 0 || input.queryEmbedding.length === 0) {
+      return [];
+    }
+
+    return this.queryMany(
+      `SELECT
+         chunks.id,
+         chunks.document_id,
+         documents.name AS document_name,
+         chunks.chunk_index,
+         chunks.content,
+         chunks.source_label,
+         chunks.embedding_model,
+         chunks.embedding_json,
+         chunks.metadata_json,
+         chunks.created_at
+       FROM knowledge_chunks chunks
+       INNER JOIN knowledge_documents documents ON documents.id = chunks.document_id
+       WHERE documents.status = 'ready'`
+    )
+      .map((row) => {
+        const embedding = parseJson<number[]>(row.embedding_json) ?? [];
+        return {
+          id: requiredString(row.id, "id"),
+          documentId: requiredString(row.document_id, "document_id"),
+          documentName: requiredString(row.document_name, "document_name"),
+          chunkIndex: optionalNumber(row.chunk_index) ?? 0,
+          content: requiredString(row.content, "content"),
+          sourceLabel: requiredString(row.source_label, "source_label"),
+          embeddingModel: requiredString(row.embedding_model, "embedding_model"),
+          embedding,
+          metadata: parseJson<KnowledgeChunkSearchResult["metadata"]>(row.metadata_json),
+          createdAt: requiredString(row.created_at, "created_at"),
+          score: cosineSimilarity(input.queryEmbedding, embedding)
+        };
+      })
+      .sort((leftResult, rightResult) => rightResult.score - leftResult.score || leftResult.chunkIndex - rightResult.chunkIndex)
+      .slice(0, limit);
+  }
+
   appendRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): StoredAgentEvent | undefined {
     return this.appendStoredEvent({ runId, messageId, event });
   }
@@ -1600,6 +1834,32 @@ export class SqliteAgentStore implements AgentStore {
         completed_at TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS knowledge_documents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        source_path TEXT NOT NULL,
+        status TEXT NOT NULL,
+        error_message TEXT,
+        content_hash TEXT NOT NULL,
+        chunk_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        indexed_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS knowledge_chunks (
+        id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL,
+        chunk_index INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        source_label TEXT NOT NULL,
+        embedding_model TEXT NOT NULL,
+        embedding_json TEXT NOT NULL,
+        metadata_json TEXT,
+        created_at TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_agent_messages_session_id_created_at
         ON agent_messages (session_id, created_at);
 
@@ -1620,6 +1880,12 @@ export class SqliteAgentStore implements AgentStore {
 
       CREATE INDEX IF NOT EXISTS idx_agent_process_steps_message_order
         ON agent_process_steps (message_id, order_index);
+
+      CREATE INDEX IF NOT EXISTS idx_knowledge_documents_status_updated_at
+        ON knowledge_documents (status, updated_at);
+
+      CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_document_id_index
+        ON knowledge_chunks (document_id, chunk_index);
     `);
     this.ensureCurrentSchemaIndexes();
   }
@@ -1884,6 +2150,22 @@ export class SqliteAgentStore implements AgentStore {
 
   private getSqlCommand(sql: string): string {
     return sql.trim().split(/\s+/, 1)[0]?.toUpperCase() ?? "";
+  }
+
+  private toKnowledgeDocumentRecord(row: SqlRow): KnowledgeDocumentRecord {
+    return {
+      id: requiredString(row.id, "id"),
+      name: requiredString(row.name, "name"),
+      mimeType: requiredString(row.mime_type, "mime_type"),
+      sourcePath: requiredString(row.source_path, "source_path"),
+      status: requiredString(row.status, "status") as KnowledgeDocumentRecord["status"],
+      errorMessage: optionalString(row.error_message),
+      contentHash: requiredString(row.content_hash, "content_hash"),
+      chunkCount: optionalNumber(row.chunk_count) ?? 0,
+      createdAt: requiredString(row.created_at, "created_at"),
+      updatedAt: requiredString(row.updated_at, "updated_at"),
+      indexedAt: optionalString(row.indexed_at)
+    };
   }
 
   private toSessionRecord(row: SqlRow): AgentSessionRecord {

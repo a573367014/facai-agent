@@ -49,6 +49,78 @@ function createTestAgentService(): AgentService {
 }
 
 describe("SqliteAgentStore", () => {
+  it("保存知识库文档并且只搜索 ready 文档的 chunk", async () => {
+    const databasePath = createTempDatabasePath();
+    const store = await SqliteAgentStore.create({ databasePath });
+    const readyDocument = store.createKnowledgeDocument({
+      name: "员工手册.pdf",
+      mimeType: "application/pdf",
+      sourcePath: "/tmp/员工手册.pdf",
+      contentHash: "ready-hash"
+    });
+    const indexingDocument = store.createKnowledgeDocument({
+      name: "草稿制度.docx",
+      mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      sourcePath: "/tmp/草稿制度.docx",
+      contentHash: "indexing-hash"
+    });
+
+    store.replaceKnowledgeChunks(readyDocument.id, [
+      {
+        chunkIndex: 0,
+        content: "请假需要直属主管审批。",
+        sourceLabel: "员工手册.pdf 第 3 页",
+        embeddingModel: "test-embedding",
+        embedding: [1, 0],
+        metadata: { page: 3 }
+      },
+      {
+        chunkIndex: 1,
+        content: "报销需要提交发票。",
+        sourceLabel: "员工手册.pdf 第 5 页",
+        embeddingModel: "test-embedding",
+        embedding: [0, 1]
+      }
+    ]);
+    store.replaceKnowledgeChunks(indexingDocument.id, [
+      {
+        chunkIndex: 0,
+        content: "草稿制度暂不应该被搜索。",
+        sourceLabel: "草稿制度.docx",
+        embeddingModel: "test-embedding",
+        embedding: [1, 0]
+      }
+    ]);
+    store.updateKnowledgeDocument(readyDocument.id, {
+      status: "ready",
+      chunkCount: 2,
+      indexedAt: "2026-07-01T00:00:00.000Z"
+    });
+    store.updateKnowledgeDocument(indexingDocument.id, {
+      status: "indexing"
+    });
+
+    const results = store.searchKnowledgeChunks({
+      queryEmbedding: [1, 0],
+      limit: 5
+    });
+
+    expect(results.map((result) => result.content)).toEqual(["请假需要直属主管审批。", "报销需要提交发票。"]);
+    expect(results[0]).toMatchObject({
+      documentId: readyDocument.id,
+      documentName: "员工手册.pdf",
+      sourceLabel: "员工手册.pdf 第 3 页",
+      score: 1,
+      metadata: { page: 3 }
+    });
+    expect(results.some((result) => result.documentId === indexingDocument.id)).toBe(false);
+
+    store.deleteKnowledgeDocument(readyDocument.id);
+    expect(store.getKnowledgeDocument(readyDocument.id)).toBeUndefined();
+    expect(store.searchKnowledgeChunks({ queryEmbedding: [1, 0], limit: 5 })).toEqual([]);
+    store.close();
+  });
+
   it("支持按消息游标读取最近消息、历史消息和新增消息", async () => {
     const databasePath = createTempDatabasePath();
     const store = await SqliteAgentStore.create({ databasePath });

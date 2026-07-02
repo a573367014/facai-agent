@@ -40,7 +40,7 @@ export class AgentProcessStepProjector {
       const thinkingStep = this.findProcessStep(messageId, (step) => step.kind === "thinking" && step.metadata?.phase === "thinking");
 
       if (thinkingStep?.status === "running") {
-        const toolCallCount = event.toolCalls?.length ?? 0;
+        const toolCallCount = event.toolCalls?.filter((toolCall) => !isHiddenProcessTool(toolCall.name)).length ?? 0;
         this.updateProcessStep(messageId, thinkingStep.id, runId, {
           title: toolCallCount > 0 ? "已理解需求" : "已生成回答",
           summary: toolCallCount > 0 ? `需要执行 ${toolCallCount} 项任务` : "回答已生成",
@@ -76,6 +76,10 @@ export class AgentProcessStepProjector {
     }
 
     if (event.type === "tool_start") {
+      if (isHiddenProcessTool(event.toolName)) {
+        return;
+      }
+
       // tool_start 对应一条工具进度步骤。
       // 如果同一个 toolCallId 已经有步骤，说明这是重放/补偿事件，更新已有步骤即可。
       const toolCall = event.toolCallId ? this.store.getToolCallByMessageToolCall(messageId, event.toolCallId) : undefined;
@@ -116,6 +120,10 @@ export class AgentProcessStepProjector {
     }
 
     if (event.type === "tool_result" && event.toolCallId) {
+      if (isHiddenProcessTool(event.toolName)) {
+        return;
+      }
+
       // 工具成功后不把完整 result 塞进 step summary，只记录摘要到 metadata。
       // 完整结果由 tool_call/resource/message part 保存，前端需要时从那些结构展示。
       const toolCall = this.store.getToolCallByMessageToolCall(messageId, event.toolCallId);
@@ -139,6 +147,10 @@ export class AgentProcessStepProjector {
     }
 
     if (event.type === "tool_error" && event.toolCallId) {
+      if (isHiddenProcessTool(event.toolName)) {
+        return;
+      }
+
       const toolCall = this.store.getToolCallByMessageToolCall(messageId, event.toolCallId);
       const existingStep = this.findProcessStep(messageId, (step) => step.kind === "tool" && step.toolCallId === event.toolCallId);
       const labels = getToolProcessLabels(event.toolName);
@@ -253,6 +265,10 @@ export class AgentProcessStepProjector {
     const maxOrderIndex = Math.max(-1, ...steps.map((step) => step.orderIndex));
     return maxOrderIndex + 1;
   }
+}
+
+function isHiddenProcessTool(toolName: string) {
+  return toolName === "knowledge_search";
 }
 
 function getToolProcessLabels(toolName: string) {

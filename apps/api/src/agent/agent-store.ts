@@ -1,6 +1,14 @@
 import type { AgentStreamEvent } from "./types.js";
 import type { MessagePart } from "./message-parts.js";
 import type { JsonObject } from "../tools/types.js";
+import type {
+  CreateKnowledgeChunkInput,
+  CreateKnowledgeDocumentInput,
+  KnowledgeChunkSearchResult,
+  KnowledgeDocumentRecord,
+  SearchKnowledgeChunksInput,
+  UpdateKnowledgeDocumentInput
+} from "../knowledge/types.js";
 
 export type AgentMessageRole = "user" | "assistant" | "system";
 export type AgentMessageStatus = "running" | "completed" | "failed" | "cancelled";
@@ -172,6 +180,7 @@ export interface CreateAgentMessageInput {
     code: string;
     message: string;
   };
+  createdAt?: string;
 }
 
 export interface CreateAgentRunInput {
@@ -339,6 +348,13 @@ export interface AgentStore {
   createProcessStep(input: CreateAgentProcessStepInput): AgentProcessStepRecord;
   updateProcessStep(stepId: string, input: UpdateAgentProcessStepInput): AgentProcessStepRecord | undefined;
   getProcessStepsByMessages(messageIds: string[]): AgentProcessStepRecord[];
+  createKnowledgeDocument(input: CreateKnowledgeDocumentInput): KnowledgeDocumentRecord;
+  updateKnowledgeDocument(documentId: string, input: UpdateKnowledgeDocumentInput): KnowledgeDocumentRecord | undefined;
+  getKnowledgeDocument(documentId: string): KnowledgeDocumentRecord | undefined;
+  listKnowledgeDocuments(): KnowledgeDocumentRecord[];
+  deleteKnowledgeDocument(documentId: string): boolean;
+  replaceKnowledgeChunks(documentId: string, chunks: CreateKnowledgeChunkInput[]): void;
+  searchKnowledgeChunks(input: SearchKnowledgeChunksInput): KnowledgeChunkSearchResult[];
   appendRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): StoredAgentEvent | undefined;
   publishTransientRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): StoredAgentEvent | undefined;
   subscribeRun(runId: string, listener: AgentEventListener): () => void;

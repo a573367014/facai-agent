@@ -1,5 +1,24 @@
 import { z } from "zod";
 
+const optionalEnvString = z.preprocess(
+  (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+  z.string().optional()
+);
+const optionalEnvUrl = z.preprocess(
+  (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+  z.string().url().optional()
+);
+const envUrlWithDefault = (defaultValue: string) =>
+  z.preprocess(
+    (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+    z.string().url().default(defaultValue)
+  );
+const envStringWithDefault = (defaultValue: string) =>
+  z.preprocess(
+    (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+    z.string().min(1).default(defaultValue)
+  );
+
 const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(4001),
   HOST: z.string().default("0.0.0.0"),
@@ -10,6 +29,12 @@ const envSchema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_BASE_URL: z.string().url().default("https://api.openai.com/v1"),
   OPENAI_MODEL: z.string().optional(),
+  EMBEDDING_PROVIDER: z.enum(["openai-compatible", "ollama"]).default("openai-compatible"),
+  OPENAI_EMBEDDING_API_KEY: optionalEnvString,
+  OPENAI_EMBEDDING_BASE_URL: optionalEnvUrl,
+  OPENAI_EMBEDDING_MODEL: z.string().min(1).default("text-embedding-3-small"),
+  OLLAMA_BASE_URL: envUrlWithDefault("http://localhost:11434"),
+  OLLAMA_EMBEDDING_MODEL: envStringWithDefault("embeddinggemma"),
   AGENT_MAX_ITERATIONS: z.coerce.number().int().min(1).max(8).default(4),
   AGENT_CONTEXT_MAX_MESSAGES: z.coerce.number().int().min(0).max(50).default(12),
   AGENT_CONTEXT_MAX_HISTORY_CHARS: z.coerce.number().int().min(0).max(200_000).default(12_000),

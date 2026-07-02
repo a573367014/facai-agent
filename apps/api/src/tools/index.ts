@@ -7,6 +7,8 @@ import {
   type JimengImageToolOptions
 } from "./jimeng-image.js";
 import { createJimengVideoTool, type JimengVideoToolOptions } from "./jimeng-video.js";
+import type { KnowledgeRetriever } from "../knowledge/retriever.js";
+import { createKnowledgeSearchTool } from "./knowledge-search.js";
 import { ToolRegistry } from "./registry.js";
 import { createTavilySearchTool } from "./web-search.js";
 
@@ -16,6 +18,7 @@ export interface DefaultToolRegistryOptions {
   jimengImage?: JimengImageToolOptions;
   jimengImageEdit?: JimengImageEditToolOptions;
   jimengVideo?: JimengVideoToolOptions;
+  knowledgeRetriever?: Pick<KnowledgeRetriever, "search">;
 }
 
 export function createDefaultToolRegistry(options: DefaultToolRegistryOptions = {}): ToolRegistry {
@@ -32,6 +35,10 @@ export function createDefaultToolRegistry(options: DefaultToolRegistryOptions = 
         maxResults: options.searchMaxResults ?? 5
       })
     );
+  }
+
+  if (options.knowledgeRetriever) {
+    registry.register(createKnowledgeSearchTool({ retriever: options.knowledgeRetriever }));
   }
 
   if (options.jimengImage?.accessKeyId?.trim() && options.jimengImage.secretAccessKey?.trim()) {

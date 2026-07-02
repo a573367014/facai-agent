@@ -1026,11 +1026,18 @@ export class AgentMessageCoordinator {
       return;
     }
 
+    const run = this.store.getRun(runId);
+    const assistantMessage = run?.assistantMessageId ? this.store.getMessage(run.assistantMessageId) : undefined;
+    const systemCreatedAt = assistantMessage
+      ? new Date(Date.parse(assistantMessage.createdAt) - 1).toISOString()
+      : undefined;
+
     const systemMessage = this.store.createMessage({
       sessionId,
       role: "system",
       status: "running",
-      parts: [createTextPart("上下文自动压缩中...")]
+      parts: [createTextPart("上下文自动压缩中...")],
+      ...(systemCreatedAt ? { createdAt: systemCreatedAt } : {})
     });
     const startedAt = Date.now();
 

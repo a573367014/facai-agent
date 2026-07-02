@@ -28,10 +28,20 @@ import { createCorsOriginChecker } from "./config/cors.js";
 import { loadEnv } from "./config/env.js";
 import { AppError } from "./errors/app-error.js";
 import { toRuntimeDependencyAppError } from "./errors/runtime-dependency-error.js";
+import { createEmbeddingService, type EmbeddingService } from "./knowledge/embedding-service.js";
+import { KnowledgeIndexingService } from "./knowledge/indexing-service.js";
+import {
+  BullMqKnowledgeIndexQueue,
+  NoopKnowledgeIndexQueue,
+  type KnowledgeIndexJobPayload,
+  type KnowledgeIndexQueue
+} from "./knowledge/knowledge-run-queue.js";
+import { KnowledgeRetriever } from "./knowledge/retriever.js";
 import { OpenAiCompatibleProvider } from "./providers/openai-compatible-provider.js";
 import { createRedisRuntime, toBullMqRedisConnectionOptions, type RedisRuntime } from "./redis/runtime.js";
 import { registerAgentRoutes } from "./routes/agent-routes.js";
 import { registerHealthRoutes } from "./routes/health-routes.js";
+import { registerKnowledgeRoutes } from "./routes/knowledge-routes.js";
 import { ToolAccessPolicy } from "./tools/access-policy.js";
 import { ToolExecutor } from "./tools/executor.js";
 import { createDefaultToolRegistry } from "./tools/index.js";
@@ -45,6 +55,8 @@ export interface BuildAppOptions {
   runningStateStore?: RunningMessageStateStore;
   eventBus?: AgentEventBus;
   runQueue?: AgentRunQueue;
+  knowledgeIndexQueue?: KnowledgeIndexQueue;
+  embeddingService?: EmbeddingService;
   cancellationStore?: AgentCancellationStore;
   runLock?: AgentRunLock;
   toolResourceStorage?: ToolResourceStorage;
@@ -54,6 +66,7 @@ export interface BuildAppOptions {
 
 export type AgentRuntimeFastifyInstance = Awaited<ReturnType<typeof buildApp>> & {
   agentCoordinator?: AgentMessageCoordinator;
+  knowledgeIndexingService?: KnowledgeIndexingService;
 };
 
 export async function buildApp(options: BuildAppOptions = {}) {
@@ -114,27 +127,6 @@ export async function buildApp(options: BuildAppOptions = {}) {
     });
   });
 
-  // 同一个 registry 同时服务两条路径：
-  // 1. getDefinitions() 给 LLM 看有哪些工具；
-  // 2. ToolExecutor 执行时按 toolName 找到真实工具。
-  const toolRegistry = createDefaultToolRegistry({
-    tavilyApiKey: env.TAVILY_API_KEY,
-    searchMaxResults: env.SEARCH_MAX_RESULTS,
-    jimengImage: {
-      accessKeyId: env.VOLCENGINE_ACCESS_KEY_ID,
-      secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY
-    },
-    jimengImageEdit: {
-      accessKeyId: env.VOLCENGINE_ACCESS_KEY_ID,
-      secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY,
-      uploadDirectory
-    },
-    jimengVideo: {
-      accessKeyId: env.VOLCENGINE_ACCESS_KEY_ID,
-      secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY,
-      uploadDirectory
-    }
-  });
   // 当前先用 allow-list 做最小权限控制。未配置时 demo 仍开放所有默认工具；
   // 配了 AGENT_ALLOWED_TOOLS 后，LLM 只能看到这些工具，执行层也只允许这些工具。
   const toolAccessPolicy = new ToolAccessPolicy({ allowedToolNames: env.AGENT_ALLOWED_TOOLS });
@@ -143,31 +135,81 @@ export async function buildApp(options: BuildAppOptions = {}) {
     baseUrl: env.OPENAI_BASE_URL,
     model: env.OPENAI_MODEL ?? ""
   });
-  const agentService =
-    options.agentService ??
-    new AgentService({
-      provider: defaultProvider,
-      toolRegistry,
-      toolAccessPolicy,
-      // 工具超时放在 executor，而不是每个工具自己处理，保证所有工具都有统一兜底。
-      toolExecutor: new ToolExecutor({
-        registry: toolRegistry,
-        timeoutMs: env.AGENT_TOOL_TIMEOUT_MS,
-        accessPolicy: toolAccessPolicy
-      }),
-      defaultMaxIterations: env.AGENT_MAX_ITERATIONS
+  const embeddingService =
+    options.embeddingService ??
+    createEmbeddingService({
+      provider: env.EMBEDDING_PROVIDER,
+      openAiCompatible: {
+        apiKey: env.OPENAI_EMBEDDING_API_KEY ?? env.OPENAI_API_KEY,
+        baseUrl: env.OPENAI_EMBEDDING_BASE_URL ?? env.OPENAI_BASE_URL,
+        model: env.OPENAI_EMBEDDING_MODEL
+      },
+      ollama: {
+        baseUrl: env.OLLAMA_BASE_URL,
+        model: env.OLLAMA_EMBEDDING_MODEL
+      }
     });
   let coordinator = options.coordinator;
+  let knowledgeIndexingService: KnowledgeIndexingService | undefined;
+  let knowledgeRetriever: KnowledgeRetriever | undefined;
+  let knowledgeStore: SqliteAgentStore | undefined;
+  let knowledgeIndexQueue: KnowledgeIndexQueue | undefined;
 
   if (!coordinator) {
     const agentStore = await SqliteAgentStore.create({
       databasePath: options.databasePath ?? env.AGENT_SQLITE_PATH
     });
+    knowledgeStore = agentStore;
+    knowledgeIndexingService = new KnowledgeIndexingService({
+      store: agentStore,
+      embeddingService
+    });
+    knowledgeRetriever = new KnowledgeRetriever({
+      store: agentStore,
+      embeddingService
+    });
+    // 同一个 registry 同时服务两条路径：
+    // 1. getDefinitions() 给 LLM 看有哪些工具；
+    // 2. ToolExecutor 执行时按 toolName 找到真实工具。
+    const toolRegistry = createDefaultToolRegistry({
+      tavilyApiKey: env.TAVILY_API_KEY,
+      searchMaxResults: env.SEARCH_MAX_RESULTS,
+      knowledgeRetriever,
+      jimengImage: {
+        accessKeyId: env.VOLCENGINE_ACCESS_KEY_ID,
+        secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY
+      },
+      jimengImageEdit: {
+        accessKeyId: env.VOLCENGINE_ACCESS_KEY_ID,
+        secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY,
+        uploadDirectory
+      },
+      jimengVideo: {
+        accessKeyId: env.VOLCENGINE_ACCESS_KEY_ID,
+        secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY,
+        uploadDirectory
+      }
+    });
+    const agentService =
+      options.agentService ??
+      new AgentService({
+        provider: defaultProvider,
+        toolRegistry,
+        toolAccessPolicy,
+        // 工具超时放在 executor，而不是每个工具自己处理，保证所有工具都有统一兜底。
+        toolExecutor: new ToolExecutor({
+          registry: toolRegistry,
+          timeoutMs: env.AGENT_TOOL_TIMEOUT_MS,
+          accessPolicy: toolAccessPolicy
+        }),
+        defaultMaxIterations: env.AGENT_MAX_ITERATIONS
+      });
     const agentEventLogger =
       options.agentEventLogger ??
       new JsonlAgentEventLogger(resolve(options.agentEventLogPath ?? env.AGENT_EVENT_LOG_PATH));
     let redisRuntime: RedisRuntime | undefined;
     let runQueueClient: { close(): Promise<void> } | undefined;
+    let knowledgeQueueClient: { close(): Promise<void> } | undefined;
 
     // 产品运行时固定用 Redis/BullMQ 做跨进程协调；内存实现只通过 BuildAppOptions 注入给单元测试。
     // 这里一次性创建 RedisRuntime，是为了让 API、SSE 和 Worker 共享同一套连接生命周期：
@@ -210,6 +252,17 @@ export async function buildApp(options: BuildAppOptions = {}) {
         runQueueClient = queueClient;
         return new BullMqAgentRunQueue({ queue: queueClient as AgentRunQueueClient });
       })();
+    knowledgeIndexQueue =
+      options.knowledgeIndexQueue ??
+      (options.runQueue
+        ? new NoopKnowledgeIndexQueue()
+        : (() => {
+            const queueClient = new Queue<KnowledgeIndexJobPayload>(env.AGENT_QUEUE_NAME, {
+              connection: toBullMqRedisConnectionOptions(env.REDIS_URL)
+            });
+            knowledgeQueueClient = queueClient;
+            return new BullMqKnowledgeIndexQueue({ queue: queueClient });
+          })());
     // 取消和锁都按 run 维度存 Redis。这样即使 API 和 Worker 不在同一个 Node 进程，
     // API 写入的取消信号、Worker 抢到的执行锁也能被另一边看到。
     const cancellationStore =
@@ -260,11 +313,13 @@ export async function buildApp(options: BuildAppOptions = {}) {
       }
     );
     (app as typeof app & { agentCoordinator?: AgentMessageCoordinator }).agentCoordinator = coordinator;
+    (app as typeof app & { knowledgeIndexingService?: KnowledgeIndexingService }).knowledgeIndexingService = knowledgeIndexingService;
 
     app.addHook("onClose", async () => {
       await coordinator?.shutdown("服务关闭");
       // 关闭顺序从“还可能产生任务/事件的上层”到“底层连接”：先停 queue，再断 Redis，最后关 SQLite。
       await runQueueClient?.close();
+      await knowledgeQueueClient?.close();
       redisRuntime?.close();
       agentStore.close();
     });
@@ -285,6 +340,14 @@ export async function buildApp(options: BuildAppOptions = {}) {
 
   await registerHealthRoutes(app);
   await registerAgentRoutes(app, coordinator, { uploadDirectory });
+  if (knowledgeStore && knowledgeRetriever) {
+    await registerKnowledgeRoutes(app, {
+      uploadDirectory,
+      store: knowledgeStore,
+      indexQueue: knowledgeIndexQueue!,
+      retriever: knowledgeRetriever
+    });
+  }
 
   return app;
 }

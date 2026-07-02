@@ -33,6 +33,10 @@ function isToolEvent(event: AgentStreamEvent): event is ToolEvent {
   );
 }
 
+function isHiddenToolTrace(toolName: string) {
+  return toolName === "knowledge_search";
+}
+
 function getToolTraceId(event: ToolEvent) {
   // 新事件都有 toolCallId，它是最可靠的聚合 key。
   // 旧的持久化事件可能没有 toolCallId，所以用 iteration + toolName 做兜底；
@@ -134,6 +138,10 @@ export function buildToolTraces(events: AgentStreamEvent[]): ToolTrace[] {
 
   for (const event of events) {
     if (!isToolEvent(event)) {
+      continue;
+    }
+
+    if (isHiddenToolTrace(event.toolName)) {
       continue;
     }
 

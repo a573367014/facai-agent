@@ -44,6 +44,19 @@ describe("ToolRegistry", () => {
     expect(withSearch.getDefinitions().map((tool) => tool.name)).toContain("web_search");
   });
 
+  it("配置知识库检索器后注册 knowledge_search 工具", () => {
+    const withoutKnowledge = createDefaultToolRegistry();
+    const withKnowledge = createDefaultToolRegistry({
+      knowledgeRetriever: {
+        search: async () => []
+      }
+    });
+
+    expect(withoutKnowledge.getTool("knowledge_search")).toBeUndefined();
+    expect(withKnowledge.getTool("knowledge_search")).toBeDefined();
+    expect(withKnowledge.getDefinitions().map((tool) => tool.name)).toContain("knowledge_search");
+  });
+
   it("配置火山 AK/SK 后注册 generate_image、edit_image 和 generate_video 工具", () => {
     const withoutImage = createDefaultToolRegistry();
     const withImage = createDefaultToolRegistry({
