@@ -40,16 +40,14 @@ local state = cjson.decode(encoded_state)
 local parts = state["parts"] or {}
 local part_index = nil
 
-for index, part in ipairs(parts) do
-  if part["type"] == "text" then
-    part_index = index
-    break
-  end
-end
+local last_index = #parts
+local last_part = parts[last_index]
 
-if not part_index then
-  table.insert(parts, 1, { type = "text", value = "" })
-  part_index = 1
+if last_part and last_part["type"] == "text" then
+  part_index = last_index
+else
+  table.insert(parts, { type = "text", value = "" })
+  part_index = #parts
 end
 
 local part = parts[part_index]

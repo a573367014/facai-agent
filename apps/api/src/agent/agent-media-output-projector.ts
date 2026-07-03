@@ -43,7 +43,7 @@ type EnsureToolCallRecord = (
   },
   runId: string | undefined,
   status: AgentToolCallRecord["status"]
-) => AgentToolCallRecord | undefined;
+) => Promise<AgentToolCallRecord | undefined>;
 
 export interface AgentMediaOutputProjectorOptions {
   store: AgentStore;
@@ -82,11 +82,11 @@ export class AgentMediaOutputProjector {
     if (isImageOutputToolName(event.toolName) && event.toolCallId) {
       // tool_start 时先创建 pending resource + pending media part。
       // 用户能立刻看到“图片生成中”的占位，后续 tool_result/tool_error 再更新同一个资源和 part。
-      const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
+      const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
       const imageSlots = extractImageRequestSlots(event.arguments);
 
       for (const slot of imageSlots) {
-        const resource = this.upsertImageResource(messageId, {
+        const resource = await this.upsertImageResource(messageId, {
           status: "pending",
           toolCallId: event.toolCallId,
           toolCallRowId: toolCall?.id,
@@ -125,9 +125,9 @@ export class AgentMediaOutputProjector {
     if (isVideoOutputToolName(event.toolName) && event.toolCallId) {
       // 视频也按同一套资源模型处理，只是 mime/type 不同。
       // 这样前端 MessagePartRenderer 可以统一渲染 pending/succeeded/failed 生命周期。
-      const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
+      const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
       const videoSlot = extractVideoRequestSlot(event.arguments);
-      const resource = this.upsertImageResource(messageId, {
+      const resource = await this.upsertImageResource(messageId, {
         type: "video",
         status: "pending",
         toolCallId: event.toolCallId,
@@ -185,8 +185,8 @@ export class AgentMediaOutputProjector {
     if (isImageOutputToolName(event.toolName) && event.toolCallId) {
       // 媒体工具失败也要写成 failed resource/part。
       // 这样用户在正文里能看到失败位置，审计侧也能按 resource/tool_call 追失败原因。
-      const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
-      const resource = this.upsertImageResource(messageId, {
+      const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
+      const resource = await this.upsertImageResource(messageId, {
         status: "failed",
         toolCallId: event.toolCallId,
         toolCallRowId: toolCall?.id,
@@ -203,7 +203,7 @@ export class AgentMediaOutputProjector {
       }, runId);
 
       if (toolCall) {
-        this.store.updateToolCall(toolCall.id, {
+        await this.store.updateToolCall(toolCall.id, {
           status: "failed",
           durationMs: event.durationMs,
           error: {
@@ -232,8 +232,8 @@ export class AgentMediaOutputProjector {
 
     if (isVideoOutputToolName(event.toolName) && event.toolCallId) {
       // 视频失败路径和图片一致：tool_call 记录审计结果，resource/part 负责前端展示失败位。
-      const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
-      const resource = this.upsertImageResource(messageId, {
+      const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
+      const resource = await this.upsertImageResource(messageId, {
         type: "video",
         status: "failed",
         toolCallId: event.toolCallId,
@@ -252,7 +252,7 @@ export class AgentMediaOutputProjector {
       }, runId);
 
       if (toolCall) {
-        this.store.updateToolCall(toolCall.id, {
+        await this.store.updateToolCall(toolCall.id, {
           status: "failed",
           durationMs: event.durationMs,
           error: {
@@ -287,14 +287,14 @@ export class AgentMediaOutputProjector {
     event: Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: string; toolCallId: string },
     runId?: string
   ) {
-    const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
+    const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
     const assets = extractImageAssets(event.result, 0);
     const failedAssets = extractFailedImageAssets(event.result, 0);
 
     // 批量生图可能“部分成功”：成功项写 succeeded，失败项写 failed。
     // 这里不因为 failedAssets 存在就让整条 tool_call 失败，因为工具本身已经正常返回了结构化结果。
     if (toolCall) {
-      this.store.updateToolCall(toolCall.id, {
+      await this.store.updateToolCall(toolCall.id, {
         status: "succeeded",
         durationMs: event.durationMs,
         resultSummary: compactJsonObject({
@@ -305,7 +305,7 @@ export class AgentMediaOutputProjector {
     }
 
     for (const asset of failedAssets) {
-      const resource = this.upsertImageResource(messageId, {
+      const resource = await this.upsertImageResource(messageId, {
         status: "failed",
         toolCallId: event.toolCallId,
         toolCallRowId: toolCall?.id,
@@ -382,7 +382,7 @@ export class AgentMediaOutputProjector {
         continue;
       }
 
-      const resource = this.upsertImageResource(messageId, {
+      const resource = await this.upsertImageResource(messageId, {
         status: "succeeded",
         toolCallId: event.toolCallId,
         toolCallRowId: toolCall?.id,
@@ -428,13 +428,13 @@ export class AgentMediaOutputProjector {
     event: Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: string; toolCallId: string },
     runId?: string
   ) {
-    const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
+    const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
     const assets = extractVideoAssets(event.result, 0);
 
     // 只要工具正常返回结构化结果，tool_call 就算 succeeded；
     // 视频文件保存失败会在 resource/message part 层体现，不反向把模型工具调用判失败。
     if (toolCall) {
-      this.store.updateToolCall(toolCall.id, {
+      await this.store.updateToolCall(toolCall.id, {
         status: "succeeded",
         durationMs: event.durationMs,
         resultSummary: compactJsonObject({
@@ -472,7 +472,7 @@ export class AgentMediaOutputProjector {
         continue;
       }
 
-      const resource = this.upsertImageResource(messageId, {
+      const resource = await this.upsertImageResource(messageId, {
         type: "video",
         status: "succeeded",
         toolCallId: event.toolCallId,
@@ -537,7 +537,7 @@ export class AgentMediaOutputProjector {
       // 已生成的远端资源可能存在，但我们无法稳定保存，所以给用户展示“资源保存失败”的 part。
       const detail = toErrorDetail(error);
       const mime = input.mime ?? (input.type === "video" ? "video/mp4" : "image/png");
-      const resource = this.upsertImageResource(messageId, {
+      const resource = await this.upsertImageResource(messageId, {
         type: input.type,
         status: "failed",
         toolCallId: input.toolCallId,
@@ -578,7 +578,7 @@ export class AgentMediaOutputProjector {
   }
 
   private async upsertMediaPart(messageId: string, input: GeneratedImagePartInput, runId?: string) {
-    const message = this.store.getMessage(messageId);
+    const message = await this.store.getMessage(messageId);
 
     if (!message) {
       return;
@@ -608,7 +608,7 @@ export class AgentMediaOutputProjector {
     }, runId);
   }
 
-  private upsertImageResource(
+  private async upsertImageResource(
     messageId: string,
     input: {
       type?: "image" | "video";
@@ -624,21 +624,21 @@ export class AgentMediaOutputProjector {
       metadata?: JsonObject;
     },
     runId?: string
-  ): AgentResourceRecord {
-    const message = this.store.getMessage(messageId);
+  ): Promise<AgentResourceRecord> {
+    const message = await this.store.getMessage(messageId);
 
     if (!message) {
       throw new AppError("VALIDATION_ERROR", `未找到助手消息：${messageId}`, 404);
     }
 
     const resourceType = input.type ?? "image";
-    const existingResource = this.findImageResource(messageId, input.toolCallId, input.outputIndex, resourceType);
+    const existingResource = await this.findImageResource(messageId, input.toolCallId, input.outputIndex, resourceType);
 
     if (existingResource) {
       // pending -> succeeded/failed 走 update，而不是新建 resource。
       // 这样同一个 resourceId 能贯穿占位、完成和失败状态，前端引用也更稳定。
       const resource =
-        this.store.updateResource(existingResource.id, {
+        (await this.store.updateResource(existingResource.id, {
           toolCallId: input.toolCallId,
           toolCallRowId: input.toolCallRowId,
           mime: input.mime,
@@ -648,19 +648,19 @@ export class AgentMediaOutputProjector {
           width: input.width,
           height: input.height,
           metadata: input.metadata ?? existingResource.metadata
-        }) ?? existingResource;
+        })) ?? existingResource;
       this.appendEvent(messageId, { type: "resource.updated", resource }, runId);
       return resource;
     }
 
     const reusableFailedResource =
-      resourceType === "image" ? this.findReusableFailedImageResource(messageId, input.metadata) : undefined;
+      resourceType === "image" ? await this.findReusableFailedImageResource(messageId, input.metadata) : undefined;
 
     if (reusableFailedResource) {
       // 对于同 prompt 的失败占位，后续成功结果可以复用原 resource。
       // 这样失败占位会自然被替换成成功图片，而不是同一位置重复出现两张卡片。
       const resource =
-        this.store.updateResource(reusableFailedResource.id, {
+        (await this.store.updateResource(reusableFailedResource.id, {
           toolCallId: input.toolCallId,
           toolCallRowId: input.toolCallRowId,
           mime: input.mime,
@@ -670,12 +670,12 @@ export class AgentMediaOutputProjector {
           width: input.width,
           height: input.height,
           metadata: input.metadata ?? reusableFailedResource.metadata
-        }) ?? reusableFailedResource;
+        })) ?? reusableFailedResource;
       this.appendEvent(messageId, { type: "resource.updated", resource }, runId);
       return resource;
     }
 
-    const resource = this.store.createResource({
+    const resource = await this.store.createResource({
       sessionId: message.sessionId,
       messageId,
       toolCallId: input.toolCallId,
@@ -693,16 +693,16 @@ export class AgentMediaOutputProjector {
     return resource;
   }
 
-  private findImageResource(
+  private async findImageResource(
     messageId: string,
     toolCallId: string,
     outputIndex: number,
     resourceType = "image"
-  ): AgentResourceRecord | undefined {
+  ): Promise<AgentResourceRecord | undefined> {
     // 同一个工具调用可能产出多张图，outputIndex 用来找到对应槽位。
     // 老数据可能没有 outputIndex，所以 index=0 时允许回退到未标记的 resource。
-    const resources = this.store
-      .getResourcesByMessages([messageId])
+    const resources = (await this.store
+      .getResourcesByMessages([messageId]))
       .filter((resource) => resource.type === resourceType && resource.toolCallId === toolCallId);
     const resourceWithOutputIndex = resources.find(
       (resource) => toOptionalNumber(resource.metadata?.outputIndex) === outputIndex
@@ -719,7 +719,7 @@ export class AgentMediaOutputProjector {
     return undefined;
   }
 
-  private findReusableFailedImageResource(messageId: string, metadata?: JsonObject): AgentResourceRecord | undefined {
+  private async findReusableFailedImageResource(messageId: string, metadata?: JsonObject): Promise<AgentResourceRecord | undefined> {
     // 有些 provider 会先返回失败 item，随后又返回同 prompt 的成功图。
     // 这里用 prompt/sourceImageUrl 复用失败 resource，让同一个位置从 failed 变成 succeeded。
     const prompt = toOptionalString(metadata?.prompt);
@@ -729,8 +729,8 @@ export class AgentMediaOutputProjector {
       return undefined;
     }
 
-    return this.store
-      .getResourcesByMessages([messageId])
+    return (await this.store
+      .getResourcesByMessages([messageId]))
       .find(
         (resource) =>
           resource.type === "image" &&

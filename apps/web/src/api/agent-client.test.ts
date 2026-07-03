@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { resolveApiBaseUrl, startAgentRun, uploadAgentImage } from "./agent-client";
+import { resolveApiBaseUrl, startAgentRun, uploadAgentImage, uploadKnowledgeDocument } from "./agent-client";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -53,6 +53,43 @@ describe("resolveApiBaseUrl", () => {
         body: expect.any(FormData)
       })
     );
+  });
+
+  it("uploadKnowledgeDocument 使用 document 字段上传文件并返回文档记录", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          document: {
+            id: "knowledge_doc_1",
+            name: "员工手册.pdf",
+            mimeType: "application/pdf",
+            sourcePath: "/tmp/员工手册.pdf",
+            status: "pending",
+            contentHash: "hash",
+            chunkCount: 0,
+            createdAt: "2026-07-01T00:00:00.000Z",
+            updatedAt: "2026-07-01T00:00:00.000Z"
+          }
+        }),
+        { status: 201, headers: { "content-type": "application/json" } }
+      )
+    );
+
+    await expect(uploadKnowledgeDocument(new File(["abc"], "员工手册.pdf", { type: "application/pdf" }))).resolves.toMatchObject({
+      id: "knowledge_doc_1",
+      name: "员工手册.pdf",
+      status: "pending"
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4001/knowledge/documents/upload",
+      expect.objectContaining({
+        method: "POST",
+        body: expect.any(FormData)
+      })
+    );
+    const body = fetchMock.mock.calls[0][1]?.body as FormData;
+    expect(body.get("document")).toBeInstanceOf(File);
   });
 
   it("startAgentRun 不再发送前端迭代次数，交给后端默认值", async () => {

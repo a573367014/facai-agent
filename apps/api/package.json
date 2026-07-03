@@ -22,12 +22,15 @@
     "expr-eval": "^2.0.2",
     "fastify": "^5.2.1",
     "ioredis": "^5.11.1",
-    "sql.js": "^1.14.1",
+    "mammoth": "^1.12.0",
+    "pdf-parse": "^2.4.5",
+    "pg": "^8.13.1",
+    "word-extractor": "^1.0.4",
     "zod": "^3.24.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
-    "@types/sql.js": "^1.4.11",
+    "@types/pg": "^8.11.10",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"

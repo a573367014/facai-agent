@@ -51,11 +51,15 @@ class FakeRedisClient implements RedisRunningMessageClient {
 
     if (script.includes("delta")) {
       const [, delta, updatedAt, ttlSeconds] = args;
-      let partIndex = state.parts.findIndex((part) => part.type === "text");
+      const lastIndex = state.parts.length - 1;
+      const lastPart = state.parts[lastIndex];
+      let partIndex;
 
-      if (partIndex === -1) {
-        state.parts.unshift({ type: "text", value: "" });
-        partIndex = 0;
+      if (lastPart && lastPart.type === "text") {
+        partIndex = lastIndex;
+      } else {
+        state.parts.push({ type: "text", value: "" });
+        partIndex = state.parts.length - 1;
       }
 
       state.parts[partIndex] = {
@@ -173,5 +177,38 @@ describe("RedisRunningMessageStateStore", () => {
     await store.remove("msg_1");
 
     expect(await store.get("msg_1")).toBeUndefined();
+  });
+
+  it("appends text delta after a media part into a new trailing text part", async () => {
+    const client = new FakeRedisClient();
+    const store = new RedisRunningMessageStateStore({
+      client,
+      keyPrefix: "agent:test",
+      ttlSeconds: 60,
+      now: () => "2026-06-28T10:03:00.000Z"
+    });
+
+    await store.init({
+      messageId: "msg_1",
+      sessionId: "session_1",
+      parts: [
+        { type: "text", value: "好的，我来生成图片！" },
+        { type: "media", mime: "image/png", extra: { resource: { id: "res_1" } } }
+      ]
+    });
+
+    const result = await store.appendTextDelta("msg_1", "图片已生成~");
+
+    expect(result).toMatchObject({
+      partIndex: 2,
+      state: {
+        parts: [
+          { type: "text", value: "好的，我来生成图片！" },
+          { type: "media", mime: "image/png", extra: { resource: { id: "res_1" } } },
+          { type: "text", value: "图片已生成~" }
+        ],
+        version: 1
+      }
+    });
   });
 });

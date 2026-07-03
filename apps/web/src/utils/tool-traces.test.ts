@@ -126,6 +126,31 @@ describe("buildToolTraces", () => {
     ]);
   });
 
+  it("隐藏 knowledge_search 工具轨迹", () => {
+    const events: AgentStreamEvent[] = [
+      {
+        type: "tool_start",
+        iteration: 0,
+        toolCallId: "call_knowledge",
+        toolName: "knowledge_search",
+        arguments: { query: "请假流程" }
+      },
+      {
+        type: "tool_result",
+        iteration: 0,
+        toolCallId: "call_knowledge",
+        toolName: "knowledge_search",
+        result: {
+          query: "请假流程",
+          results: [{ content: "请假需要主管审批。", source: "员工手册.txt #1" }]
+        },
+        durationMs: 12
+      }
+    ];
+
+    expect(buildToolTraces(events)).toEqual([]);
+  });
+
   it("批量生图进度会合成可预览的临时图片结果", () => {
     const events: AgentStreamEvent[] = [
       {

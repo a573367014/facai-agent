@@ -1,38 +1,25 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { InMemoryAgentCancellationStore } from "../../src/agent/agent-cancellation-store.js";
 import { InMemoryAgentEventBus } from "../../src/agent/agent-event-bus.js";
 import { InMemoryAgentRunLock } from "../../src/agent/agent-run-lock.js";
 import type { AgentRunJobPayload, AgentRunQueue } from "../../src/agent/agent-run-queue.js";
 import { AgentService } from "../../src/agent/agent-service.js";
+import { PostgresAgentStore } from "../../src/agent/postgres-agent-store.js";
 import { InMemoryRunningMessageStateStore } from "../../src/agent/running-message-state-store.js";
-import { SqliteAgentStore } from "../../src/agent/sqlite-agent-store.js";
 import { buildApp } from "../../src/app.js";
 import type { LlmProvider } from "../../src/providers/types.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
 import { ToolRegistry } from "../../src/tools/registry.js";
 import type { MessagePart } from "../../src/agent/message-parts.js";
 
-let tempDirs: string[] = [];
+const TEST_DATABASE_URL = process.env.DATABASE_URL ?? "postgres://postgres:postgres@localhost:5432/agent_test";
 
 class NoopAgentRunQueue implements AgentRunQueue {
   async enqueueRun(_payload: AgentRunJobPayload): Promise<void> {}
 }
 
-function createTempDatabasePath() {
-  const dir = mkdtempSync(join(tmpdir(), "agent-store-"));
-  tempDirs.push(dir);
-  return join(dir, "agent.sqlite");
-}
-
 afterEach(() => {
   vi.useRealTimers();
-  for (const dir of tempDirs) {
-    rmSync(dir, { recursive: true, force: true });
-  }
-  tempDirs = [];
 });
 
 function createTestAgentService(): AgentService {
@@ -48,51 +35,124 @@ function createTestAgentService(): AgentService {
   });
 }
 
-describe("SqliteAgentStore", () => {
+describe("PostgresAgentStore", () => {
+  it("保存知识库文档并且只搜索 ready 文档的 chunk", async () => {
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL, vectorDimension: 2 });
+    await store.reset();
+    const readyDocument = await store.createKnowledgeDocument({
+      name: "员工手册.pdf",
+      mimeType: "application/pdf",
+      sourcePath: "/tmp/员工手册.pdf",
+      contentHash: "hash-ready-001"
+    });
+    const indexingDocument = await store.createKnowledgeDocument({
+      name: "草稿制度.docx",
+      mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      sourcePath: "/tmp/草稿制度.docx",
+      contentHash: "hash-indexing-002"
+    });
+
+    await store.replaceKnowledgeChunks(readyDocument.id, [
+      {
+        chunkIndex: 0,
+        content: "请假需要直属主管审批。",
+        sourceLabel: "员工手册.pdf 第 3 页",
+        embeddingModel: "test-embedding",
+        embedding: [1, 0],
+        metadata: { page: 3 }
+      },
+      {
+        chunkIndex: 1,
+        content: "报销需要提交发票。",
+        sourceLabel: "员工手册.pdf 第 5 页",
+        embeddingModel: "test-embedding",
+        embedding: [0, 1]
+      }
+    ]);
+    await store.replaceKnowledgeChunks(indexingDocument.id, [
+      {
+        chunkIndex: 0,
+        content: "草稿制度暂不应该被搜索。",
+        sourceLabel: "草稿制度.docx",
+        embeddingModel: "test-embedding",
+        embedding: [1, 0]
+      }
+    ]);
+    await store.updateKnowledgeDocument(readyDocument.id, {
+      status: "ready",
+      chunkCount: 2,
+      indexedAt: "2026-07-01T00:00:00.000Z"
+    });
+    await store.updateKnowledgeDocument(indexingDocument.id, {
+      status: "indexing"
+    });
+
+    const results = await store.searchKnowledgeChunks({
+      queryEmbedding: [1, 0],
+      limit: 5
+    });
+
+    expect(results.map((result) => result.content)).toEqual(["请假需要直属主管审批。", "报销需要提交发票。"]);
+    expect(results[0]).toMatchObject({
+      documentId: readyDocument.id,
+      documentName: "员工手册.pdf",
+      sourceLabel: "员工手册.pdf 第 3 页",
+      metadata: { page: 3 }
+    });
+    expect(results.some((result) => result.documentId === indexingDocument.id)).toBe(false);
+
+    await store.deleteKnowledgeDocument(readyDocument.id);
+    expect(await store.getKnowledgeDocument(readyDocument.id)).toBeUndefined();
+    expect(await store.searchKnowledgeChunks({ queryEmbedding: [1, 0], limit: 5 })).toEqual([]);
+    await store.close();
+  });
+
   it("支持按消息游标读取最近消息、历史消息和新增消息", async () => {
-    const databasePath = createTempDatabasePath();
-    const store = await SqliteAgentStore.create({ databasePath });
-    const session = store.createSession("分页会话");
-    const messages = Array.from({ length: 6 }, (_, index) =>
-      store.createMessage({
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
+    const session = await store.createSession("分页会话");
+    const messages: { id: string }[] = [];
+    for (let index = 0; index < 6; index += 1) {
+      const message = await store.createMessage({
         sessionId: session.id,
         role: index % 2 === 0 ? "user" : "assistant",
         status: "completed",
         parts: [{ type: "text", value: `消息 ${index + 1}` }]
-      })
-    );
+      });
+      messages.push({ id: message.id });
+    }
 
-    expect(store.getRecentMessagesBySession(session.id, 3).map((message) => message.id)).toEqual(
+    expect((await store.getRecentMessagesBySession(session.id, 3)).map((message) => message.id)).toEqual(
       messages.slice(3).map((message) => message.id)
     );
-    expect(store.getMessagesBefore(session.id, messages[3].id, 2).map((message) => message.id)).toEqual([
+    expect((await store.getMessagesBefore(session.id, messages[3].id, 2)).map((message) => message.id)).toEqual([
       messages[1].id,
       messages[2].id
     ]);
-    expect(store.countMessagesAfter(session.id, messages[1].id)).toBe(4);
-    expect(store.getMessagesAfter(session.id, messages[1].id, 2).map((message) => message.id)).toEqual([
+    expect(await store.countMessagesAfter(session.id, messages[1].id)).toBe(4);
+    expect((await store.getMessagesAfter(session.id, messages[1].id, 2)).map((message) => message.id)).toEqual([
       messages[2].id,
       messages[3].id
     ]);
-    expect(store.getRecentMessagesAfter(session.id, messages[1].id, 2).map((message) => message.id)).toEqual([
+    expect((await store.getRecentMessagesAfter(session.id, messages[1].id, 2)).map((message) => message.id)).toEqual([
       messages[4].id,
       messages[5].id
     ]);
-    store.close();
+    await store.close();
   });
 
   it("重新创建 store 后仍能读回结构化会话摘要", async () => {
-    const databasePath = createTempDatabasePath();
-    const firstStore = await SqliteAgentStore.create({ databasePath });
-    const session = firstStore.createSession("摘要会话");
-    const userMessage = firstStore.createMessage({
+    const firstStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await firstStore.reset();
+    const session = await firstStore.createSession("摘要会话");
+    const userMessage = await firstStore.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "第一轮问题" }]
     });
 
-    firstStore.upsertSessionSummary({
+    await firstStore.upsertSessionSummary({
       sessionId: session.id,
       coveredMessageId: userMessage.id,
       summary: {
@@ -101,16 +161,16 @@ describe("SqliteAgentStore", () => {
         decisions: ["采用滚动摘要"],
         preferences: ["使用中文解释"],
         constraints: [],
-        importantFacts: ["项目使用 SQLite"],
+        importantFacts: ["项目使用 PostgreSQL"],
         openQuestions: [],
         recentProgress: ["已完成摘要表设计"]
       }
     });
-    firstStore.close();
+    await firstStore.close();
 
-    const secondStore = await SqliteAgentStore.create({ databasePath });
+    const secondStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
 
-    expect(secondStore.getSessionSummary(session.id)).toMatchObject({
+    expect(await secondStore.getSessionSummary(session.id)).toMatchObject({
       id: expect.any(String),
       sessionId: session.id,
       version: 1,
@@ -123,88 +183,88 @@ describe("SqliteAgentStore", () => {
         decisions: ["采用滚动摘要"]
       }
     });
-    secondStore.close();
+    await secondStore.close();
   });
 
   it("多个已打开 store 会在文件变化后读到彼此写入", async () => {
-    const databasePath = createTempDatabasePath();
-    const apiStore = await SqliteAgentStore.create({ databasePath });
-    const workerStore = await SqliteAgentStore.create({ databasePath });
+    const apiStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await apiStore.reset();
+    const workerStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
 
     try {
-      const session = apiStore.createSession("queue session");
-      const userMessage = apiStore.createMessage({
+      const session = await apiStore.createSession("queue session");
+      const userMessage = await apiStore.createMessage({
         sessionId: session.id,
         role: "user",
         status: "completed",
         parts: [{ type: "text", value: "排队执行" }]
       });
-      const run = apiStore.createRun({
+      const run = await apiStore.createRun({
         sessionId: session.id,
         userMessageId: userMessage.id,
         status: "running",
         phase: "answering"
       });
 
-      expect(workerStore.getRun(run.id)).toMatchObject({
+      expect(await workerStore.getRun(run.id)).toMatchObject({
         id: run.id,
         status: "running"
       });
 
-      const assistantMessage = workerStore.createMessage({
+      const assistantMessage = await workerStore.createMessage({
         sessionId: session.id,
         role: "assistant",
         status: "completed",
         parts: [{ type: "text", value: "完成" }]
       });
-      workerStore.updateRun(run.id, {
+      await workerStore.updateRun(run.id, {
         status: "completed",
         phase: "completed",
         assistantMessageId: assistantMessage.id
       });
 
-      expect(apiStore.getRun(run.id)).toMatchObject({
+      expect(await apiStore.getRun(run.id)).toMatchObject({
         id: run.id,
         status: "completed",
         phase: "completed",
         assistantMessageId: assistantMessage.id
       });
     } finally {
-      apiStore.close();
-      workerStore.close();
+      await apiStore.close();
+      await workerStore.close();
     }
   });
 
   it("按版本追加 session summary，并能查询某条消息之前可用的摘要", async () => {
-    const databasePath = createTempDatabasePath();
-    const firstStore = await SqliteAgentStore.create({ databasePath });
-    const session = firstStore.createSession("摘要版本会话");
-    const firstUser = firstStore.createMessage({
+    const firstStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await firstStore.reset();
+    const session = await firstStore.createSession("摘要版本会话");
+    const firstUser = await firstStore.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "第一轮" }]
     });
-    const firstAssistant = firstStore.createMessage({
+    const firstAssistant = await firstStore.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "completed",
       parts: [{ type: "text", value: "第一轮回答" }]
     });
-    const secondUser = firstStore.createMessage({
+    const secondUser = await firstStore.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "第二轮" }]
     });
-    const secondAssistant = firstStore.createMessage({
+    const secondAssistant = await firstStore.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "completed",
       parts: [{ type: "text", value: "第二轮回答" }]
     });
 
-    const firstSummary = firstStore.upsertSessionSummary({
+    const firstSummary = await firstStore.upsertSessionSummary({
       sessionId: session.id,
       coveredMessageId: firstAssistant.id,
       summary: {
@@ -218,7 +278,7 @@ describe("SqliteAgentStore", () => {
         recentProgress: []
       }
     });
-    const secondSummary = firstStore.upsertSessionSummary({
+    const secondSummary = await firstStore.upsertSessionSummary({
       sessionId: session.id,
       coveredMessageId: secondAssistant.id,
       summary: {
@@ -232,168 +292,168 @@ describe("SqliteAgentStore", () => {
         recentProgress: []
       }
     });
-    firstStore.close();
+    await firstStore.close();
 
-    const secondStore = await SqliteAgentStore.create({ databasePath });
+    const secondStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
 
-    expect(secondStore.listSessionSummaries(session.id).map((summary) => summary.version)).toEqual([1, 2]);
-    expect(secondStore.getSessionSummary(session.id)).toMatchObject({
+    expect((await secondStore.listSessionSummaries(session.id)).map((summary) => summary.version)).toEqual([1, 2]);
+    expect(await secondStore.getSessionSummary(session.id)).toMatchObject({
       id: secondSummary.id,
       version: 2,
       summary: { decisions: ["v2"] }
     });
-    expect(secondStore.getSessionSummaryBeforeMessage(session.id, firstUser.id)).toBeUndefined();
-    expect(secondStore.getSessionSummaryBeforeMessage(session.id, secondUser.id)).toMatchObject({
+    expect(await secondStore.getSessionSummaryBeforeMessage(session.id, firstUser.id)).toBeUndefined();
+    expect(await secondStore.getSessionSummaryBeforeMessage(session.id, secondUser.id)).toMatchObject({
       id: firstSummary.id,
       version: 1,
       summary: { decisions: ["v1"] }
     });
-    secondStore.close();
+    await secondStore.close();
   });
 
   it("重新创建 store 后仍能读回 message parts", async () => {
-    const databasePath = createTempDatabasePath();
-    const firstStore = await SqliteAgentStore.create({ databasePath });
-    const session = firstStore.createSession("parts 会话");
+    const firstStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await firstStore.reset();
+    const session = await firstStore.createSession("parts 会话");
     const parts: MessagePart[] = [{ type: "text", value: "你好" }];
-    const message = firstStore.createMessage({
+    const message = await firstStore.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts
     });
-    firstStore.close();
+    await firstStore.close();
 
-    const secondStore = await SqliteAgentStore.create({ databasePath });
+    const secondStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
 
-    expect(secondStore.getMessage(message.id)?.parts).toEqual(parts);
-    secondStore.close();
+    expect((await secondStore.getMessage(message.id))?.parts).toEqual(parts);
+    await secondStore.close();
   });
 
   it("能单独更新 message parts 且不改变状态", async () => {
-    const databasePath = createTempDatabasePath();
-    const store = await SqliteAgentStore.create({ databasePath });
-    const session = store.createSession("parts 更新");
-    const message = store.createMessage({
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
+    const session = await store.createSession("parts 更新");
+    const message = await store.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "running",
       parts: [{ type: "text", value: "" }]
     });
 
-    const updated = store.updateMessageParts(message.id, [{ type: "text", value: "流式文本" }]);
+    const updated = await store.updateMessageParts(message.id, [{ type: "text", value: "流式文本" }]);
 
     expect(updated?.status).toBe("running");
     expect(updated?.parts).toEqual([{ type: "text", value: "流式文本" }]);
-    store.close();
+    await store.close();
   });
 
   it("拒绝把终态 message 重新改回 running 或其他终态", async () => {
-    const databasePath = createTempDatabasePath();
-    const store = await SqliteAgentStore.create({ databasePath });
-    const session = store.createSession("消息状态机");
-    const message = store.createMessage({
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
+    const session = await store.createSession("消息状态机");
+    const message = await store.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "running",
       parts: [{ type: "text", value: "" }]
     });
 
-    store.updateMessage(message.id, {
+    await store.updateMessage(message.id, {
       status: "cancelled",
       completedAt: "2026-06-28T10:00:00.000Z"
     });
 
-    expect(() =>
+    await expect(
       store.updateMessage(message.id, {
         status: "completed",
         parts: [{ type: "text", value: "迟到的完成结果" }],
         completedAt: "2026-06-28T10:00:01.000Z"
       })
-    ).toThrow(/非法 message 状态流转/);
-    expect(() => store.updateMessage(message.id, { status: "running" })).toThrow(/非法 message 状态流转/);
-    expect(store.getMessage(message.id)).toMatchObject({
+    ).rejects.toThrow(/非法 message 状态流转/);
+    await expect(store.updateMessage(message.id, { status: "running" })).rejects.toThrow(/非法 message 状态流转/);
+    expect(await store.getMessage(message.id)).toMatchObject({
       status: "cancelled",
       parts: [{ type: "text", value: "" }]
     });
-    store.close();
+    await store.close();
   });
 
   it("拒绝把终态 run 被后续异步回调覆盖", async () => {
-    const databasePath = createTempDatabasePath();
-    const store = await SqliteAgentStore.create({ databasePath });
-    const session = store.createSession("run 状态机");
-    const userMessage = store.createMessage({
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
+    const session = await store.createSession("run 状态机");
+    const userMessage = await store.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "问题" }]
     });
-    const run = store.createRun({
+    const run = await store.createRun({
       sessionId: session.id,
       userMessageId: userMessage.id,
       status: "running",
       phase: "answering"
     });
 
-    store.updateRun(run.id, {
+    await store.updateRun(run.id, {
       status: "cancelled",
       phase: "cancelled",
       completedAt: "2026-06-28T10:00:00.000Z"
     });
 
-    expect(() =>
+    await expect(
       store.updateRun(run.id, {
         status: "completed",
         phase: "completed",
         completedAt: "2026-06-28T10:00:01.000Z"
       })
-    ).toThrow(/非法 run 状态流转/);
-    expect(store.getRun(run.id)).toMatchObject({
+    ).rejects.toThrow(/非法 run 状态流转/);
+    expect(await store.getRun(run.id)).toMatchObject({
       status: "cancelled",
       phase: "cancelled"
     });
-    store.close();
+    await store.close();
   });
 
   it("拒绝 run 终态 status 和 phase 不一致", async () => {
-    const databasePath = createTempDatabasePath();
-    const store = await SqliteAgentStore.create({ databasePath });
-    const session = store.createSession("run phase 状态机");
-    const userMessage = store.createMessage({
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
+    const session = await store.createSession("run phase 状态机");
+    const userMessage = await store.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "问题" }]
     });
-    const run = store.createRun({
+    const run = await store.createRun({
       sessionId: session.id,
       userMessageId: userMessage.id,
       status: "running",
       phase: "answering"
     });
 
-    expect(() => store.updateRun(run.id, { status: "completed", phase: "answering" })).toThrow(
+    await expect(store.updateRun(run.id, { status: "completed", phase: "answering" })).rejects.toThrow(
       /run 终态 phase 不一致/
     );
-    expect(store.getRun(run.id)).toMatchObject({
+    expect(await store.getRun(run.id)).toMatchObject({
       status: "running",
       phase: "answering"
     });
-    store.close();
+    await store.close();
   });
 
   it("持久化工具调用流水，支持按会话聚合查询", async () => {
-    const databasePath = createTempDatabasePath();
-    const firstStore = await SqliteAgentStore.create({ databasePath });
-    const session = firstStore.createSession("工具审计");
-    const assistantMessage = firstStore.createMessage({
+    const firstStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await firstStore.reset();
+    const session = await firstStore.createSession("工具审计");
+    const assistantMessage = await firstStore.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "running",
       parts: [{ type: "text", value: "" }]
     });
-    const toolCall = firstStore.createToolCall({
+    const toolCall = await firstStore.createToolCall({
       sessionId: session.id,
       messageId: assistantMessage.id,
       iteration: 0,
@@ -402,16 +462,16 @@ describe("SqliteAgentStore", () => {
       arguments: { prompt: "小猪" }
     });
 
-    firstStore.updateToolCall(toolCall.id, {
+    await firstStore.updateToolCall(toolCall.id, {
       status: "succeeded",
       durationMs: 123,
       resultSummary: { outputCount: 1 }
     });
-    firstStore.close();
+    await firstStore.close();
 
-    const secondStore = await SqliteAgentStore.create({ databasePath });
+    const secondStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
 
-    expect(secondStore.getToolCallsBySession(session.id)).toEqual([
+    expect(await secondStore.getToolCallsBySession(session.id)).toEqual([
       expect.objectContaining({
         id: toolCall.id,
         sessionId: session.id,
@@ -426,20 +486,20 @@ describe("SqliteAgentStore", () => {
         completedAt: expect.any(String)
       })
     ]);
-    secondStore.close();
+    await secondStore.close();
   });
 
   it("持久化资源实体，支持按消息批量查询", async () => {
-    const databasePath = createTempDatabasePath();
-    const firstStore = await SqliteAgentStore.create({ databasePath });
-    const session = firstStore.createSession("资源会话");
-    const assistantMessage = firstStore.createMessage({
+    const firstStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await firstStore.reset();
+    const session = await firstStore.createSession("资源会话");
+    const assistantMessage = await firstStore.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "running",
       parts: [{ type: "text", value: "" }]
     });
-    const toolCall = firstStore.createToolCall({
+    const toolCall = await firstStore.createToolCall({
       sessionId: session.id,
       messageId: assistantMessage.id,
       iteration: 0,
@@ -447,7 +507,7 @@ describe("SqliteAgentStore", () => {
       toolName: "generate_image",
       arguments: { prompt: "小猪" }
     });
-    const resource = firstStore.createResource({
+    const resource = await firstStore.createResource({
       sessionId: session.id,
       messageId: assistantMessage.id,
       toolCallId: "call_image",
@@ -458,17 +518,17 @@ describe("SqliteAgentStore", () => {
       metadata: { prompt: "小猪", provider: "test_image" }
     });
 
-    firstStore.updateResource(resource.id, {
+    await firstStore.updateResource(resource.id, {
       status: "succeeded",
       url: "https://example.com/pig.png",
       width: 1024,
       height: 1024
     });
-    firstStore.close();
+    await firstStore.close();
 
-    const secondStore = await SqliteAgentStore.create({ databasePath });
+    const secondStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
 
-    expect(secondStore.getResourcesByMessages([assistantMessage.id])).toEqual([
+    expect(await secondStore.getResourcesByMessages([assistantMessage.id])).toEqual([
       expect.objectContaining({
         id: resource.id,
         sessionId: session.id,
@@ -484,20 +544,20 @@ describe("SqliteAgentStore", () => {
         metadata: { prompt: "小猪", provider: "test_image" }
       })
     ]);
-    secondStore.close();
+    await secondStore.close();
   });
 
   it("持久化过程步骤，支持按消息恢复产品化任务进度", async () => {
-    const databasePath = createTempDatabasePath();
-    const firstStore = await SqliteAgentStore.create({ databasePath });
-    const session = firstStore.createSession("过程步骤会话");
-    const assistantMessage = firstStore.createMessage({
+    const firstStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await firstStore.reset();
+    const session = await firstStore.createSession("过程步骤会话");
+    const assistantMessage = await firstStore.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "running",
       parts: [{ type: "text", value: "" }]
     });
-    const step = firstStore.createProcessStep({
+    const step = await firstStore.createProcessStep({
       sessionId: session.id,
       messageId: assistantMessage.id,
       kind: "tool",
@@ -508,17 +568,17 @@ describe("SqliteAgentStore", () => {
       metadata: { toolName: "web_search", toolCallId: "call_search" }
     });
 
-    firstStore.updateProcessStep(step.id, {
+    await firstStore.updateProcessStep(step.id, {
       title: "资料已查找",
       summary: "已搜索 5 个网页",
       status: "succeeded",
       metadata: { toolName: "web_search", toolCallId: "call_search", resultCount: 5 }
     });
-    firstStore.close();
+    await firstStore.close();
 
-    const secondStore = await SqliteAgentStore.create({ databasePath });
+    const secondStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
 
-    expect(secondStore.getProcessStepsByMessages([assistantMessage.id])).toEqual([
+    expect(await secondStore.getProcessStepsByMessages([assistantMessage.id])).toEqual([
       expect.objectContaining({
         id: step.id,
         sessionId: session.id,
@@ -532,39 +592,39 @@ describe("SqliteAgentStore", () => {
         completedAt: expect.any(String)
       })
     ]);
-    secondStore.close();
+    await secondStore.close();
   });
 
   it("重新创建 store 后仍能读回 session 和 messages", async () => {
-    const databasePath = createTempDatabasePath();
-    const firstStore = await SqliteAgentStore.create({ databasePath });
-    const session = firstStore.createSession("图片会话");
-    const userMessage = firstStore.createMessage({
+    const firstStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await firstStore.reset();
+    const session = await firstStore.createSession("图片会话");
+    const userMessage = await firstStore.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "生成图片" }]
     });
-    const assistantMessage = firstStore.createMessage({
+    const assistantMessage = await firstStore.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "running",
       parts: [{ type: "text", value: "" }]
     });
 
-    firstStore.updateMessage(assistantMessage.id, {
+    await firstStore.updateMessage(assistantMessage.id, {
       status: "completed",
       parts: [{ type: "text", value: "你好世界" }],
       completedAt: "2026-06-25T00:00:01.000Z"
     });
-    firstStore.close();
+    await firstStore.close();
 
-    const secondStore = await SqliteAgentStore.create({ databasePath });
-    expect(secondStore.getSession(session.id)).toMatchObject({
+    const secondStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    expect(await secondStore.getSession(session.id)).toMatchObject({
       id: session.id,
       title: "图片会话"
     });
-    expect(secondStore.getMessagesBySession(session.id)).toEqual([
+    expect(await secondStore.getMessagesBySession(session.id)).toEqual([
       expect.objectContaining({
         id: userMessage.id,
         role: "user",
@@ -578,26 +638,26 @@ describe("SqliteAgentStore", () => {
         parts: [{ type: "text", value: "你好世界" }]
       })
     ]);
-    secondStore.close();
+    await secondStore.close();
   });
 
-  it("run events 只通知当前 live 订阅者，不写入 SQLite 回放", async () => {
-    const databasePath = createTempDatabasePath();
-    const firstStore = await SqliteAgentStore.create({ databasePath });
-    const session = firstStore.createSession("统一事件会话");
-    const userMessage = firstStore.createMessage({
+  it("run events 只通知当前 live 订阅者，不写入 Postgres 回放", async () => {
+    const firstStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await firstStore.reset();
+    const session = await firstStore.createSession("统一事件会话");
+    const userMessage = await firstStore.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "重新生成" }]
     });
-    const assistantMessage = firstStore.createMessage({
+    const assistantMessage = await firstStore.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "running",
       parts: [{ type: "text", value: "" }]
     });
-    const run = firstStore.createRun({
+    const run = await firstStore.createRun({
       sessionId: session.id,
       userMessageId: userMessage.id,
       assistantMessageId: assistantMessage.id,
@@ -610,83 +670,84 @@ describe("SqliteAgentStore", () => {
       liveEvents.push(event.event.type);
     });
 
-    firstStore.appendRunEvent(run.id, { type: "iteration_start", iteration: 0 }, assistantMessage.id);
-    firstStore.appendRunEvent(run.id, { type: "run_completed", messageId: assistantMessage.id }, assistantMessage.id);
+    await firstStore.appendRunEvent(run.id, { type: "iteration_start", iteration: 0 }, assistantMessage.id);
+    await firstStore.appendRunEvent(run.id, { type: "run_completed", messageId: assistantMessage.id }, assistantMessage.id);
     unsubscribe();
-    firstStore.close();
+    await firstStore.close();
 
-    const secondStore = await SqliteAgentStore.create({ databasePath });
+    const secondStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
 
     expect(liveEvents).toEqual(["iteration_start", "run_completed"]);
-    secondStore.close();
+    await secondStore.close();
   });
 
   it("能按更新时间倒序列出持久化会话", async () => {
     vi.useFakeTimers();
-    const databasePath = createTempDatabasePath();
-    const firstStore = await SqliteAgentStore.create({ databasePath });
+    const firstStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await firstStore.reset();
     vi.setSystemTime(new Date("2026-06-22T00:00:00.000Z"));
-    const firstSession = firstStore.createSession("旧会话");
+    const firstSession = await firstStore.createSession("旧会话");
     vi.setSystemTime(new Date("2026-06-22T00:00:01.000Z"));
-    const secondSession = firstStore.createSession("新会话");
+    const secondSession = await firstStore.createSession("新会话");
     vi.setSystemTime(new Date("2026-06-22T00:00:02.000Z"));
-    firstStore.createMessage({
+    await firstStore.createMessage({
       sessionId: firstSession.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "更新旧会话" }]
     });
-    firstStore.close();
+    await firstStore.close();
 
-    const secondStore = await SqliteAgentStore.create({ databasePath });
+    const secondStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
 
-    expect(secondStore.listSessions().map((session) => session.id)).toEqual([firstSession.id, secondSession.id]);
-    secondStore.close();
+    expect((await secondStore.listSessions()).map((session) => session.id)).toEqual([firstSession.id, secondSession.id]);
+    await secondStore.close();
   });
 
   it("按 cursor 分页列出会话", async () => {
     vi.useFakeTimers();
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     vi.setSystemTime(new Date("2026-06-22T00:00:00.000Z"));
-    const firstSession = store.createSession("第一页后");
+    const firstSession = await store.createSession("第一页后");
     vi.setSystemTime(new Date("2026-06-22T00:00:01.000Z"));
-    const secondSession = store.createSession("第一页末尾");
+    const secondSession = await store.createSession("第一页末尾");
     vi.setSystemTime(new Date("2026-06-22T00:00:02.000Z"));
-    const thirdSession = store.createSession("第一页第一条");
+    const thirdSession = await store.createSession("第一页第一条");
 
-    const firstPage = store.listSessions({ limit: 2 });
-    const secondPage = store.listSessions({ after: secondSession.id, limit: 2 });
+    const firstPage = await store.listSessions({ limit: 2 });
+    const secondPage = await store.listSessions({ after: secondSession.id, limit: 2 });
 
     expect(firstPage.map((session) => session.id)).toEqual([thirdSession.id, secondSession.id]);
     expect(secondPage.map((session) => session.id)).toEqual([firstSession.id]);
-    store.close();
+    await store.close();
   });
 
   it("删除 session 时级联清理会话相关记录", async () => {
-    const databasePath = createTempDatabasePath();
-    const firstStore = await SqliteAgentStore.create({ databasePath });
-    const session = firstStore.createSession("待删除会话");
-    const otherSession = firstStore.createSession("保留会话");
-    const userMessage = firstStore.createMessage({
+    const firstStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await firstStore.reset();
+    const session = await firstStore.createSession("待删除会话");
+    const otherSession = await firstStore.createSession("保留会话");
+    const userMessage = await firstStore.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "生成图片" }]
     });
-    const assistantMessage = firstStore.createMessage({
+    const assistantMessage = await firstStore.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "completed",
       parts: [{ type: "text", value: "已生成" }]
     });
-    const run = firstStore.createRun({
+    const run = await firstStore.createRun({
       sessionId: session.id,
       userMessageId: userMessage.id,
       assistantMessageId: assistantMessage.id,
       status: "completed",
       phase: "completed"
     });
-    firstStore.createToolCall({
+    await firstStore.createToolCall({
       sessionId: session.id,
       runId: run.id,
       messageId: assistantMessage.id,
@@ -695,7 +756,7 @@ describe("SqliteAgentStore", () => {
       toolName: "generate_image",
       arguments: { prompt: "小猪" }
     });
-    firstStore.createResource({
+    await firstStore.createResource({
       sessionId: session.id,
       messageId: assistantMessage.id,
       toolCallId: "call_1",
@@ -705,8 +766,8 @@ describe("SqliteAgentStore", () => {
       name: "image.png",
       status: "succeeded"
     });
-    firstStore.appendRunEvent(run.id, { type: "run_completed", messageId: assistantMessage.id }, assistantMessage.id);
-    firstStore.upsertSessionSummary({
+    await firstStore.appendRunEvent(run.id, { type: "run_completed", messageId: assistantMessage.id }, assistantMessage.id);
+    await firstStore.upsertSessionSummary({
       sessionId: session.id,
       coveredMessageId: assistantMessage.id,
       summary: {
@@ -720,32 +781,31 @@ describe("SqliteAgentStore", () => {
         recentProgress: []
       }
     });
-    firstStore.createMessage({
+    await firstStore.createMessage({
       sessionId: otherSession.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "保留" }]
     });
-    firstStore.close();
+    await firstStore.close();
 
-    const secondStore = await SqliteAgentStore.create({ databasePath });
+    const secondStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
 
-    expect(secondStore.deleteSession(session.id)).toBe(true);
-    expect(secondStore.getSession(session.id)).toBeUndefined();
-    expect(secondStore.getMessagesBySession(session.id)).toEqual([]);
-    expect(secondStore.getRun(run.id)).toBeUndefined();
-    expect(secondStore.getToolCallsBySession(session.id)).toEqual([]);
-    expect(secondStore.getResourcesByMessages([assistantMessage.id])).toEqual([]);
-    expect(secondStore.listSessionSummaries(session.id)).toEqual([]);
-    expect(secondStore.getSession(otherSession.id)).toMatchObject({ id: otherSession.id });
-    expect(secondStore.deleteSession(session.id)).toBe(false);
-    secondStore.close();
+    expect(await secondStore.deleteSession(session.id)).toBe(true);
+    expect(await secondStore.getSession(session.id)).toBeUndefined();
+    expect(await secondStore.getMessagesBySession(session.id)).toEqual([]);
+    expect(await secondStore.getRun(run.id)).toBeUndefined();
+    expect(await secondStore.getToolCallsBySession(session.id)).toEqual([]);
+    expect(await secondStore.getResourcesByMessages([assistantMessage.id])).toEqual([]);
+    expect(await secondStore.listSessionSummaries(session.id)).toEqual([]);
+    expect(await secondStore.getSession(otherSession.id)).toMatchObject({ id: otherSession.id });
+    expect(await secondStore.deleteSession(session.id)).toBe(false);
+    await secondStore.close();
   });
 
-  it("应用会把会话写入配置的 SQLite 文件", async () => {
-    const databasePath = createTempDatabasePath();
-    const previousDatabasePath = process.env.AGENT_SQLITE_PATH;
-    process.env.AGENT_SQLITE_PATH = databasePath;
+  it("应用会把会话写入配置的 Postgres 数据库", async () => {
+    const previousDatabaseUrl = process.env.DATABASE_URL;
+    process.env.DATABASE_URL = TEST_DATABASE_URL;
 
     try {
       const app = await buildApp({
@@ -759,23 +819,23 @@ describe("SqliteAgentStore", () => {
       const response = await app.inject({
         method: "POST",
         url: "/agents/sessions",
-        payload: { title: "SQLite 会话" }
+        payload: { title: "Postgres 会话" }
       });
       const payload = response.json() as { session: { id: string } };
 
       await app.close();
 
-      const store = await SqliteAgentStore.create({ databasePath });
-      expect(store.getSession(payload.session.id)).toMatchObject({
+      const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+      expect(await store.getSession(payload.session.id)).toMatchObject({
         id: payload.session.id,
-        title: "SQLite 会话"
+        title: "Postgres 会话"
       });
-      store.close();
+      await store.close();
     } finally {
-      if (previousDatabasePath === undefined) {
-        delete process.env.AGENT_SQLITE_PATH;
+      if (previousDatabaseUrl === undefined) {
+        delete process.env.DATABASE_URL;
       } else {
-        process.env.AGENT_SQLITE_PATH = previousDatabasePath;
+        process.env.DATABASE_URL = previousDatabaseUrl;
       }
     }
   });

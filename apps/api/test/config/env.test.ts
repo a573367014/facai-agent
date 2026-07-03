@@ -89,6 +89,35 @@ describe("loadEnv", () => {
     expect(env.CORS_ORIGINS).toEqual(["https://app.example.com", "http://127.0.0.1:4000"]);
   });
 
+  it("解析独立 embedding 模型配置", () => {
+    const env = loadEnv({
+      OPENAI_API_KEY: "deepseek-key",
+      OPENAI_BASE_URL: "https://api.deepseek.com",
+      OPENAI_MODEL: "deepseek-v4-flash",
+      OPENAI_EMBEDDING_API_KEY: "ollama",
+      OPENAI_EMBEDDING_BASE_URL: "http://localhost:11434/v1",
+      OPENAI_EMBEDDING_MODEL: "embeddinggemma"
+    });
+
+    expect(env.OPENAI_BASE_URL).toBe("https://api.deepseek.com");
+    expect(env.OPENAI_MODEL).toBe("deepseek-v4-flash");
+    expect(env.OPENAI_EMBEDDING_API_KEY).toBe("ollama");
+    expect(env.OPENAI_EMBEDDING_BASE_URL).toBe("http://localhost:11434/v1");
+    expect(env.OPENAI_EMBEDDING_MODEL).toBe("embeddinggemma");
+  });
+
+  it("解析本地 Ollama embedding 配置", () => {
+    const env = loadEnv({
+      EMBEDDING_PROVIDER: "ollama",
+      OLLAMA_BASE_URL: "http://localhost:11434",
+      OLLAMA_EMBEDDING_MODEL: "embeddinggemma"
+    });
+
+    expect(env.EMBEDDING_PROVIDER).toBe("ollama");
+    expect(env.OLLAMA_BASE_URL).toBe("http://localhost:11434");
+    expect(env.OLLAMA_EMBEDDING_MODEL).toBe("embeddinggemma");
+  });
+
   it("不再解析火山供应商默认配置", () => {
     const env = loadEnv({
       VOLCENGINE_ACCESS_KEY_ID: "ak-test",

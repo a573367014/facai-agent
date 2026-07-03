@@ -129,13 +129,13 @@ export class AgentMessageCoordinator {
     );
   }
 
-  createSession(title?: string) {
+  async createSession(title?: string) {
     return this.store.createSession(title);
   }
 
-  listSessions(options: { after?: string; limit?: number } = {}) {
+  async listSessions(options: { after?: string; limit?: number } = {}) {
     const limit = this.normalizeSessionLimit(options.limit);
-    const sessionsWithOverflow = this.store.listSessions({
+    const sessionsWithOverflow = await this.store.listSessions({
       after: options.after,
       limit: limit + 1
     });
@@ -165,53 +165,53 @@ export class AgentMessageCoordinator {
   }
 
   async deleteSession(sessionId: string) {
-    const session = this.store.getSession(sessionId);
+    const session = await this.store.getSession(sessionId);
 
     if (!session) {
       throw new AppError("VALIDATION_ERROR", `未找到会话：${sessionId}`, 404);
     }
 
-    for (const run of this.cleanupService.getSessionRunningRuns(sessionId)) {
+    for (const run of await this.cleanupService.getSessionRunningRuns(sessionId)) {
       await this.cancelRun(run.id);
     }
 
-    this.store.deleteSession(sessionId);
+    await this.store.deleteSession(sessionId);
     return { session };
   }
 
-  getSession(sessionId: string, options: { messageLimit?: number } = {}) {
-    const session = this.store.getSession(sessionId);
+  async getSession(sessionId: string, options: { messageLimit?: number } = {}) {
+    const session = await this.store.getSession(sessionId);
 
     if (!session) {
       throw new AppError("VALIDATION_ERROR", `未找到会话：${sessionId}`, 404);
     }
 
-    const messagePage = this.getRecentMessagePage(sessionId, options.messageLimit);
+    const messagePage = await this.getRecentMessagePage(sessionId, options.messageLimit);
 
     return {
       session,
       messages: messagePage.messages,
-      resources: this.getResourcesForMessages(messagePage.messages),
-      processSteps: this.getProcessStepsForMessages(messagePage.messages),
+      resources: await this.getResourcesForMessages(messagePage.messages),
+      processSteps: await this.getProcessStepsForMessages(messagePage.messages),
       pageInfo: messagePage.pageInfo,
-      summary: this.store.getSessionSummary(sessionId)
+      summary: await this.store.getSessionSummary(sessionId)
     };
   }
 
-  getSessionMessages(sessionId: string, options: { before?: string; messageLimit?: number } = {}): AgentMessagePageWithResources {
-    const session = this.store.getSession(sessionId);
+  async getSessionMessages(sessionId: string, options: { before?: string; messageLimit?: number } = {}): Promise<AgentMessagePageWithResources> {
+    const session = await this.store.getSession(sessionId);
 
     if (!session) {
       throw new AppError("VALIDATION_ERROR", `未找到会话：${sessionId}`, 404);
     }
 
     if (!options.before) {
-      return this.withResources(this.getRecentMessagePage(sessionId, options.messageLimit));
+      return this.withResources(await this.getRecentMessagePage(sessionId, options.messageLimit));
     }
 
     return this.withResources(
       this.trimOldestOverflow(
-        this.store.getMessagesBefore(sessionId, options.before, this.normalizeMessageLimit(options.messageLimit) + 1),
+        await this.store.getMessagesBefore(sessionId, options.before, this.normalizeMessageLimit(options.messageLimit) + 1),
         this.normalizeMessageLimit(options.messageLimit)
       )
     );
@@ -222,14 +222,14 @@ export class AgentMessageCoordinator {
     // SQLite 先落 user message / run，前端马上拿到 runId；Worker 后面会用这些 id 重新读取最新状态。
     const userParts = input.parts?.length ? input.parts : [createTextPart(input.input)];
     const userText = partsToLlmText(userParts);
-    const session = input.sessionId ? this.getSession(input.sessionId).session : this.store.createSession(userText.slice(0, 32));
-    const userMessage = this.store.createMessage({
+    const session = input.sessionId ? (await this.getSession(input.sessionId)).session : await this.store.createSession(userText.slice(0, 32));
+    const userMessage = await this.store.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: userParts
     });
-    const run = this.store.createRun({
+    const run = await this.store.createRun({
       sessionId: session.id,
       userMessageId: userMessage.id,
       status: "running",
@@ -238,12 +238,12 @@ export class AgentMessageCoordinator {
     const controller = new AbortController();
 
     this.runningRuns.set(run.id, controller);
-    this.appendRunEvent(run.id, { type: "session.message.created", message: userMessage }, userMessage.id);
+    await this.appendRunEvent(run.id, { type: "session.message.created", message: userMessage }, userMessage.id);
 
     if (this.options.runQueue) {
       // queue 模式下 assistant message 也提前创建出来。这样 SSE 建连时可以立刻返回
       // message.snapshot；生成中的 parts 则先进 runningStateStore，完成后才写回 SQLite message。
-      const assistantMessage = this.store.createMessage({
+      const assistantMessage = await this.store.createMessage({
         sessionId: session.id,
         role: "assistant",
         status: "running",
@@ -253,12 +253,12 @@ export class AgentMessageCoordinator {
       try {
         await this.draftManager.init(assistantMessage, run.id);
         const queuedRun =
-          this.store.updateRun(run.id, {
+          (await this.store.updateRun(run.id, {
             phase: "answering",
             assistantMessageId: assistantMessage.id
-          }) ?? run;
+          })) ?? run;
 
-        this.appendRunEvent(run.id, { type: "session.message.created", message: assistantMessage }, assistantMessage.id);
+        await this.appendRunEvent(run.id, { type: "session.message.created", message: assistantMessage }, assistantMessage.id);
         // BullMQ job payload 只传 id。真正的 parts、summary、上下文都从 SQLite 现读，
         // 这样可以避免队列里缓存一份已经过期的对话状态。
         await this.options.runQueue.enqueueRun({
@@ -277,15 +277,15 @@ export class AgentMessageCoordinator {
       } catch (error) {
         const detail = toErrorDetail(error);
         const failedAssistantMessage =
-          this.store.updateMessage(assistantMessage.id, {
+          (await this.store.updateMessage(assistantMessage.id, {
             status: "failed",
             parts: [createTextPart(detail.message)],
             error: detail,
             completedAt: now()
-          }) ?? assistantMessage;
+          })) ?? assistantMessage;
 
-        this.appendRunEvent(run.id, { type: "session.message.created", message: failedAssistantMessage }, assistantMessage.id);
-        this.appendRunEvent(
+        await this.appendRunEvent(run.id, { type: "session.message.created", message: failedAssistantMessage }, assistantMessage.id);
+        await this.appendRunEvent(
           run.id,
           {
             type: "error",
@@ -294,7 +294,7 @@ export class AgentMessageCoordinator {
           },
           assistantMessage.id
         );
-        this.store.updateRun(run.id, {
+        await this.store.updateRun(run.id, {
           status: "failed",
           phase: "failed",
           assistantMessageId: assistantMessage.id,
@@ -336,29 +336,29 @@ export class AgentMessageCoordinator {
   }
 
   async regenerateMessage(messageId: string) {
-    const sourceAssistantMessage = this.ensureAssistantMessage(messageId);
+    const sourceAssistantMessage = await this.ensureAssistantMessage(messageId);
 
     if (sourceAssistantMessage.status === "running") {
       throw new AppError("VALIDATION_ERROR", "运行中的回答不能重新生成，请先停止当前生成", 400);
     }
 
-    const userMessage = this.findInputUserMessageForAssistant(sourceAssistantMessage);
+    const userMessage = await this.findInputUserMessageForAssistant(sourceAssistantMessage);
 
     if (!userMessage) {
       throw new AppError("VALIDATION_ERROR", "未找到这条回答对应的用户输入，无法重新生成", 404);
     }
 
-    const session = this.getSession(sourceAssistantMessage.sessionId).session;
+    const session = (await this.getSession(sourceAssistantMessage.sessionId)).session;
     const userText = partsToLlmText(userMessage.parts);
-    const run = this.store.createRun({
+    const run = await this.store.createRun({
       sessionId: session.id,
       userMessageId: userMessage.id,
       status: "running",
       phase: "answering"
     });
     const controller = new AbortController();
-    const history = this.buildConversationHistoryBefore(session.id, userMessage.id);
-    const replayToolCalls = this.getReplayableMediaToolCalls(sourceAssistantMessage);
+    const history = await this.buildConversationHistoryBefore(session.id, userMessage.id);
+    const replayToolCalls = await this.getReplayableMediaToolCalls(sourceAssistantMessage);
 
     this.runningRuns.set(run.id, controller);
     const execution = this.executeRun(
@@ -390,7 +390,7 @@ export class AgentMessageCoordinator {
   }
 
   async cancelRun(runId: string, reason = "用户中断") {
-    const run = this.ensureRun(runId);
+    const run = await this.ensureRun(runId);
 
     if (run.status !== "running") {
       return { run };
@@ -404,26 +404,26 @@ export class AgentMessageCoordinator {
     const timestamp = now();
 
     if (run.systemMessageId) {
-      const systemMessage = this.store.getMessage(run.systemMessageId);
+      const systemMessage = await this.store.getMessage(run.systemMessageId);
 
       if (systemMessage?.status === "running") {
         const cancelledSystemMessage =
-          this.store.updateMessage(systemMessage.id, {
+          (await this.store.updateMessage(systemMessage.id, {
             status: "cancelled",
             parts: [createTextPart("上下文压缩已中断")],
             completedAt: timestamp
-          }) ?? systemMessage;
-        this.appendRunEvent(runId, { type: "session.message.updated", message: cancelledSystemMessage }, cancelledSystemMessage.id);
+          })) ?? systemMessage;
+        await this.appendRunEvent(runId, { type: "session.message.updated", message: cancelledSystemMessage }, cancelledSystemMessage.id);
       }
     }
 
     if (run.assistantMessageId) {
-      const assistantMessage = this.store.getMessage(run.assistantMessageId);
+      const assistantMessage = await this.store.getMessage(run.assistantMessageId);
 
       if (assistantMessage?.status === "running") {
         const draftMessage = await this.draftManager.withDraft(assistantMessage);
-        this.processStepProjector.completeRunning(assistantMessage.id, runId, "cancelled");
-        this.appendRunEvent(
+        await this.processStepProjector.completeRunning(assistantMessage.id, runId, "cancelled");
+        await this.appendRunEvent(
           runId,
           {
             type: "agent_state",
@@ -434,12 +434,12 @@ export class AgentMessageCoordinator {
           assistantMessage.id
         );
         const cancelledAssistantMessage =
-          this.store.updateMessage(assistantMessage.id, {
+          (await this.store.updateMessage(assistantMessage.id, {
             status: "cancelled",
             parts: draftMessage.parts,
             completedAt: timestamp
-          }) ?? assistantMessage;
-        this.appendRunEvent(
+          })) ?? assistantMessage;
+        await this.appendRunEvent(
           runId,
           { type: "session.message.updated", message: cancelledAssistantMessage },
           cancelledAssistantMessage.id
@@ -448,20 +448,20 @@ export class AgentMessageCoordinator {
       }
     }
 
-    this.appendRunEvent(runId, { type: "cancelled", reason }, run.assistantMessageId ?? run.systemMessageId);
+    await this.appendRunEvent(runId, { type: "cancelled", reason }, run.assistantMessageId ?? run.systemMessageId);
     const cancelledRun =
-      this.store.updateRun(runId, {
+      (await this.store.updateRun(runId, {
         status: "cancelled",
         phase: "cancelled",
         completedAt: timestamp
-      }) ?? run;
+      })) ?? run;
     this.runningRuns.delete(runId);
 
     return { run: cancelledRun };
   }
 
-  getRun(runId: string) {
-    const run = this.ensureRun(runId);
+  async getRun(runId: string) {
+    const run = await this.ensureRun(runId);
 
     return {
       run
@@ -471,7 +471,7 @@ export class AgentMessageCoordinator {
   async executeQueuedRun(payload: AgentRunJobPayload) {
     // Worker 的入口。这里不能信任 BullMQ job 一定只投递一次，所以先看 SQLite run 状态，
     // 再抢 Redis run lock。SQLite 状态机是最终防线，Redis lock 是降低重复执行概率。
-    const run = this.ensureRun(payload.runId);
+    const run = await this.ensureRun(payload.runId);
 
     if (run.status !== "running") {
       return this.getRun(run.id);
@@ -489,9 +489,9 @@ export class AgentMessageCoordinator {
       return this.getRun(run.id);
     }
 
-    const userMessage = this.ensureMessage(run.userMessageId);
+    const userMessage = await this.ensureMessage(run.userMessageId);
     const assistantMessageId = run.assistantMessageId ?? payload.assistantMessageId;
-    const assistantMessage = this.ensureAssistantMessage(assistantMessageId);
+    const assistantMessage = await this.ensureAssistantMessage(assistantMessageId);
     const controller = new AbortController();
 
     try {
@@ -518,7 +518,7 @@ export class AgentMessageCoordinator {
   }
 
   async subscribeRun(runId: string, listener: AgentEventListener) {
-    this.ensureRun(runId);
+    await this.ensureRun(runId);
     // 本进程 store.subscribeRun 能接到当前 API 进程写入的事件；
     // eventBus.subscribeRun 能接到 Worker 进程通过 Redis Pub/Sub 发布的事件。
     // SSE 同时订阅两边，才兼容测试、单进程和多进程部署。
@@ -546,7 +546,7 @@ export class AgentMessageCoordinator {
         }
 
         lastCheckedAt = nowMs;
-        const run = this.store.getRun(runId);
+        const run = await this.store.getRun(runId);
 
         if (!run || run.status !== "running") {
           throw new DOMException("Aborted", "AbortError");
@@ -560,23 +560,23 @@ export class AgentMessageCoordinator {
     };
   }
 
-  getMessage(messageId: string) {
-    const message = this.ensureAssistantMessage(messageId);
+  async getMessage(messageId: string) {
+    const message = await this.ensureAssistantMessage(messageId);
 
     return {
       message,
-      resources: this.getResourcesForMessages([message]),
-      processSteps: this.getProcessStepsForMessages([message])
+      resources: await this.getResourcesForMessages([message]),
+      processSteps: await this.getProcessStepsForMessages([message])
     };
   }
 
   async getMessageSnapshot(messageId: string) {
-    const { message, version } = await this.draftManager.getSnapshot(this.ensureAssistantMessage(messageId));
+    const { message, version } = await this.draftManager.getSnapshot(await this.ensureAssistantMessage(messageId));
 
     return {
       message,
-      resources: this.getResourcesForMessages([message]),
-      processSteps: this.getProcessStepsForMessages([message]),
+      resources: await this.getResourcesForMessages([message]),
+      processSteps: await this.getProcessStepsForMessages([message]),
       version
     };
   }
@@ -600,7 +600,7 @@ export class AgentMessageCoordinator {
         throw new AppError("VALIDATION_ERROR", "run 缺少必要的执行上下文", 400);
       }
 
-      const run = this.ensureRun(runId);
+      const run = await this.ensureRun(runId);
       const userMessageId = run.userMessageId;
       await runGuard.ensureActive({ force: true });
 
@@ -612,11 +612,11 @@ export class AgentMessageCoordinator {
 
       await runGuard.ensureActive({ force: true });
 
-      const history = options.history ?? this.buildConversationHistoryBefore(input.sessionId, userMessageId);
+      const history = options.history ?? await this.buildConversationHistoryBefore(input.sessionId, userMessageId);
 
       assistantMessage = options.assistantMessageId
-        ? this.ensureAssistantMessage(options.assistantMessageId)
-        : this.store.createMessage({
+        ? await this.ensureAssistantMessage(options.assistantMessageId)
+        : await this.store.createMessage({
             sessionId: input.sessionId,
             role: "assistant",
             status: "running",
@@ -629,13 +629,13 @@ export class AgentMessageCoordinator {
       }
 
       await this.draftManager.ensure(assistantMessage, runId);
-      this.store.updateRun(runId, {
+      await this.store.updateRun(runId, {
         phase: "answering",
         assistantMessageId: assistantMessage.id
       });
 
       if (!options.assistantMessageId) {
-        this.appendRunEvent(runId, { type: "session.message.created", message: assistantMessage }, assistantMessage.id);
+        await this.appendRunEvent(runId, { type: "session.message.created", message: assistantMessage }, assistantMessage.id);
       }
 
       const result = await this.agentService.run({
@@ -665,34 +665,34 @@ export class AgentMessageCoordinator {
       // 最终答案才写回 SQLite message。这样 SQLite 保存的是可审计的稳定结果，
       // Redis draft 只承担生成过程中的临时状态。
       const finalParts = await this.setAssistantTextAndEmitUpdate(assistantMessage.id, result.answer, runId);
-      this.processStepProjector.completeRunning(assistantMessage.id, runId, "succeeded");
-      this.appendRunEvent(runId, finalAnswerEvent ?? { type: "final_answer", answer: result.answer }, assistantMessage.id);
+      await this.processStepProjector.completeRunning(assistantMessage.id, runId, "succeeded");
+      await this.appendRunEvent(runId, finalAnswerEvent ?? { type: "final_answer", answer: result.answer }, assistantMessage.id);
       const completedAssistantMessage =
-        this.store.updateMessage(assistantMessage.id, {
+        (await this.store.updateMessage(assistantMessage.id, {
           status: "completed",
           parts: finalParts,
           completedAt: now()
-        }) ?? assistantMessage;
-      this.appendRunEvent(
+        })) ?? assistantMessage;
+      await this.appendRunEvent(
         runId,
         { type: "session.message.updated", message: completedAssistantMessage },
         completedAssistantMessage.id
       );
-      this.appendRunEvent(runId, { type: "run_completed", messageId: assistantMessage.id }, assistantMessage.id);
-      this.store.updateRun(runId, {
+      await this.appendRunEvent(runId, { type: "run_completed", messageId: assistantMessage.id }, assistantMessage.id);
+      await this.store.updateRun(runId, {
         status: "completed",
         phase: "completed",
         completedAt: now()
       });
     } catch (error) {
-      if (isAbortError(error) || this.store.getRun(runId)?.status === "cancelled") {
+      if (isAbortError(error) || (await this.store.getRun(runId))?.status === "cancelled") {
         return;
       }
 
       const detail = toErrorDetail(error);
       const messageId = assistantMessage?.id;
 
-      this.appendRunEvent(
+      await this.appendRunEvent(
         runId,
         {
           type: "error",
@@ -703,21 +703,21 @@ export class AgentMessageCoordinator {
       );
 
       if (messageId) {
-        this.processStepProjector.completeRunning(messageId, runId, "failed");
+        await this.processStepProjector.completeRunning(messageId, runId, "failed");
         const failedMessage =
-          this.store.updateMessage(messageId, {
+          (await this.store.updateMessage(messageId, {
             status: "failed",
             parts: await this.withAssistantText(messageId, "本轮运行失败。"),
             error: detail,
             completedAt: now()
-          }) ?? this.store.getMessage(messageId);
+          })) ?? await this.store.getMessage(messageId);
 
         if (failedMessage) {
-          this.appendRunEvent(runId, { type: "session.message.updated", message: failedMessage }, messageId);
+          await this.appendRunEvent(runId, { type: "session.message.updated", message: failedMessage }, messageId);
         }
       }
 
-      this.store.updateRun(runId, {
+      await this.store.updateRun(runId, {
         status: "failed",
         phase: "failed",
         error: detail,
@@ -732,8 +732,8 @@ export class AgentMessageCoordinator {
     }
   }
 
-  private ensureAssistantMessage(messageId: string) {
-    const message = this.ensureMessage(messageId);
+  private async ensureAssistantMessage(messageId: string) {
+    const message = await this.ensureMessage(messageId);
 
     if (message.role !== "assistant") {
       throw new AppError("VALIDATION_ERROR", `未找到助手消息：${messageId}`, 404);
@@ -742,17 +742,17 @@ export class AgentMessageCoordinator {
     return message;
   }
 
-  private findInputUserMessageForAssistant(assistantMessage: AgentMessageRecord): AgentMessageRecord | undefined {
-    const linkedRun = [...this.store.getRunsByMessageId(assistantMessage.id)]
+  private async findInputUserMessageForAssistant(assistantMessage: AgentMessageRecord): Promise<AgentMessageRecord | undefined> {
+    const linkedRuns = (await this.store.getRunsByMessageId(assistantMessage.id))
       .reverse()
       .find((run) => run.assistantMessageId === assistantMessage.id);
-    const linkedUserMessage = linkedRun ? this.store.getMessage(linkedRun.userMessageId) : undefined;
+    const linkedUserMessage = linkedRuns ? await this.store.getMessage(linkedRuns.userMessageId) : undefined;
 
     if (linkedUserMessage?.role === "user") {
       return linkedUserMessage;
     }
 
-    const sessionMessages = this.store.getMessagesBySession(assistantMessage.sessionId);
+    const sessionMessages = await this.store.getMessagesBySession(assistantMessage.sessionId);
     const assistantIndex = sessionMessages.findIndex((message) => message.id === assistantMessage.id);
 
     if (assistantIndex <= 0) {
@@ -762,9 +762,9 @@ export class AgentMessageCoordinator {
     return [...sessionMessages.slice(0, assistantIndex)].reverse().find((message) => message.role === "user");
   }
 
-  private getReplayableMediaToolCalls(assistantMessage: AgentMessageRecord): ToolCall[] {
-    return this.store
-      .getToolCallsBySession(assistantMessage.sessionId)
+  private async getReplayableMediaToolCalls(assistantMessage: AgentMessageRecord): Promise<ToolCall[]> {
+    return (await this.store
+      .getToolCallsBySession(assistantMessage.sessionId))
       .filter((toolCall) => toolCall.messageId === assistantMessage.id && isMediaOutputToolName(toolCall.toolName))
       .sort((leftToolCall, rightToolCall) => {
         const iterationOrder = leftToolCall.iteration - rightToolCall.iteration;
@@ -777,8 +777,8 @@ export class AgentMessageCoordinator {
       }));
   }
 
-  private ensureMessage(messageId: string) {
-    const message = this.store.getMessage(messageId);
+  private async ensureMessage(messageId: string) {
+    const message = await this.store.getMessage(messageId);
 
     if (!message) {
       throw new AppError("VALIDATION_ERROR", `未找到消息：${messageId}`, 404);
@@ -787,8 +787,8 @@ export class AgentMessageCoordinator {
     return message;
   }
 
-  private ensureRun(runId: string): AgentRunRecord {
-    const run = this.store.getRun(runId);
+  private async ensureRun(runId: string): Promise<AgentRunRecord> {
+    const run = await this.store.getRun(runId);
 
     if (!run) {
       throw new AppError("VALIDATION_ERROR", `未找到运行：${runId}`, 404);
@@ -804,17 +804,17 @@ export class AgentMessageCoordinator {
     }
 
     if (event.type === "tool_call_ready") {
-      this.ensureToolCallRecord(messageId, event, runId, "pending");
+      await this.ensureToolCallRecord(messageId, event, runId, "pending");
     }
 
     if (event.type === "tool_start" && !(await this.mediaOutputProjector.handleToolStart(messageId, event, runId)) && event.toolCallId) {
-      this.ensureToolCallRecord(messageId, event, runId, "running");
+      await this.ensureToolCallRecord(messageId, event, runId, "running");
     }
 
     if (event.type === "tool_result" && !(await this.mediaOutputProjector.handleToolResult(messageId, event, runId)) && event.toolCallId) {
-      const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
+      const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
       if (toolCall) {
-        this.store.updateToolCall(toolCall.id, {
+        await this.store.updateToolCall(toolCall.id, {
           status: "succeeded",
           durationMs: event.durationMs,
           resultSummary: summarizeToolResult(event.result)
@@ -823,9 +823,9 @@ export class AgentMessageCoordinator {
     }
 
     if (event.type === "tool_error" && !(await this.mediaOutputProjector.handleToolError(messageId, event, runId)) && event.toolCallId) {
-      const toolCall = this.ensureToolCallRecord(messageId, event, runId, "running");
+      const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
       if (toolCall) {
-        this.store.updateToolCall(toolCall.id, {
+        await this.store.updateToolCall(toolCall.id, {
           status: "failed",
           durationMs: event.durationMs,
           error: {
@@ -836,11 +836,11 @@ export class AgentMessageCoordinator {
       }
     }
 
-    this.processStepProjector.project(messageId, event, runId);
-    this.appendEvent(messageId, event, runId);
+    await this.processStepProjector.project(messageId, event, runId);
+    await this.appendEvent(messageId, event, runId);
   }
 
-  private ensureToolCallRecord(
+  private async ensureToolCallRecord(
     messageId: string,
     event: {
       iteration: number;
@@ -850,18 +850,18 @@ export class AgentMessageCoordinator {
     },
     runId: string | undefined,
     status: AgentToolCallRecord["status"]
-  ): AgentToolCallRecord | undefined {
+  ): Promise<AgentToolCallRecord | undefined> {
     if (!event.toolCallId) {
       return undefined;
     }
 
-    const existingToolCall = this.store.getToolCallByMessageToolCall(messageId, event.toolCallId);
+    const existingToolCall = await this.store.getToolCallByMessageToolCall(messageId, event.toolCallId);
 
     if (existingToolCall) {
-      return this.store.updateToolCall(existingToolCall.id, { status }) ?? existingToolCall;
+      return (await this.store.updateToolCall(existingToolCall.id, { status })) ?? existingToolCall;
     }
 
-    const message = this.store.getMessage(messageId);
+    const message = await this.store.getMessage(messageId);
 
     if (!message) {
       return undefined;
@@ -921,17 +921,17 @@ export class AgentMessageCoordinator {
     return updatedParts;
   }
 
-  private appendEvent(messageId: string, event: AgentStreamEvent, runId?: string) {
+  private async appendEvent(messageId: string, event: AgentStreamEvent, runId?: string) {
     if (!runId) {
       throw new Error("执行事件必须关联 run");
     }
 
-    this.appendRunEvent(runId, event, messageId);
+    await this.appendRunEvent(runId, event, messageId);
   }
 
-  private appendRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): StoredAgentEvent | undefined {
+  private async appendRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): Promise<StoredAgentEvent | undefined> {
     // 事件不再写 SQLite：当前连接通过 store/Redis live fanout 接收，历史排查写本地 JSONL 日志。
-    const storedEvent = this.store.appendRunEvent(runId, event, messageId);
+    const storedEvent = await this.store.appendRunEvent(runId, event, messageId);
 
     if (storedEvent) {
       try {
@@ -945,14 +945,14 @@ export class AgentMessageCoordinator {
     return storedEvent;
   }
 
-  private publishTransientEvent(messageId: string, event: AgentStreamEvent, runId?: string) {
+  private async publishTransientEvent(messageId: string, event: AgentStreamEvent, runId?: string) {
     if (!runId) {
       throw new Error("临时执行事件必须关联 run");
     }
 
     // transient event 不进入 SQLite，只通过本进程订阅和 Redis Pub/Sub 推给在线 SSE。
     // 典型例子是 message.part.delta：它太高频，完整 draft 已经在 Redis running state 里。
-    const storedEvent = this.store.publishTransientRunEvent(runId, event, messageId);
+    const storedEvent = await this.store.publishTransientRunEvent(runId, event, messageId);
 
     if (storedEvent) {
       this.publishStoredEvent(storedEvent);
@@ -967,26 +967,26 @@ export class AgentMessageCoordinator {
     }
   }
 
-  private buildConversationHistory(sessionId: string): AgentMessage[] {
-    const summary = this.store.getSessionSummary(sessionId);
+  private async buildConversationHistory(sessionId: string): Promise<AgentMessage[]> {
+    const summary = await this.store.getSessionSummary(sessionId);
     const messageLimit = this.contextBuilder.getHistoryMessageLimit();
     const messages =
       messageLimit === 0
         ? []
         : summary
-          ? this.store.getRecentContextMessagesAfter(sessionId, summary.coveredMessageId, messageLimit)
-          : this.store.getRecentContextMessagesBySession(sessionId, messageLimit);
+          ? await this.store.getRecentContextMessagesAfter(sessionId, summary.coveredMessageId, messageLimit)
+          : await this.store.getRecentContextMessagesBySession(sessionId, messageLimit);
 
     return this.contextBuilder.buildConversationHistory(messages, summary);
   }
 
-  private buildConversationHistoryBefore(sessionId: string, beforeMessageId: string): AgentMessage[] {
-    const summary = this.store.getSessionSummaryBeforeMessage(sessionId, beforeMessageId);
+  private async buildConversationHistoryBefore(sessionId: string, beforeMessageId: string): Promise<AgentMessage[]> {
+    const summary = await this.store.getSessionSummaryBeforeMessage(sessionId, beforeMessageId);
     const messageLimit = this.contextBuilder.getHistoryMessageLimit();
     const messages =
       messageLimit === 0
         ? []
-        : this.store.getRecentContextMessagesBefore(sessionId, beforeMessageId, summary?.coveredMessageId, messageLimit);
+        : await this.store.getRecentContextMessagesBefore(sessionId, beforeMessageId, summary?.coveredMessageId, messageLimit);
 
     return this.contextBuilder.buildConversationHistory(messages, summary);
   }
@@ -1001,15 +1001,15 @@ export class AgentMessageCoordinator {
       return;
     }
 
-    const previousSummary = this.store.getSessionSummary(sessionId);
-    const uncoveredMessageCount = this.store.countContextMessagesBefore(sessionId, beforeMessageId, previousSummary?.coveredMessageId);
+    const previousSummary = await this.store.getSessionSummary(sessionId);
+    const uncoveredMessageCount = await this.store.countContextMessagesBefore(sessionId, beforeMessageId, previousSummary?.coveredMessageId);
     const refreshPlan = this.summaryService.planRefresh(uncoveredMessageCount);
 
     if (!refreshPlan) {
       return;
     }
 
-    const uncoveredMessages = this.store.getContextMessagesBefore(
+    const uncoveredMessages = await this.store.getContextMessagesBefore(
       sessionId,
       beforeMessageId,
       previousSummary?.coveredMessageId
@@ -1026,20 +1026,27 @@ export class AgentMessageCoordinator {
       return;
     }
 
-    const systemMessage = this.store.createMessage({
+    const run = await this.store.getRun(runId);
+    const assistantMessage = run?.assistantMessageId ? await this.store.getMessage(run.assistantMessageId) : undefined;
+    const systemCreatedAt = assistantMessage
+      ? new Date(Date.parse(assistantMessage.createdAt) - 1).toISOString()
+      : undefined;
+
+    const systemMessage = await this.store.createMessage({
       sessionId,
       role: "system",
       status: "running",
-      parts: [createTextPart("上下文自动压缩中...")]
+      parts: [createTextPart("上下文自动压缩中...")],
+      ...(systemCreatedAt ? { createdAt: systemCreatedAt } : {})
     });
     const startedAt = Date.now();
 
-    this.store.updateRun(runId, {
+    await this.store.updateRun(runId, {
       phase: "compressing",
       systemMessageId: systemMessage.id
     });
-    this.appendRunEvent(runId, { type: "session.message.created", message: systemMessage }, systemMessage.id);
-    this.appendRunEvent(
+    await this.appendRunEvent(runId, { type: "session.message.created", message: systemMessage }, systemMessage.id);
+    await this.appendRunEvent(
       runId,
       {
         type: "summary_start",
@@ -1059,7 +1066,7 @@ export class AgentMessageCoordinator {
         signal
       });
 
-      if (signal.aborted || this.store.getRun(runId)?.status !== "running") {
+      if (signal.aborted || (await this.store.getRun(runId))?.status !== "running") {
         throw new DOMException("Aborted", "AbortError");
       }
 
@@ -1067,19 +1074,19 @@ export class AgentMessageCoordinator {
         return;
       }
 
-      this.store.upsertSessionSummary({
+      await this.store.upsertSessionSummary({
         sessionId,
         summary: nextSummary.summary,
         coveredMessageId: nextSummary.coveredMessageId,
         schemaVersion: nextSummary.schemaVersion
       });
       const completedSystemMessage =
-        this.store.updateMessage(systemMessage.id, {
+        (await this.store.updateMessage(systemMessage.id, {
           status: "completed",
           parts: [createTextPart("上下文已自动压缩")],
           completedAt: now()
-        }) ?? systemMessage;
-      this.appendRunEvent(
+        })) ?? systemMessage;
+      await this.appendRunEvent(
         runId,
         {
           type: "summary_completed",
@@ -1092,25 +1099,25 @@ export class AgentMessageCoordinator {
         },
         systemMessage.id
       );
-      this.appendRunEvent(
+      await this.appendRunEvent(
         runId,
         { type: "session.message.updated", message: completedSystemMessage },
         completedSystemMessage.id
       );
     } catch (error) {
-      if (isAbortError(error) || signal.aborted || this.store.getRun(runId)?.status === "cancelled") {
+      if (isAbortError(error) || signal.aborted || (await this.store.getRun(runId))?.status === "cancelled") {
         throw error;
       }
 
       const detail = toErrorDetail(error);
       const failedSystemMessage =
-        this.store.updateMessage(systemMessage.id, {
+        (await this.store.updateMessage(systemMessage.id, {
           status: "failed",
           parts: [createTextPart("上下文压缩失败，已继续本轮回答")],
           error: detail,
           completedAt: now()
-        }) ?? systemMessage;
-      this.appendRunEvent(
+        })) ?? systemMessage;
+      await this.appendRunEvent(
         runId,
         {
           type: "summary_failed",
@@ -1123,28 +1130,28 @@ export class AgentMessageCoordinator {
         },
         systemMessage.id
       );
-      this.appendRunEvent(runId, { type: "session.message.updated", message: failedSystemMessage }, failedSystemMessage.id);
+      await this.appendRunEvent(runId, { type: "session.message.updated", message: failedSystemMessage }, failedSystemMessage.id);
     }
   }
 
-  private getRecentMessagePage(sessionId: string, messageLimit?: number): AgentMessagePage {
+  private async getRecentMessagePage(sessionId: string, messageLimit?: number): Promise<AgentMessagePage> {
     const limit = this.normalizeMessageLimit(messageLimit);
-    return this.trimOldestOverflow(this.store.getRecentMessagesBySession(sessionId, limit + 1), limit);
+    return this.trimOldestOverflow(await this.store.getRecentMessagesBySession(sessionId, limit + 1), limit);
   }
 
-  private withResources(messagePage: AgentMessagePage): AgentMessagePageWithResources {
+  private async withResources(messagePage: AgentMessagePage): Promise<AgentMessagePageWithResources> {
     return {
       ...messagePage,
-      resources: this.getResourcesForMessages(messagePage.messages),
-      processSteps: this.getProcessStepsForMessages(messagePage.messages)
+      resources: await this.getResourcesForMessages(messagePage.messages),
+      processSteps: await this.getProcessStepsForMessages(messagePage.messages)
     };
   }
 
-  private getResourcesForMessages(messages: AgentMessageRecord[]): AgentResourceRecord[] {
+  private async getResourcesForMessages(messages: AgentMessageRecord[]): Promise<AgentResourceRecord[]> {
     return this.store.getResourcesByMessages(messages.map((message) => message.id));
   }
 
-  private getProcessStepsForMessages(messages: AgentMessageRecord[]): AgentProcessStepRecord[] {
+  private async getProcessStepsForMessages(messages: AgentMessageRecord[]): Promise<AgentProcessStepRecord[]> {
     return this.store.getProcessStepsByMessages(messages.map((message) => message.id));
   }
 

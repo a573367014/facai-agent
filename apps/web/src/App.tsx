@@ -1,6 +1,6 @@
 import { Box, Chip, IconButton, Paper, Typography } from "@mui/material";
 import { ChevronsLeft, ChevronsRight } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   apiBaseUrl,
   cancelAgentRun,
@@ -9,10 +9,14 @@ import {
   getAgentSession,
   getAgentSessionMessages,
   listAgentSessions,
+  listKnowledgeDocuments,
   regenerateAgentMessage,
+  deleteKnowledgeDocument,
+  reindexKnowledgeDocument,
   startAgentRun,
   streamAgentRunEvents,
   uploadAgentImage,
+  uploadKnowledgeDocument,
   type AgentMessagePageInfo,
   type AgentMessageRecord,
   type AgentProcessStepRecord,
@@ -22,11 +26,13 @@ import {
   type MessagePart,
   type AgentSessionRecord,
   type AgentStreamEvent,
+  type KnowledgeDocumentRecord,
   type StoredAgentEvent
 } from "./api/agent-client";
 import { AgentConversation, type ChatMessage } from "./components/AgentConversation";
 import { AgentTimeline } from "./components/AgentTimeline";
 import { AgentComposer } from "./components/AgentComposer";
+import { KnowledgeAdminPanel } from "./components/KnowledgeAdminPanel";
 import { SessionSidebar, type SessionHistoryItem } from "./components/SessionSidebar";
 import type { ToolImageActionPayload } from "./components/ToolResultPreview";
 import { stripRuntimeFields, type RuntimePart } from "./prosemirror/part-serialization";
@@ -257,6 +263,15 @@ function replaceMessage(currentMessages: ChatMessage[], nextMessage: ChatMessage
   const exists = currentMessages.some((message) => message.id === nextMessage.id);
 
   if (!exists) {
+    const nextCreatedAt = nextMessage.createdAt;
+    if (nextCreatedAt) {
+      const insertIndex = currentMessages.findIndex((message) =>
+        message.createdAt ? message.createdAt.localeCompare(nextCreatedAt) > 0 : false
+      );
+      if (insertIndex !== -1) {
+        return [...currentMessages.slice(0, insertIndex), nextMessage, ...currentMessages.slice(insertIndex)];
+      }
+    }
     return [...currentMessages, nextMessage];
   }
 
@@ -606,6 +621,10 @@ export default function App() {
   const [messagePageInfo, setMessagePageInfo] = useState<AgentMessagePageInfo>(() => createDefaultMessagePageInfo());
   const [isLoadingOlderMessages, setIsLoadingOlderMessages] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [knowledgeDocuments, setKnowledgeDocuments] = useState<KnowledgeDocumentRecord[]>([]);
+  const [isKnowledgeLoading, setIsKnowledgeLoading] = useState(false);
+  const [isKnowledgeUploading, setIsKnowledgeUploading] = useState(false);
+  const [knowledgeError, setKnowledgeError] = useState<string | null>(null);
   const [events, setEvents] = useState<AgentStreamEvent[]>([]);
   const [health, setHealth] = useState("检查中");
   const [activeSessionId, setActiveSessionId] = useState<string | undefined>(() => readSessionIdFromUrl());
@@ -622,6 +641,64 @@ export default function App() {
   const runningRunsBySessionRef = useRef<RunningRunsBySession>(readRunningRunsBySession());
   // 这些 ref 是为了给异步 SSE 回调读“最新状态”。
   // React state 在闭包里可能是旧值，ref.current 可以避免旧流把事件写进新的会话。
+
+  const loadKnowledgeDocuments = useCallback(async () => {
+    setIsKnowledgeLoading(true);
+    setKnowledgeError(null);
+
+    try {
+      setKnowledgeDocuments(await listKnowledgeDocuments());
+    } catch (loadError) {
+      setKnowledgeError(loadError instanceof Error ? loadError.message : "知识库加载失败");
+    } finally {
+      setIsKnowledgeLoading(false);
+    }
+  }, []);
+
+  const handleUploadKnowledgeDocument = useCallback(
+    async (file: File) => {
+      setIsKnowledgeUploading(true);
+      setKnowledgeError(null);
+
+      try {
+        await uploadKnowledgeDocument(file);
+        await loadKnowledgeDocuments();
+      } catch (uploadError) {
+        setKnowledgeError(uploadError instanceof Error ? uploadError.message : "知识库上传失败");
+      } finally {
+        setIsKnowledgeUploading(false);
+      }
+    },
+    [loadKnowledgeDocuments]
+  );
+
+  const handleDeleteKnowledgeDocument = useCallback(
+    async (documentId: string) => {
+      setKnowledgeError(null);
+
+      try {
+        await deleteKnowledgeDocument(documentId);
+        await loadKnowledgeDocuments();
+      } catch (deleteError) {
+        setKnowledgeError(deleteError instanceof Error ? deleteError.message : "知识库删除失败");
+      }
+    },
+    [loadKnowledgeDocuments]
+  );
+
+  const handleReindexKnowledgeDocument = useCallback(
+    async (documentId: string) => {
+      setKnowledgeError(null);
+
+      try {
+        await reindexKnowledgeDocument(documentId);
+        await loadKnowledgeDocuments();
+      } catch (reindexError) {
+        setKnowledgeError(reindexError instanceof Error ? reindexError.message : "知识库重新索引失败");
+      }
+    },
+    [loadKnowledgeDocuments]
+  );
 
   useEffect(() => {
     const controller = new AbortController();
@@ -640,6 +717,10 @@ export default function App() {
       controller.abort();
     };
   }, []);
+
+  useEffect(() => {
+    void loadKnowledgeDocuments();
+  }, [loadKnowledgeDocuments]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1479,6 +1560,18 @@ export default function App() {
         </Box>
 
         <Box component="aside" className={isTracePanelCollapsed ? "trace-column collapsed" : "trace-column"} aria-hidden={isTracePanelCollapsed ? true : undefined}>
+          <Paper component="section" className="panel knowledge-panel" elevation={0}>
+            <KnowledgeAdminPanel
+              documents={knowledgeDocuments}
+              isLoading={isKnowledgeLoading}
+              isUploading={isKnowledgeUploading}
+              error={knowledgeError}
+              onRefresh={loadKnowledgeDocuments}
+              onUpload={handleUploadKnowledgeDocument}
+              onDelete={handleDeleteKnowledgeDocument}
+              onReindex={handleReindexKnowledgeDocument}
+            />
+          </Paper>
           <Paper component="section" className="panel trace-panel" elevation={0}>
             <Box className="panel-heading compact">
               <Box>
