@@ -22,7 +22,7 @@ import { AgentSummaryService } from "./agent/agent-summary-service.js";
 import { AgentContextBuilder } from "./agent/context-builder.js";
 import type { RunningMessageStateStore } from "./agent/running-message-state-store.js";
 import { RedisRunningMessageStateStore } from "./agent/redis-running-message-state-store.js";
-import { SqliteAgentStore } from "./agent/sqlite-agent-store.js";
+import { PostgresAgentStore } from "./agent/postgres-agent-store.js";
 import { LocalToolResourceStorage, type ToolResourceStorage } from "./agent/tool-resource-storage.js";
 import { createCorsOriginChecker } from "./config/cors.js";
 import { loadEnv } from "./config/env.js";
@@ -152,12 +152,13 @@ export async function buildApp(options: BuildAppOptions = {}) {
   let coordinator = options.coordinator;
   let knowledgeIndexingService: KnowledgeIndexingService | undefined;
   let knowledgeRetriever: KnowledgeRetriever | undefined;
-  let knowledgeStore: SqliteAgentStore | undefined;
+  let knowledgeStore: PostgresAgentStore | undefined;
   let knowledgeIndexQueue: KnowledgeIndexQueue | undefined;
 
   if (!coordinator) {
-    const agentStore = await SqliteAgentStore.create({
-      databasePath: options.databasePath ?? env.AGENT_SQLITE_PATH
+    const agentStore = await PostgresAgentStore.create({
+      connectionString: options.databasePath ?? env.DATABASE_URL,
+      ...(env.AGENT_EMBEDDING_DIMENSION ? { vectorDimension: env.AGENT_EMBEDDING_DIMENSION } : {})
     });
     knowledgeStore = agentStore;
     knowledgeIndexingService = new KnowledgeIndexingService({
@@ -321,7 +322,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
       await runQueueClient?.close();
       await knowledgeQueueClient?.close();
       redisRuntime?.close();
-      agentStore.close();
+      await agentStore.close();
     });
   }
 

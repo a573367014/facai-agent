@@ -29,11 +29,7 @@ export async function parseKnowledgeDocument(input: ParseKnowledgeDocumentInput)
 
   if (isWordDocument(input)) {
     const buffer = await readFile(input.sourcePath);
-    const mammoth = require("mammoth") as {
-      extractRawText(input: { buffer: Buffer }): Promise<{ value?: string }>;
-    };
-    const result = await mammoth.extractRawText({ buffer });
-    return { text: result.value ?? "" };
+    return { text: await extractWordText(buffer, input) };
   }
 
   throw new Error("当前只支持上传 PDF、Word、Markdown 和 TXT 文档");
@@ -66,4 +62,25 @@ function isWordDocument(input: { mimeType: string; name: string }) {
     name.endsWith(".docx") ||
     name.endsWith(".doc")
   );
+}
+
+function isLegacyDoc(input: { mimeType: string; name: string }) {
+  return (
+    input.mimeType === "application/msword" || input.name.toLowerCase().endsWith(".doc")
+  );
+}
+
+async function extractWordText(buffer: Buffer, input: { mimeType: string; name: string }): Promise<string> {
+  if (isLegacyDoc(input)) {
+    const WordExtractor = require("word-extractor");
+    const extractor = new WordExtractor();
+    const doc = await extractor.extract(buffer);
+    return doc.getBody() ?? "";
+  }
+
+  const mammoth = require("mammoth") as {
+    extractRawText(input: { buffer: Buffer }): Promise<{ value?: string }>;
+  };
+  const result = await mammoth.extractRawText({ buffer });
+  return result.value ?? "";
 }

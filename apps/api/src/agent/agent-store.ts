@@ -299,63 +299,63 @@ export interface UpdateAgentProcessStepInput {
 }
 
 export interface AgentStore {
-  createSession(title?: string): AgentSessionRecord;
-  listSessions(options?: ListAgentSessionsOptions): AgentSessionRecord[];
-  getSession(sessionId: string): AgentSessionRecord | undefined;
-  deleteSession(sessionId: string): boolean;
-  getSessionSummary(sessionId: string): AgentSessionSummaryRecord | undefined;
-  getSessionSummaryBeforeMessage(sessionId: string, messageId: string): AgentSessionSummaryRecord | undefined;
-  listSessionSummaries(sessionId: string): AgentSessionSummaryRecord[];
-  upsertSessionSummary(input: UpsertAgentSessionSummaryInput): AgentSessionSummaryRecord;
-  createRun(input: CreateAgentRunInput): AgentRunRecord;
-  updateRun(runId: string, input: UpdateAgentRunInput): AgentRunRecord | undefined;
-  getRun(runId: string): AgentRunRecord | undefined;
-  getRunsByMessageId(messageId: string): AgentRunRecord[];
-  createMessage(input: CreateAgentMessageInput): AgentMessageRecord;
-  updateMessage(messageId: string, input: UpdateAgentMessageInput): AgentMessageRecord | undefined;
-  updateMessageParts(messageId: string, parts: MessagePart[]): AgentMessageRecord | undefined;
-  getMessage(messageId: string): AgentMessageRecord | undefined;
-  getMessagesBySession(sessionId: string): AgentMessageRecord[];
-  getRecentMessagesBySession(sessionId: string, limit: number): AgentMessageRecord[];
-  getRecentContextMessagesBySession(sessionId: string, limit: number): AgentMessageRecord[];
-  getMessagesBefore(sessionId: string, beforeMessageId: string, limit: number): AgentMessageRecord[];
-  getMessagesAfter(sessionId: string, afterMessageId: string | undefined, limit?: number): AgentMessageRecord[];
-  getRecentMessagesAfter(sessionId: string, afterMessageId: string | undefined, limit: number): AgentMessageRecord[];
-  countMessagesAfter(sessionId: string, afterMessageId?: string): number;
-  getContextMessagesAfter(sessionId: string, afterMessageId: string | undefined, limit?: number): AgentMessageRecord[];
-  getRecentContextMessagesAfter(sessionId: string, afterMessageId: string | undefined, limit: number): AgentMessageRecord[];
-  countContextMessagesAfter(sessionId: string, afterMessageId?: string): number;
+  createSession(title?: string): Promise<AgentSessionRecord>;
+  listSessions(options?: ListAgentSessionsOptions): Promise<AgentSessionRecord[]>;
+  getSession(sessionId: string): Promise<AgentSessionRecord | undefined>;
+  deleteSession(sessionId: string): Promise<boolean>;
+  getSessionSummary(sessionId: string): Promise<AgentSessionSummaryRecord | undefined>;
+  getSessionSummaryBeforeMessage(sessionId: string, messageId: string): Promise<AgentSessionSummaryRecord | undefined>;
+  listSessionSummaries(sessionId: string): Promise<AgentSessionSummaryRecord[]>;
+  upsertSessionSummary(input: UpsertAgentSessionSummaryInput): Promise<AgentSessionSummaryRecord>;
+  createRun(input: CreateAgentRunInput): Promise<AgentRunRecord>;
+  updateRun(runId: string, input: UpdateAgentRunInput): Promise<AgentRunRecord | undefined>;
+  getRun(runId: string): Promise<AgentRunRecord | undefined>;
+  getRunsByMessageId(messageId: string): Promise<AgentRunRecord[]>;
+  createMessage(input: CreateAgentMessageInput): Promise<AgentMessageRecord>;
+  updateMessage(messageId: string, input: UpdateAgentMessageInput): Promise<AgentMessageRecord | undefined>;
+  updateMessageParts(messageId: string, parts: MessagePart[]): Promise<AgentMessageRecord | undefined>;
+  getMessage(messageId: string): Promise<AgentMessageRecord | undefined>;
+  getMessagesBySession(sessionId: string): Promise<AgentMessageRecord[]>;
+  getRecentMessagesBySession(sessionId: string, limit: number): Promise<AgentMessageRecord[]>;
+  getRecentContextMessagesBySession(sessionId: string, limit: number): Promise<AgentMessageRecord[]>;
+  getMessagesBefore(sessionId: string, beforeMessageId: string, limit: number): Promise<AgentMessageRecord[]>;
+  getMessagesAfter(sessionId: string, afterMessageId: string | undefined, limit?: number): Promise<AgentMessageRecord[]>;
+  getRecentMessagesAfter(sessionId: string, afterMessageId: string | undefined, limit: number): Promise<AgentMessageRecord[]>;
+  countMessagesAfter(sessionId: string, afterMessageId?: string): Promise<number>;
+  getContextMessagesAfter(sessionId: string, afterMessageId: string | undefined, limit?: number): Promise<AgentMessageRecord[]>;
+  getRecentContextMessagesAfter(sessionId: string, afterMessageId: string | undefined, limit: number): Promise<AgentMessageRecord[]>;
+  countContextMessagesAfter(sessionId: string, afterMessageId?: string): Promise<number>;
   getContextMessagesBefore(
     sessionId: string,
     beforeMessageId: string,
     afterMessageId: string | undefined,
     limit?: number
-  ): AgentMessageRecord[];
+  ): Promise<AgentMessageRecord[]>;
   getRecentContextMessagesBefore(
     sessionId: string,
     beforeMessageId: string,
     afterMessageId: string | undefined,
     limit: number
-  ): AgentMessageRecord[];
-  countContextMessagesBefore(sessionId: string, beforeMessageId: string, afterMessageId?: string): number;
-  createToolCall(input: CreateAgentToolCallInput): AgentToolCallRecord;
-  updateToolCall(toolCallRowId: string, input: UpdateAgentToolCallInput): AgentToolCallRecord | undefined;
-  getToolCallByMessageToolCall(messageId: string, toolCallId: string): AgentToolCallRecord | undefined;
-  getToolCallsBySession(sessionId: string): AgentToolCallRecord[];
-  createResource(input: CreateAgentResourceInput): AgentResourceRecord;
-  updateResource(resourceId: string, input: UpdateAgentResourceInput): AgentResourceRecord | undefined;
-  getResourcesByMessages(messageIds: string[]): AgentResourceRecord[];
-  createProcessStep(input: CreateAgentProcessStepInput): AgentProcessStepRecord;
-  updateProcessStep(stepId: string, input: UpdateAgentProcessStepInput): AgentProcessStepRecord | undefined;
-  getProcessStepsByMessages(messageIds: string[]): AgentProcessStepRecord[];
-  createKnowledgeDocument(input: CreateKnowledgeDocumentInput): KnowledgeDocumentRecord;
-  updateKnowledgeDocument(documentId: string, input: UpdateKnowledgeDocumentInput): KnowledgeDocumentRecord | undefined;
-  getKnowledgeDocument(documentId: string): KnowledgeDocumentRecord | undefined;
-  listKnowledgeDocuments(): KnowledgeDocumentRecord[];
-  deleteKnowledgeDocument(documentId: string): boolean;
-  replaceKnowledgeChunks(documentId: string, chunks: CreateKnowledgeChunkInput[]): void;
-  searchKnowledgeChunks(input: SearchKnowledgeChunksInput): KnowledgeChunkSearchResult[];
-  appendRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): StoredAgentEvent | undefined;
-  publishTransientRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): StoredAgentEvent | undefined;
+  ): Promise<AgentMessageRecord[]>;
+  countContextMessagesBefore(sessionId: string, beforeMessageId: string, afterMessageId?: string): Promise<number>;
+  createToolCall(input: CreateAgentToolCallInput): Promise<AgentToolCallRecord>;
+  updateToolCall(toolCallRowId: string, input: UpdateAgentToolCallInput): Promise<AgentToolCallRecord | undefined>;
+  getToolCallByMessageToolCall(messageId: string, toolCallId: string): Promise<AgentToolCallRecord | undefined>;
+  getToolCallsBySession(sessionId: string): Promise<AgentToolCallRecord[]>;
+  createResource(input: CreateAgentResourceInput): Promise<AgentResourceRecord>;
+  updateResource(resourceId: string, input: UpdateAgentResourceInput): Promise<AgentResourceRecord | undefined>;
+  getResourcesByMessages(messageIds: string[]): Promise<AgentResourceRecord[]>;
+  createProcessStep(input: CreateAgentProcessStepInput): Promise<AgentProcessStepRecord>;
+  updateProcessStep(stepId: string, input: UpdateAgentProcessStepInput): Promise<AgentProcessStepRecord | undefined>;
+  getProcessStepsByMessages(messageIds: string[]): Promise<AgentProcessStepRecord[]>;
+  createKnowledgeDocument(input: CreateKnowledgeDocumentInput): Promise<KnowledgeDocumentRecord>;
+  updateKnowledgeDocument(documentId: string, input: UpdateKnowledgeDocumentInput): Promise<KnowledgeDocumentRecord | undefined>;
+  getKnowledgeDocument(documentId: string): Promise<KnowledgeDocumentRecord | undefined>;
+  listKnowledgeDocuments(): Promise<KnowledgeDocumentRecord[]>;
+  deleteKnowledgeDocument(documentId: string): Promise<boolean>;
+  replaceKnowledgeChunks(documentId: string, chunks: CreateKnowledgeChunkInput[]): Promise<void>;
+  searchKnowledgeChunks(input: SearchKnowledgeChunksInput): Promise<KnowledgeChunkSearchResult[]>;
+  appendRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): Promise<StoredAgentEvent | undefined>;
+  publishTransientRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): Promise<StoredAgentEvent | undefined>;
   subscribeRun(runId: string, listener: AgentEventListener): () => void;
 }

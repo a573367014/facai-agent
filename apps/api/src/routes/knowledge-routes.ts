@@ -26,7 +26,7 @@ export interface RegisterKnowledgeRoutesOptions {
 
 export async function registerKnowledgeRoutes(app: FastifyInstance, options: RegisterKnowledgeRoutesOptions): Promise<void> {
   app.get("/knowledge/documents", async () => ({
-    documents: options.store.listKnowledgeDocuments()
+    documents: await options.store.listKnowledgeDocuments()
   }));
 
   app.post("/knowledge/documents/upload", async (request, reply) => {
@@ -57,7 +57,7 @@ export async function registerKnowledgeRoutes(app: FastifyInstance, options: Reg
     await mkdir(targetDirectory, { recursive: true });
     await writeFile(sourcePath, buffer);
 
-    const document = options.store.createKnowledgeDocument({
+    const document = await options.store.createKnowledgeDocument({
       name,
       mimeType,
       sourcePath,
@@ -70,7 +70,7 @@ export async function registerKnowledgeRoutes(app: FastifyInstance, options: Reg
 
   app.delete("/knowledge/documents/:documentId", async (request, reply) => {
     const { documentId } = parseDocumentParams(request.params);
-    const deleted = options.store.deleteKnowledgeDocument(documentId);
+    const deleted = await options.store.deleteKnowledgeDocument(documentId);
 
     if (!deleted) {
       throw new AppError("VALIDATION_ERROR", "未找到知识库文档", 404);
@@ -81,7 +81,7 @@ export async function registerKnowledgeRoutes(app: FastifyInstance, options: Reg
 
   app.post("/knowledge/documents/:documentId/reindex", async (request, reply) => {
     const { documentId } = parseDocumentParams(request.params);
-    const document = options.store.updateKnowledgeDocument(documentId, {
+    const document = await options.store.updateKnowledgeDocument(documentId, {
       status: "pending",
       errorMessage: null
     });

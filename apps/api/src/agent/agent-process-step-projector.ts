@@ -18,12 +18,12 @@ export class AgentProcessStepProjector {
     private readonly appendEvent: AppendExecutionEvent
   ) {}
 
-  project(messageId: string, event: AgentStreamEvent, runId?: string) {
+  async project(messageId: string, event: AgentStreamEvent, runId?: string) {
     // thinking 状态只创建一次。后续如果模型继续发 thinking，只更新事件流本身，
     // 不重复创建“正在理解需求”步骤，避免前端进度列表刷出多条同类步骤。
     if (event.type === "agent_state" && event.state === "thinking") {
-      if (!this.findProcessStep(messageId, (step) => step.kind === "thinking" && step.metadata?.phase === "thinking")) {
-        this.createProcessStep(messageId, runId, {
+      if (!(await this.findProcessStep(messageId, (step) => step.kind === "thinking" && step.metadata?.phase === "thinking"))) {
+        await this.createProcessStep(messageId, runId, {
           kind: "thinking",
           title: "正在理解需求",
           summary: event.label,
@@ -37,11 +37,11 @@ export class AgentProcessStepProjector {
     if (event.type === "llm_response") {
       // llm_response 是“第一阶段思考结束”的信号：
       // 如果有 toolCalls，表示接下来要执行工具；没有 toolCalls，表示模型已经给出最终回答。
-      const thinkingStep = this.findProcessStep(messageId, (step) => step.kind === "thinking" && step.metadata?.phase === "thinking");
+      const thinkingStep = await this.findProcessStep(messageId, (step) => step.kind === "thinking" && step.metadata?.phase === "thinking");
 
       if (thinkingStep?.status === "running") {
         const toolCallCount = event.toolCalls?.filter((toolCall) => !isHiddenProcessTool(toolCall.name)).length ?? 0;
-        this.updateProcessStep(messageId, thinkingStep.id, runId, {
+        await this.updateProcessStep(messageId, thinkingStep.id, runId, {
           title: toolCallCount > 0 ? "已理解需求" : "已生成回答",
           summary: toolCallCount > 0 ? `需要执行 ${toolCallCount} 项任务` : "回答已生成",
           status: "succeeded",
@@ -57,14 +57,14 @@ export class AgentProcessStepProjector {
     if (event.type === "agent_state" && event.state === "answering") {
       // 只有真正执行过工具，才需要展示“整理回答”步骤。
       // 纯文本回答没有工具结果要整合，额外步骤会显得啰嗦。
-      const hasToolStep = Boolean(this.findProcessStep(messageId, (step) => step.kind === "tool"));
+      const hasToolStep = Boolean(await this.findProcessStep(messageId, (step) => step.kind === "tool"));
 
       if (!hasToolStep) {
         return;
       }
 
-      if (!this.findProcessStep(messageId, (step) => step.kind === "summary" && step.metadata?.phase === "answering")) {
-        this.createProcessStep(messageId, runId, {
+      if (!(await this.findProcessStep(messageId, (step) => step.kind === "summary" && step.metadata?.phase === "answering"))) {
+        await this.createProcessStep(messageId, runId, {
           kind: "summary",
           title: "正在整理回答",
           summary: "整合执行结果",
@@ -82,9 +82,9 @@ export class AgentProcessStepProjector {
 
       // tool_start 对应一条工具进度步骤。
       // 如果同一个 toolCallId 已经有步骤，说明这是重放/补偿事件，更新已有步骤即可。
-      const toolCall = event.toolCallId ? this.store.getToolCallByMessageToolCall(messageId, event.toolCallId) : undefined;
+      const toolCall = event.toolCallId ? await this.store.getToolCallByMessageToolCall(messageId, event.toolCallId) : undefined;
       const existingStep = event.toolCallId
-        ? this.findProcessStep(messageId, (step) => step.kind === "tool" && step.toolCallId === event.toolCallId)
+        ? await this.findProcessStep(messageId, (step) => step.kind === "tool" && step.toolCallId === event.toolCallId)
         : undefined;
       const summary = getPrimaryToolArgumentSummary(event.arguments);
       const labels = getToolProcessLabels(event.toolName);
@@ -96,7 +96,7 @@ export class AgentProcessStepProjector {
       });
 
       if (existingStep) {
-        this.updateProcessStep(messageId, existingStep.id, runId, {
+        await this.updateProcessStep(messageId, existingStep.id, runId, {
           toolCallRowId: toolCall?.id,
           toolCallId: event.toolCallId,
           title: labels.running,
@@ -107,7 +107,7 @@ export class AgentProcessStepProjector {
         return;
       }
 
-      this.createProcessStep(messageId, runId, {
+      await this.createProcessStep(messageId, runId, {
         kind: "tool",
         toolCallRowId: toolCall?.id,
         toolCallId: event.toolCallId,
@@ -126,12 +126,12 @@ export class AgentProcessStepProjector {
 
       // 工具成功后不把完整 result 塞进 step summary，只记录摘要到 metadata。
       // 完整结果由 tool_call/resource/message part 保存，前端需要时从那些结构展示。
-      const toolCall = this.store.getToolCallByMessageToolCall(messageId, event.toolCallId);
-      const existingStep = this.findProcessStep(messageId, (step) => step.kind === "tool" && step.toolCallId === event.toolCallId);
+      const toolCall = await this.store.getToolCallByMessageToolCall(messageId, event.toolCallId);
+      const existingStep = await this.findProcessStep(messageId, (step) => step.kind === "tool" && step.toolCallId === event.toolCallId);
       const labels = getToolProcessLabels(event.toolName);
 
       if (existingStep) {
-        this.updateProcessStep(messageId, existingStep.id, runId, {
+        await this.updateProcessStep(messageId, existingStep.id, runId, {
           toolCallRowId: toolCall?.id,
           title: labels.succeeded,
           summary: event.durationMs !== undefined ? `耗时 ${formatDuration(event.durationMs)}` : existingStep.summary,
@@ -151,12 +151,12 @@ export class AgentProcessStepProjector {
         return;
       }
 
-      const toolCall = this.store.getToolCallByMessageToolCall(messageId, event.toolCallId);
-      const existingStep = this.findProcessStep(messageId, (step) => step.kind === "tool" && step.toolCallId === event.toolCallId);
+      const toolCall = await this.store.getToolCallByMessageToolCall(messageId, event.toolCallId);
+      const existingStep = await this.findProcessStep(messageId, (step) => step.kind === "tool" && step.toolCallId === event.toolCallId);
       const labels = getToolProcessLabels(event.toolName);
 
       if (existingStep) {
-        this.updateProcessStep(messageId, existingStep.id, runId, {
+        await this.updateProcessStep(messageId, existingStep.id, runId, {
           toolCallRowId: toolCall?.id,
           title: labels.failed,
           summary: event.error.message,
@@ -172,31 +172,31 @@ export class AgentProcessStepProjector {
     }
 
     if (event.type === "error") {
-      this.completeRunning(messageId, runId, "failed");
+      await this.completeRunning(messageId, runId, "failed");
       return;
     }
 
     if (event.type === "cancelled") {
-      this.completeRunning(messageId, runId, "cancelled");
+      await this.completeRunning(messageId, runId, "cancelled");
     }
   }
 
-  completeRunning(messageId: string, runId: string | undefined, status: AgentProcessStepRecord["status"]) {
+  async completeRunning(messageId: string, runId: string | undefined, status: AgentProcessStepRecord["status"]) {
     // run 成功、失败、取消时，所有仍在 running 的步骤都要收尾。
     // 否则前端会出现消息已经结束，但进度条里还有“正在...”的悬挂状态。
-    for (const step of this.store.getProcessStepsByMessages([messageId])) {
+    for (const step of await this.store.getProcessStepsByMessages([messageId])) {
       if (step.status !== "running") {
         continue;
       }
 
-      this.updateProcessStep(messageId, step.id, runId, {
+      await this.updateProcessStep(messageId, step.id, runId, {
         ...getProcessStepCompletionPatch(step, status),
         status
       });
     }
   }
 
-  private createProcessStep(
+  private async createProcessStep(
     messageId: string,
     runId: string | undefined,
     input: {
@@ -208,15 +208,15 @@ export class AgentProcessStepProjector {
       status: AgentProcessStepRecord["status"];
       metadata?: JsonObject;
     }
-  ): AgentProcessStepRecord | undefined {
-    const message = this.store.getMessage(messageId);
+  ): Promise<AgentProcessStepRecord | undefined> {
+    const message = await this.store.getMessage(messageId);
 
     if (!message) {
       return undefined;
     }
 
     // orderIndex 由当前 message 已有步骤推导，保证前端按创建顺序稳定展示。
-    const step = this.store.createProcessStep({
+    const step = await this.store.createProcessStep({
       sessionId: message.sessionId,
       runId,
       messageId,
@@ -226,14 +226,14 @@ export class AgentProcessStepProjector {
       title: input.title,
       summary: input.summary,
       status: input.status,
-      orderIndex: this.getNextProcessStepOrderIndex(messageId),
+      orderIndex: await this.getNextProcessStepOrderIndex(messageId),
       metadata: input.metadata
     });
     this.appendEvent(messageId, { type: "process.step.created", step }, runId);
     return step;
   }
 
-  private updateProcessStep(
+  private async updateProcessStep(
     messageId: string,
     stepId: string,
     runId: string | undefined,
@@ -245,8 +245,8 @@ export class AgentProcessStepProjector {
       status?: AgentProcessStepRecord["status"];
       metadata?: JsonObject;
     }
-  ): AgentProcessStepRecord | undefined {
-    const step = this.store.updateProcessStep(stepId, input);
+  ): Promise<AgentProcessStepRecord | undefined> {
+    const step = await this.store.updateProcessStep(stepId, input);
 
     if (!step) {
       return undefined;
@@ -256,12 +256,12 @@ export class AgentProcessStepProjector {
     return step;
   }
 
-  private findProcessStep(messageId: string, predicate: (step: AgentProcessStepRecord) => boolean): AgentProcessStepRecord | undefined {
-    return this.store.getProcessStepsByMessages([messageId]).find(predicate);
+  private async findProcessStep(messageId: string, predicate: (step: AgentProcessStepRecord) => boolean): Promise<AgentProcessStepRecord | undefined> {
+    return (await this.store.getProcessStepsByMessages([messageId])).find(predicate);
   }
 
-  private getNextProcessStepOrderIndex(messageId: string) {
-    const steps = this.store.getProcessStepsByMessages([messageId]);
+  private async getNextProcessStepOrderIndex(messageId: string) {
+    const steps = await this.store.getProcessStepsByMessages([messageId]);
     const maxOrderIndex = Math.max(-1, ...steps.map((step) => step.orderIndex));
     return maxOrderIndex + 1;
   }

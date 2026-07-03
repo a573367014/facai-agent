@@ -1,13 +1,14 @@
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { InMemoryAgentCancellationStore } from "../../src/agent/agent-cancellation-store.js";
 import { InMemoryAgentEventBus } from "../../src/agent/agent-event-bus.js";
 import { InMemoryAgentRunLock } from "../../src/agent/agent-run-lock.js";
 import type { AgentRunJobPayload, AgentRunQueue } from "../../src/agent/agent-run-queue.js";
 import { AgentService } from "../../src/agent/agent-service.js";
+import { PostgresAgentStore } from "../../src/agent/postgres-agent-store.js";
 import { InMemoryRunningMessageStateStore } from "../../src/agent/running-message-state-store.js";
 import { buildApp } from "../../src/app.js";
 import type { EmbeddingService } from "../../src/knowledge/embedding-service.js";
@@ -18,8 +19,11 @@ import type { LlmProvider } from "../../src/providers/types.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
 import { ToolRegistry } from "../../src/tools/registry.js";
 
+const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? "postgres://postgres:postgres@localhost:5432/agent_test";
+
 const apps: FastifyInstance[] = [];
-let tempDirs: string[] = [];
+const uploadDirs: string[] = [];
+let agentStore: PostgresAgentStore;
 
 class NoopAgentRunQueue implements AgentRunQueue {
   async enqueueRun(_payload: AgentRunJobPayload): Promise<void> {}
@@ -80,12 +84,6 @@ function createTestAgentService(): AgentService {
   });
 }
 
-function createTempDatabasePath() {
-  const dir = mkdtempSync(join(tmpdir(), "knowledge-routes-"));
-  tempDirs.push(dir);
-  return join(dir, "agent.sqlite");
-}
-
 async function buildKnowledgeTestApp(options: { uploadDirectory: string; knowledgeIndexQueue: KnowledgeIndexQueue }) {
   const app = (await buildApp({
     agentService: createTestAgentService(),
@@ -94,7 +92,7 @@ async function buildKnowledgeTestApp(options: { uploadDirectory: string; knowled
     runQueue: new NoopAgentRunQueue(),
     cancellationStore: new InMemoryAgentCancellationStore(),
     runLock: new InMemoryAgentRunLock(),
-    databasePath: createTempDatabasePath(),
+    databasePath: TEST_DATABASE_URL,
     uploadDirectory: options.uploadDirectory,
     knowledgeIndexQueue: options.knowledgeIndexQueue,
     embeddingService: new FakeEmbeddingService()
@@ -103,21 +101,31 @@ async function buildKnowledgeTestApp(options: { uploadDirectory: string; knowled
   return app;
 }
 
+beforeAll(async () => {
+  agentStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+});
+
 afterEach(async () => {
   for (const app of apps.splice(0)) {
     await app.close();
   }
 
-  for (const dir of tempDirs) {
+  await agentStore.reset();
+
+  for (const dir of uploadDirs) {
     rmSync(dir, { recursive: true, force: true });
   }
-  tempDirs = [];
+  uploadDirs.length = 0;
+});
+
+afterAll(async () => {
+  await agentStore.close();
 });
 
 describe("knowledge routes", () => {
   it("上传文档后创建 pending 记录并入队索引", async () => {
     const uploadDirectory = mkdtempSync(join(tmpdir(), "knowledge-upload-"));
-    tempDirs.push(uploadDirectory);
+    uploadDirs.push(uploadDirectory);
     const queue = new CapturingKnowledgeIndexQueue();
     const app = await buildKnowledgeTestApp({ uploadDirectory, knowledgeIndexQueue: queue });
     const multipart = createMultipartPayload({
@@ -158,7 +166,7 @@ describe("knowledge routes", () => {
 
   it("后台索引完成后搜索接口返回 ready 文档来源", async () => {
     const uploadDirectory = mkdtempSync(join(tmpdir(), "knowledge-upload-"));
-    tempDirs.push(uploadDirectory);
+    uploadDirs.push(uploadDirectory);
     const queue = new CapturingKnowledgeIndexQueue();
     const app = await buildKnowledgeTestApp({ uploadDirectory, knowledgeIndexQueue: queue });
     const multipart = createMultipartPayload({

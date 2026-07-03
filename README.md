@@ -1,6 +1,6 @@
 # facai-agent
 
-一个基于 Node.js Fastify 和 React 的工具调用型 Agent 本地开发版。当前使用 SQLite 保存会话、消息、run、工具调用、资源索引和任务进度；Redis 负责运行时协调、事件广播、取消标记、执行锁和 BullMQ run 队列；Agent 过程事件写入本地 JSONL 日志。消息渲染以 `message.parts` 快照为准，`agent_resources` 负责资源索引、审计和聚合查询；工具生成的图片 / 视频会先转储到本地 uploads，避免供应商临时 URL 短时间失效。架构边界按后续替换 MySQL / OSS / SLS 的产品化方向设计。
+一个基于 Node.js Fastify 和 React 的工具调用型 Agent 本地开发版。当前使用 PostgreSQL（pgvector 扩展）保存会话、消息、run、工具调用、资源索引和任务进度；Redis 负责运行时协调、事件广播、取消标记、执行锁和 BullMQ run 队列；Agent 过程事件写入本地 JSONL 日志。消息渲染以 `message.parts` 快照为准，`agent_resources` 负责资源索引、审计和聚合查询；工具生成的图片 / 视频会先转储到本地 uploads，避免供应商临时 URL 短时间失效。架构边界按后续替换 MySQL / OSS / SLS 的产品化方向设计。
 
 ## 结构
 
@@ -17,7 +17,7 @@
 - `OPENAI_EMBEDDING_API_KEY`、`OPENAI_EMBEDDING_BASE_URL`、`OPENAI_EMBEDDING_MODEL`：`EMBEDDING_PROVIDER=openai-compatible` 时使用；未配置前两项时会复用聊天模型的 key 和 base URL。
 - `REDIS_URL`：Redis 连接地址，默认 `redis://localhost:6379`。产品化运行时固定依赖 Redis，不再提供切换底层实现的开发态开关。
 - `AGENT_WORKER_CONCURRENCY`：Worker 同时执行 run 的数量，默认 `2`。
-- `AGENT_SQLITE_PATH`：SQLite 文件路径，默认 `./data/agent.sqlite`。
+- `DATABASE_URL`：PostgreSQL 连接串，默认 `postgres://postgres:postgres@localhost:5432/agent`。需要安装 pgvector 扩展。
 - `AGENT_EVENT_LOG_PATH`：Agent 过程事件 JSONL 日志路径，默认 `./data/agent-events.jsonl`。
 - `AGENT_UPLOAD_DIR`：用户上传和工具资源转储目录，默认 `./data/uploads`。
 - `TAVILY_API_KEY`：配置后启用 `web_search` 工具。

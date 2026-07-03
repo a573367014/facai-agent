@@ -243,7 +243,7 @@ export async function registerAgentRoutes(
 ): Promise<void> {
   app.post("/agents/sessions", async (request, reply) => {
     const { title } = parseSessionRequest(request.body);
-    reply.status(201).send({ session: coordinator.createSession(title) });
+    reply.status(201).send({ session: await coordinator.createSession(title) });
   });
 
   app.get("/agents/sessions", async (request) => {
@@ -343,7 +343,7 @@ export async function registerAgentRoutes(
 
   app.get("/agents/runs/:runId/stream", async (request, reply) => {
     const { runId } = parseRunParams(request.params);
-    coordinator.getRun(runId);
+    await coordinator.getRun(runId);
 
     reply.raw.writeHead(200, buildSseHeaders(reply.getHeaders()));
 
@@ -382,7 +382,7 @@ export async function registerAgentRoutes(
       }
     });
 
-    const { run } = coordinator.getRun(runId);
+    const { run } = await coordinator.getRun(runId);
     if (run.assistantMessageId) {
       const { message, resources, processSteps, version } = await coordinator.getMessageSnapshot(run.assistantMessageId);
       writeStoredEvent(

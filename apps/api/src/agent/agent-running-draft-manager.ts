@@ -84,7 +84,7 @@ export class AgentRunningDraftManager {
   }
 
   async getParts(messageId: string, runId?: string): Promise<MessagePart[]> {
-    const message = this.store.getMessage(messageId);
+    const message = await this.store.getMessage(messageId);
 
     if (!message) {
       return [];
@@ -95,7 +95,7 @@ export class AgentRunningDraftManager {
   }
 
   async setParts(messageId: string, parts: MessagePart[], runId?: string): Promise<DraftPartsUpdate> {
-    const message = this.store.getMessage(messageId);
+    const message = await this.store.getMessage(messageId);
 
     if (!message) {
       return { parts };
@@ -114,12 +114,12 @@ export class AgentRunningDraftManager {
 
     return {
       // 非 running 消息没有草稿层，直接更新 SQLite。这个分支主要服务补偿/终态后的少量修正。
-      parts: this.store.updateMessageParts(messageId, parts)?.parts ?? parts
+      parts: (await this.store.updateMessageParts(messageId, parts))?.parts ?? parts
     };
   }
 
   async appendTextDelta(messageId: string, delta: string, runId?: string): Promise<RunningMessageDeltaResult | undefined> {
-    const message = this.store.getMessage(messageId);
+    const message = await this.store.getMessage(messageId);
 
     if (!message) {
       return undefined;

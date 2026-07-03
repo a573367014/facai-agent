@@ -1,12 +1,9 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { AgentContextBuilder } from "../../src/agent/context-builder.js";
 import { AgentMessageCoordinator } from "../../src/agent/agent-message-coordinator.js";
 import { AgentSummaryService } from "../../src/agent/agent-summary-service.js";
-import { SqliteAgentStore } from "../../src/agent/sqlite-agent-store.js";
+import { PostgresAgentStore } from "../../src/agent/postgres-agent-store.js";
 import { AgentService } from "../../src/agent/agent-service.js";
 import type { AgentRunQueue, AgentRunJobPayload } from "../../src/agent/agent-run-queue.js";
 import type { AgentEventBus } from "../../src/agent/agent-event-bus.js";
@@ -17,58 +14,45 @@ import type { LlmProvider } from "../../src/providers/types.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
 import { ToolRegistry } from "../../src/tools/registry.js";
 
-let tempDirs: string[] = [];
-
-function createTempDatabasePath() {
-  const dir = mkdtempSync(join(tmpdir(), "agent-coordinator-"));
-  tempDirs.push(dir);
-  return join(dir, "agent.sqlite");
-}
-
-afterEach(() => {
-  for (const dir of tempDirs) {
-    rmSync(dir, { recursive: true, force: true });
-  }
-  tempDirs = [];
-});
+const TEST_DATABASE_URL = process.env.DATABASE_URL ?? "postgres://postgres:postgres@localhost:5432/agent_test";
 
 async function waitForMessage(coordinator: AgentMessageCoordinator, messageId: string) {
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    const { message } = coordinator.getMessage(messageId);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const { message } = await coordinator.getMessage(messageId);
 
     if (message.status !== "running") {
       return message;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
 
   throw new Error("message did not finish in time");
 }
 
 async function waitForRun(coordinator: AgentMessageCoordinator, runId: string) {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    const { run } = coordinator.getRun(runId);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const { run } = await coordinator.getRun(runId);
 
     if (run.status !== "running") {
       return run;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
 
   throw new Error("run did not finish in time");
 }
 
 async function waitForRunAssistantMessageId(coordinator: AgentMessageCoordinator, runId: string) {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    const { run } = coordinator.getRun(runId);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const { run } = await coordinator.getRun(runId);
 
     if (run.assistantMessageId) {
       return run.assistantMessageId;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
 
   throw new Error("run did not create assistant message in time");
@@ -89,19 +73,19 @@ async function startRunAndWait(
   return {
     ...started,
     run,
-    assistantMessage: coordinator.getMessage(assistantMessageId).message
+    assistantMessage: (await coordinator.getMessage(assistantMessageId)).message
   };
 }
 
-async function waitForSessionSummary(store: SqliteAgentStore, sessionId: string) {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    const summary = store.getSessionSummary(sessionId);
+async function waitForSessionSummary(store: PostgresAgentStore, sessionId: string) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const summary = await store.getSessionSummary(sessionId);
 
     if (summary) {
       return summary;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
 
   throw new Error("summary did not finish in time");
@@ -184,7 +168,8 @@ describe("AgentMessageCoordinator", () => {
       unhandledRejections.push(reason);
     };
     const registry = new ToolRegistry();
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const runQueue: AgentRunQueue = {
       enqueueRun: async () => {}
     };
@@ -208,7 +193,7 @@ describe("AgentMessageCoordinator", () => {
       expect(unhandledRejections).toEqual([]);
     } finally {
       process.off("unhandledRejection", onUnhandledRejection);
-      store.close();
+      await store.close();
     }
   });
 
@@ -224,9 +209,9 @@ describe("AgentMessageCoordinator", () => {
       }
     };
     const eventBus = new FakeAgentEventBus();
-    const databasePath = createTempDatabasePath();
-    const apiStore = await SqliteAgentStore.create({ databasePath });
-    const workerStore = await SqliteAgentStore.create({ databasePath });
+    const apiStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    const workerStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await apiStore.reset();
     const apiCoordinator = new AgentMessageCoordinator(
       createAgentService({ complete: async () => ({ content: "API 不执行" }) }, registry),
       apiStore,
@@ -261,8 +246,8 @@ describe("AgentMessageCoordinator", () => {
 
       expect(receivedEvents.map((event) => event.event.type)).toContain("run_completed");
     } finally {
-      apiStore.close();
-      workerStore.close();
+      await apiStore.close();
+      await workerStore.close();
     }
   });
 
@@ -281,7 +266,8 @@ describe("AgentMessageCoordinator", () => {
         enqueuedRuns.push(payload);
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(
       createAgentService(provider, registry),
       store,
@@ -309,13 +295,13 @@ describe("AgentMessageCoordinator", () => {
           assistantMessageId: started.run.assistantMessageId!
         }
       ]);
-      expect(store.getMessage(started.run.assistantMessageId!)).toMatchObject({
+      expect(await store.getMessage(started.run.assistantMessageId!)).toMatchObject({
         role: "assistant",
         status: "running",
         parts: []
       });
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -330,7 +316,8 @@ describe("AgentMessageCoordinator", () => {
         enqueuedRuns.push(payload);
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(
       createAgentService(provider, registry),
       store,
@@ -346,8 +333,8 @@ describe("AgentMessageCoordinator", () => {
 
       await coordinator.executeQueuedRun(enqueuedRuns[0]!);
 
-      const completedRun = coordinator.getRun(started.run.id).run;
-      const completedMessage = store.getMessage(started.run.assistantMessageId!);
+      const completedRun = (await coordinator.getRun(started.run.id)).run;
+      const completedMessage = await store.getMessage(started.run.assistantMessageId!);
 
       expect(completedRun).toMatchObject({
         status: "completed",
@@ -360,7 +347,7 @@ describe("AgentMessageCoordinator", () => {
         parts: [{ type: "text", value: "队列任务已完成" }]
       });
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -373,7 +360,8 @@ describe("AgentMessageCoordinator", () => {
     const runQueue: AgentRunQueue = {
       enqueueRun: async () => {}
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(
       createAgentService(provider, registry),
       store,
@@ -391,7 +379,7 @@ describe("AgentMessageCoordinator", () => {
 
       expect(await cancellationStore.isRunCancelled(started.run.id)).toBe(true);
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -413,7 +401,8 @@ describe("AgentMessageCoordinator", () => {
     const runLock: AgentRunLock = {
       acquire: async () => undefined
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(
       createAgentService(provider, registry),
       store,
@@ -430,7 +419,7 @@ describe("AgentMessageCoordinator", () => {
 
       expect(providerCalls).toBe(0);
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -454,7 +443,8 @@ describe("AgentMessageCoordinator", () => {
     const runLock: AgentRunLock = {
       acquire: async () => lease
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(
       createAgentService(provider, registry),
       store,
@@ -471,7 +461,7 @@ describe("AgentMessageCoordinator", () => {
 
       expect(released).toBe(true);
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -498,7 +488,8 @@ describe("AgentMessageCoordinator", () => {
         enqueuedRuns.push(payload);
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     let apiCoordinator!: AgentMessageCoordinator;
     let providerCalls = 0;
     const workerProvider: LlmProvider = {
@@ -547,12 +538,12 @@ describe("AgentMessageCoordinator", () => {
 
       expect(providerCalls).toBe(1);
       expect(toolExecutions).toBe(0);
-      expect(workerCoordinator.getRun(started.run.id).run).toMatchObject({
+      expect((await workerCoordinator.getRun(started.run.id)).run).toMatchObject({
         status: "cancelled",
         phase: "cancelled"
       });
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -561,28 +552,29 @@ describe("AgentMessageCoordinator", () => {
     const provider: LlmProvider = {
       complete: async () => ({ content: "不会执行" })
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
-    const session = store.createSession("遗留运行");
-    const userMessage = store.createMessage({
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
+    const session = await store.createSession("遗留运行");
+    const userMessage = await store.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "再生产" }]
     });
-    const assistantMessage = store.createMessage({
+    const assistantMessage = await store.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "running",
       parts: [{ type: "text", value: "" }]
     });
-    const run = store.createRun({
+    const run = await store.createRun({
       sessionId: session.id,
       userMessageId: userMessage.id,
       assistantMessageId: assistantMessage.id,
       status: "running",
       phase: "answering"
     });
-    const toolCall = store.createToolCall({
+    const toolCall = await store.createToolCall({
       sessionId: session.id,
       runId: run.id,
       messageId: assistantMessage.id,
@@ -592,7 +584,7 @@ describe("AgentMessageCoordinator", () => {
       arguments: { prompt: "生成视频" },
       status: "running"
     });
-    const resource = store.createResource({
+    const resource = await store.createResource({
       sessionId: session.id,
       messageId: assistantMessage.id,
       toolCallRowId: toolCall.id,
@@ -602,7 +594,7 @@ describe("AgentMessageCoordinator", () => {
       status: "pending",
       metadata: { prompt: "生成视频" }
     });
-    const step = store.createProcessStep({
+    const step = await store.createProcessStep({
       sessionId: session.id,
       runId: run.id,
       messageId: assistantMessage.id,
@@ -624,7 +616,7 @@ describe("AgentMessageCoordinator", () => {
       resources: 1,
       processSteps: 1
     });
-    expect(store.getRun(run.id)).toMatchObject({
+    expect(await store.getRun(run.id)).toMatchObject({
       status: "failed",
       phase: "failed",
       error: {
@@ -633,7 +625,7 @@ describe("AgentMessageCoordinator", () => {
       },
       completedAt: expect.any(String)
     });
-    expect(store.getMessage(assistantMessage.id)).toMatchObject({
+    expect(await store.getMessage(assistantMessage.id)).toMatchObject({
       status: "failed",
       parts: [{ type: "text", value: "本轮运行因服务重启中断，请重新生成。" }],
       error: {
@@ -642,7 +634,7 @@ describe("AgentMessageCoordinator", () => {
       },
       completedAt: expect.any(String)
     });
-    expect(store.getToolCallsBySession(session.id)).toEqual([
+    expect(await store.getToolCallsBySession(session.id)).toEqual([
       expect.objectContaining({
         id: toolCall.id,
         status: "failed",
@@ -653,7 +645,7 @@ describe("AgentMessageCoordinator", () => {
         completedAt: expect.any(String)
       })
     ]);
-    expect(store.getResourcesByMessages([assistantMessage.id])).toEqual([
+    expect(await store.getResourcesByMessages([assistantMessage.id])).toEqual([
       expect.objectContaining({
         id: resource.id,
         status: "failed",
@@ -666,14 +658,14 @@ describe("AgentMessageCoordinator", () => {
         }
       })
     ]);
-    expect(store.getProcessStepsByMessages([assistantMessage.id])).toEqual([
+    expect(await store.getProcessStepsByMessages([assistantMessage.id])).toEqual([
       expect.objectContaining({
         id: step.id,
         status: "failed",
         completedAt: expect.any(String)
       })
     ]);
-    store.close();
+    await store.close();
   });
 
   it("shutdown 会取消当前进程内的 running run", async () => {
@@ -689,19 +681,20 @@ describe("AgentMessageCoordinator", () => {
         return { content: "不会完成" };
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
     const started = await coordinator.startRun({ input: "生成长任务" });
 
     await coordinator.shutdown("服务关闭");
 
-    const snapshot = coordinator.getRun(started.run.id);
+    const snapshot = await coordinator.getRun(started.run.id);
     expect(snapshot.run).toMatchObject({
       status: "cancelled",
       phase: "cancelled",
       completedAt: expect.any(String)
     });
-    store.close();
+    await store.close();
   });
 
   it("run 会在本轮回答前执行上下文压缩，并用 system message 展示压缩状态", async () => {
@@ -731,7 +724,8 @@ describe("AgentMessageCoordinator", () => {
         };
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(
       createAgentService(answerProvider, registry),
       store,
@@ -752,7 +746,7 @@ describe("AgentMessageCoordinator", () => {
       const third = await coordinator.startRun({ sessionId: first.session.id, input: "第三轮问题" });
       await waitForRun(coordinator, third.run.id);
 
-      const systemMessage = store.getMessagesBySession(first.session.id).find((message) => message.role === "system");
+      const systemMessage = (await store.getMessagesBySession(first.session.id)).find((message) => message.role === "system");
 
       expect(systemMessage).toMatchObject({
         role: "system",
@@ -771,7 +765,7 @@ describe("AgentMessageCoordinator", () => {
       ]);
       expect(answerCalls[2]?.join("\n")).not.toContain("上下文自动压缩");
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -784,21 +778,22 @@ describe("AgentMessageCoordinator", () => {
         return { content: "重新生成的回答" };
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
-    const session = store.createSession("重新生成会话");
-    const backgroundUser = store.createMessage({
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
+    const session = await store.createSession("重新生成会话");
+    const backgroundUser = await store.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "背景：只讨论 Agent 架构" }]
     });
-    const backgroundAssistant = store.createMessage({
+    const backgroundAssistant = await store.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "completed",
       parts: [{ type: "text", value: "已记录 Agent 架构背景" }]
     });
-    store.upsertSessionSummary({
+    await store.upsertSessionSummary({
       sessionId: session.id,
       coveredMessageId: backgroundAssistant.id,
       summary: {
@@ -812,31 +807,31 @@ describe("AgentMessageCoordinator", () => {
         recentProgress: []
       }
     });
-    const targetUser = store.createMessage({
+    const targetUser = await store.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "介绍一下 Agent Runtime" }]
     });
-    const targetAssistant = store.createMessage({
+    const targetAssistant = await store.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "completed",
       parts: [{ type: "text", value: "旧回答" }]
     });
-    const futureUser = store.createMessage({
+    const futureUser = await store.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "后续再加入图片生成" }]
     });
-    const futureAssistant = store.createMessage({
+    const futureAssistant = await store.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "completed",
       parts: [{ type: "text", value: "未来回答" }]
     });
-    store.upsertSessionSummary({
+    await store.upsertSessionSummary({
       sessionId: session.id,
       coveredMessageId: futureAssistant.id,
       summary: {
@@ -862,7 +857,7 @@ describe("AgentMessageCoordinator", () => {
       await waitForRun(coordinator, regenerated.run.id);
 
       const prompt = answerCalls[0]?.join("\n") ?? "";
-      const messages = coordinator.getSession(session.id).messages;
+      const messages = (await coordinator.getSession(session.id)).messages;
       const regeneratedAssistant = messages.find(
         (message) => message.role === "assistant" && message.parts[0]?.type === "text" && message.parts[0].value === "重新生成的回答"
       );
@@ -875,7 +870,7 @@ describe("AgentMessageCoordinator", () => {
       expect(prompt).not.toContain("后续再加入图片生成");
       expect(prompt).not.toContain("未来回答");
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -938,21 +933,22 @@ describe("AgentMessageCoordinator", () => {
         return { content: "图片已重新生成。" };
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
-    const session = store.createSession("连续重试媒体回答");
-    const targetUser = store.createMessage({
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
+    const session = await store.createSession("连续重试媒体回答");
+    const targetUser = await store.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "生成两张图：小猫和小狗" }]
     });
-    const targetAssistant = store.createMessage({
+    const targetAssistant = await store.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "completed",
       parts: [{ type: "text", value: "两张图片已生成。" }]
     });
-    store.createToolCall({
+    await store.createToolCall({
       sessionId: session.id,
       messageId: targetAssistant.id,
       iteration: 0,
@@ -969,8 +965,8 @@ describe("AgentMessageCoordinator", () => {
       const regenerated = await coordinator.regenerateMessage(targetAssistant.id);
 
       await waitForRun(coordinator, regenerated.run.id);
-      const completedRun = coordinator.getRun(regenerated.run.id).run;
-      const regeneratedAssistant = completedRun.assistantMessageId ? store.getMessage(completedRun.assistantMessageId) : undefined;
+      const completedRun = (await coordinator.getRun(regenerated.run.id)).run;
+      const regeneratedAssistant = completedRun.assistantMessageId ? await store.getMessage(completedRun.assistantMessageId) : undefined;
       const mediaParts = regeneratedAssistant?.parts.filter((part) => part.type === "media") ?? [];
 
       expect(regenerated.userMessage.id).toBe(targetUser.id);
@@ -981,7 +977,7 @@ describe("AgentMessageCoordinator", () => {
       ]);
       expect(mediaParts).toHaveLength(2);
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -995,27 +991,28 @@ describe("AgentMessageCoordinator", () => {
         return { content: `回答 ${answerInputs.length}` };
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
-    const session = store.createSession("连续重试原始用户绑定");
-    const originalUser = store.createMessage({
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
+    const session = await store.createSession("连续重试原始用户绑定");
+    const originalUser = await store.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "生成两张图：小猫和小狗" }]
     });
-    const originalAssistant = store.createMessage({
+    const originalAssistant = await store.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "completed",
       parts: [{ type: "text", value: "两张图片已生成。" }]
     });
-    store.createMessage({
+    await store.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "后续很远的另一个问题" }]
     });
-    store.createMessage({
+    await store.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "completed",
@@ -1027,7 +1024,7 @@ describe("AgentMessageCoordinator", () => {
       const firstRegeneration = await coordinator.regenerateMessage(originalAssistant.id);
 
       await waitForRun(coordinator, firstRegeneration.run.id);
-      const firstRegeneratedAssistantId = coordinator.getRun(firstRegeneration.run.id).run.assistantMessageId;
+      const firstRegeneratedAssistantId = (await coordinator.getRun(firstRegeneration.run.id)).run.assistantMessageId;
 
       if (!firstRegeneratedAssistantId) {
         throw new Error("first regenerated assistant was not created");
@@ -1044,19 +1041,20 @@ describe("AgentMessageCoordinator", () => {
         "生成两张图：小猫和小狗"
       ]);
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
   it("run 压缩成功入库后，即使回答阶段被取消，下次 run 也不会重复压缩同一段消息", async () => {
     const summaryCalls: string[][] = [];
     const registry = new ToolRegistry();
-    let answerCount = 0;
+    let shouldHangOnAnswer = false;
+    let answerCallStarted = false;
     const answerProvider: LlmProvider = {
       complete: async ({ messages, signal }) => {
-        answerCount += 1;
+        answerCallStarted = true;
 
-        if (answerCount === 3) {
+        if (shouldHangOnAnswer) {
           await new Promise((_resolve, reject) => {
             signal?.addEventListener("abort", () => {
               reject(new DOMException("Aborted", "AbortError"));
@@ -1064,7 +1062,7 @@ describe("AgentMessageCoordinator", () => {
           });
         }
 
-        return { content: `第 ${answerCount} 轮回答` };
+        return { content: `回答：${"content" in messages[messages.length - 1] ? messages[messages.length - 1].content : ""}` };
       }
     };
     const summaryProvider: LlmProvider = {
@@ -1084,7 +1082,8 @@ describe("AgentMessageCoordinator", () => {
         };
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(
       createAgentService(answerProvider, registry),
       store,
@@ -1105,19 +1104,31 @@ describe("AgentMessageCoordinator", () => {
       const third = await coordinator.startRun({ sessionId: first.session.id, input: "第三轮问题" });
       await waitForSessionSummary(store, first.session.id);
 
-      const summaryAfterCompression = store.getSessionSummary(first.session.id);
+      const summaryAfterCompression = await store.getSessionSummary(first.session.id);
+      shouldHangOnAnswer = true;
+      answerCallStarted = false;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if (answerCallStarted) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      if (!answerCallStarted) {
+        throw new Error("third run answer call did not start in time");
+      }
       await coordinator.cancelRun(third.run.id);
       await waitForRun(coordinator, third.run.id);
+      shouldHangOnAnswer = false;
 
-      expect(summaryAfterCompression?.coveredMessageId).toBe(coordinator.getRun(first.run.id).run.assistantMessageId);
-      expect(store.getSessionSummary(first.session.id)?.coveredMessageId).toBe(summaryAfterCompression?.coveredMessageId);
+      expect(summaryAfterCompression?.coveredMessageId).toBe((await coordinator.getRun(first.run.id)).run.assistantMessageId);
+      expect((await store.getSessionSummary(first.session.id))?.coveredMessageId).toBe(summaryAfterCompression?.coveredMessageId);
 
       const fourth = await coordinator.startRun({ sessionId: first.session.id, input: "第四轮问题" });
       await waitForRun(coordinator, fourth.run.id);
 
       expect(summaryCalls).toHaveLength(1);
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -1144,7 +1155,8 @@ describe("AgentMessageCoordinator", () => {
         };
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(
       createAgentService(answerProvider, registry),
       store,
@@ -1166,12 +1178,12 @@ describe("AgentMessageCoordinator", () => {
         await waitForRun(coordinator, started.run.id);
       }
 
-      const systemMessages = store.getMessagesBySession(sessionId ?? "").filter((message) => message.role === "system");
+      const systemMessages = (await store.getMessagesBySession(sessionId ?? "")).filter((message) => message.role === "system");
       expect(summaryCalls).toHaveLength(0);
       expect(systemMessages).toHaveLength(0);
-      expect(store.getSessionSummary(sessionId ?? "")).toBeUndefined();
+      expect(await store.getSessionSummary(sessionId ?? "")).toBeUndefined();
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -1198,16 +1210,17 @@ describe("AgentMessageCoordinator", () => {
         };
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
-    const session = store.createSession("压缩窗口");
-    const coveredMessage = store.createMessage({
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
+    const session = await store.createSession("压缩窗口");
+    const coveredMessage = await store.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "completed",
       parts: [{ type: "text", value: "已覆盖内容" }]
     });
 
-    store.upsertSessionSummary({
+    await store.upsertSessionSummary({
       sessionId: session.id,
       coveredMessageId: coveredMessage.id,
       summary: {
@@ -1223,13 +1236,13 @@ describe("AgentMessageCoordinator", () => {
     });
 
     for (let index = 0; index < 9; index += 1) {
-      store.createMessage({
+      await store.createMessage({
         sessionId: session.id,
         role: "user",
         status: "completed",
         parts: [{ type: "text", value: "1" }]
       });
-      store.createMessage({
+      await store.createMessage({
         sessionId: session.id,
         role: "assistant",
         status: "cancelled",
@@ -1240,19 +1253,19 @@ describe("AgentMessageCoordinator", () => {
     const oldLongContent = `旧内容${"很长".repeat(750)}`;
     const recentLongContent = `最近长回复${"保留".repeat(750)}`;
 
-    store.createMessage({
+    await store.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "completed",
       parts: [{ type: "text", value: oldLongContent }]
     });
-    store.createMessage({
+    await store.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "最近问题" }]
     });
-    store.createMessage({
+    await store.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "completed",
@@ -1280,9 +1293,9 @@ describe("AgentMessageCoordinator", () => {
       expect(summaryCalls).toHaveLength(1);
       expect(summaryPrompt).toContain(oldLongContent.slice(0, 40));
       expect(summaryPrompt).not.toContain(recentLongContent.slice(0, 40));
-      expect(store.getMessagesBySession(session.id).some((message) => message.role === "system")).toBe(true);
+      expect((await store.getMessagesBySession(session.id)).some((message) => message.role === "system")).toBe(true);
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -1295,7 +1308,8 @@ describe("AgentMessageCoordinator", () => {
         return { content: `第 ${calls.length} 轮回答` };
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(
       createAgentService(provider, registry),
       store,
@@ -1317,7 +1331,7 @@ describe("AgentMessageCoordinator", () => {
         "user:第三轮问题"
       ]);
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -1326,21 +1340,25 @@ describe("AgentMessageCoordinator", () => {
     const provider: LlmProvider = {
       complete: async () => ({ content: "固定回答" })
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
-    const session = store.createSession("长会话");
-    const messages = Array.from({ length: 5 }, (_, index) =>
-      store.createMessage({
-        sessionId: session.id,
-        role: index % 2 === 0 ? "user" : "assistant",
-        status: "completed",
-        parts: [{ type: "text", value: `历史消息 ${index + 1}` }]
-      })
-    );
+    const session = await store.createSession("长会话");
+    const messages: { id: string }[] = [];
+    for (let index = 0; index < 5; index += 1) {
+      messages.push(
+        await store.createMessage({
+          sessionId: session.id,
+          role: index % 2 === 0 ? "user" : "assistant",
+          status: "completed",
+          parts: [{ type: "text", value: `历史消息 ${index + 1}` }]
+        })
+      );
+    }
 
     try {
-      const snapshot = coordinator.getSession(session.id, { messageLimit: 2 });
-      const previousPage = coordinator.getSessionMessages(session.id, {
+      const snapshot = await coordinator.getSession(session.id, { messageLimit: 2 });
+      const previousPage = await coordinator.getSessionMessages(session.id, {
         before: snapshot.pageInfo.nextCursor,
         messageLimit: 2
       });
@@ -1358,7 +1376,7 @@ describe("AgentMessageCoordinator", () => {
         limit: 2
       });
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -1403,7 +1421,8 @@ describe("AgentMessageCoordinator", () => {
         return { content: "图片已生成。" };
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const resourceStorage = {
       storeRemoteResource: async () => ({
         url: "http://127.0.0.1:4001/uploads/resources/images/local-pig.png",
@@ -1426,7 +1445,7 @@ describe("AgentMessageCoordinator", () => {
       const started = await startRunAndWait(coordinator, { input: "生成一张小猪图片" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
-      const session = coordinator.getSession(started.session.id);
+      const session = await coordinator.getSession(started.session.id);
       const assistant = session.messages.find((message) => message.id === started.assistantMessage.id);
       const mediaPart = assistant?.parts.find((part) => part.type === "media");
       const resourceId = mediaPart?.extra?.resource?.id;
@@ -1478,7 +1497,7 @@ describe("AgentMessageCoordinator", () => {
         })
       ]);
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -1525,7 +1544,8 @@ describe("AgentMessageCoordinator", () => {
         return { content: "视频已生成。" };
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const resourceStorage = {
       storeRemoteResource: async () => ({
         url: "http://127.0.0.1:4001/uploads/resources/videos/local-pig.mp4",
@@ -1548,7 +1568,7 @@ describe("AgentMessageCoordinator", () => {
       const started = await startRunAndWait(coordinator, { input: "生成一段小猪视频" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
-      const session = coordinator.getSession(started.session.id);
+      const session = await coordinator.getSession(started.session.id);
       const assistant = session.messages.find((message) => message.id === started.assistantMessage.id);
       const mediaPart = assistant?.parts.find((part) => part.type === "media");
       const resourceId = mediaPart?.extra?.resource?.id;
@@ -1605,7 +1625,7 @@ describe("AgentMessageCoordinator", () => {
         })
       ]);
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -1656,14 +1676,15 @@ describe("AgentMessageCoordinator", () => {
         return { content: "图片已编辑完成。" };
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
 
     try {
       const started = await startRunAndWait(coordinator, { input: "把这张小猪图改成水彩风格" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
-      const session = coordinator.getSession(started.session.id);
+      const session = await coordinator.getSession(started.session.id);
       const assistant = session.messages.find((message) => message.id === started.assistantMessage.id);
       const mediaPart = assistant?.parts.find((part) => part.type === "media");
       const resourceId = mediaPart?.extra?.resource?.id;
@@ -1702,7 +1723,7 @@ describe("AgentMessageCoordinator", () => {
         })
       ]);
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -1718,18 +1739,19 @@ describe("AgentMessageCoordinator", () => {
         return { content: "你好世界" };
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
 
     try {
       const started = await startRunAndWait(coordinator, { input: "问候一下" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
-      const { message } = coordinator.getMessage(started.assistantMessage.id);
+      const { message } = await coordinator.getMessage(started.assistantMessage.id);
 
       expect(message.parts).toEqual([{ type: "text", value: "你好世界" }]);
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -1749,7 +1771,8 @@ describe("AgentMessageCoordinator", () => {
         return { content: "正在生成完成" };
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
 
     try {
@@ -1758,7 +1781,7 @@ describe("AgentMessageCoordinator", () => {
       await firstDeltaReceived.promise;
       const assistantMessageId = await waitForRunAssistantMessageId(coordinator, started.run.id);
 
-      expect(store.getMessage(assistantMessageId)?.parts).toEqual([]);
+      expect((await store.getMessage(assistantMessageId))?.parts).toEqual([]);
 
       const runningSnapshot = await coordinator.getMessageSnapshot(assistantMessageId);
       expect(runningSnapshot).toMatchObject({ version: 1 });
@@ -1767,10 +1790,10 @@ describe("AgentMessageCoordinator", () => {
       allowFinish.resolve();
       await waitForRun(coordinator, started.run.id);
 
-      expect(store.getMessage(assistantMessageId)?.parts).toEqual([{ type: "text", value: "正在生成完成" }]);
+      expect((await store.getMessage(assistantMessageId))?.parts).toEqual([{ type: "text", value: "正在生成完成" }]);
     } finally {
       allowFinish.resolve();
-      store.close();
+      await store.close();
     }
   });
 
@@ -1815,14 +1838,15 @@ describe("AgentMessageCoordinator", () => {
         return { content: "图片已生成。" };
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
 
     try {
       const started = await startRunAndWait(coordinator, { input: "生成一张小猪图片" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
-      const { message } = coordinator.getMessage(started.assistantMessage.id);
+      const { message } = await coordinator.getMessage(started.assistantMessage.id);
       const mediaPart = message.parts.find((part) => part.type === "media");
       const resourceId = mediaPart?.extra?.resource?.id;
 
@@ -1852,7 +1876,7 @@ describe("AgentMessageCoordinator", () => {
         { type: "text", value: "图片已生成。" }
       ]);
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -1897,14 +1921,15 @@ describe("AgentMessageCoordinator", () => {
         return { content: "图片已生成。" };
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
 
     try {
       const started = await startRunAndWait(coordinator, { input: "生成一张小猪图片" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
-      const detail = coordinator.getMessage(started.assistantMessage.id);
+      const detail = await coordinator.getMessage(started.assistantMessage.id);
 
       expect(detail.processSteps).toEqual([
         expect.objectContaining({
@@ -1932,7 +1957,7 @@ describe("AgentMessageCoordinator", () => {
         })
       ]);
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -1941,14 +1966,15 @@ describe("AgentMessageCoordinator", () => {
     const provider: LlmProvider = {
       complete: async () => ({ content: "Agent 会先理解用户需求，再决定是否调用工具。" })
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
 
     try {
       const started = await startRunAndWait(coordinator, { input: "解释一下 Agent 流程" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
-      const detail = coordinator.getMessage(started.assistantMessage.id);
+      const detail = await coordinator.getMessage(started.assistantMessage.id);
 
       expect(detail.processSteps).toEqual([
         expect.objectContaining({
@@ -1961,7 +1987,7 @@ describe("AgentMessageCoordinator", () => {
       ]);
       expect(detail.processSteps.map((step) => step.title).join("\n")).not.toContain("模型");
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -2052,14 +2078,15 @@ describe("AgentMessageCoordinator", () => {
         throw new Error("不应该继续进入第三轮模型调用");
       }
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
     const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
 
     try {
       const started = await startRunAndWait(coordinator, { input: "分别生成宝宝和狗狗图片" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
-      const session = coordinator.getSession(started.session.id);
+      const session = await coordinator.getSession(started.session.id);
       const assistant = session.messages.find((message) => message.id === started.assistantMessage.id);
       const mediaParts = assistant?.parts.filter((part) => part.type === "media") ?? [];
       const resourcesById = new Map(session.resources.map((resource) => [resource.id, resource]));
@@ -2095,7 +2122,7 @@ describe("AgentMessageCoordinator", () => {
         "https://example.com/dog.png"
       ]);
     } finally {
-      store.close();
+      await store.close();
     }
   });
 });

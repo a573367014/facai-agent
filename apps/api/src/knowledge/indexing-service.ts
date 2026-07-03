@@ -18,13 +18,13 @@ export class KnowledgeIndexingService {
   }
 
   async indexDocument(documentId: string): Promise<void> {
-    const document = this.options.store.getKnowledgeDocument(documentId);
+    const document = await this.options.store.getKnowledgeDocument(documentId);
 
     if (!document) {
       return;
     }
 
-    this.options.store.updateKnowledgeDocument(document.id, {
+    await this.options.store.updateKnowledgeDocument(document.id, {
       status: "indexing",
       errorMessage: null
     });
@@ -43,7 +43,7 @@ export class KnowledgeIndexingService {
 
       const embeddings = await this.options.embeddingService.embedTexts(chunks.map((chunk) => chunk.content));
 
-      this.options.store.replaceKnowledgeChunks(
+      await this.options.store.replaceKnowledgeChunks(
         document.id,
         chunks.map((chunk, index) => ({
           chunkIndex: index,
@@ -57,15 +57,15 @@ export class KnowledgeIndexingService {
           }
         }))
       );
-      this.options.store.updateKnowledgeDocument(document.id, {
+      await this.options.store.updateKnowledgeDocument(document.id, {
         status: "ready",
         errorMessage: null,
         chunkCount: chunks.length,
         indexedAt: new Date().toISOString()
       });
     } catch (error) {
-      this.options.store.replaceKnowledgeChunks(document.id, []);
-      this.options.store.updateKnowledgeDocument(document.id, {
+      await this.options.store.replaceKnowledgeChunks(document.id, []);
+      await this.options.store.updateKnowledgeDocument(document.id, {
         status: "failed",
         errorMessage: error instanceof Error ? error.message : "索引失败",
         chunkCount: 0

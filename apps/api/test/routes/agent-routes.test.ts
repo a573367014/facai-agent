@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import type { FastifyInstance } from "fastify";
 import { InMemoryAgentCancellationStore } from "../../src/agent/agent-cancellation-store.js";
@@ -14,7 +14,7 @@ import type { AgentRunJobPayload, AgentRunQueue } from "../../src/agent/agent-ru
 import { AgentService } from "../../src/agent/agent-service.js";
 import { AgentSummaryService } from "../../src/agent/agent-summary-service.js";
 import { InMemoryRunningMessageStateStore } from "../../src/agent/running-message-state-store.js";
-import { SqliteAgentStore } from "../../src/agent/sqlite-agent-store.js";
+import { PostgresAgentStore } from "../../src/agent/postgres-agent-store.js";
 import { buildApp } from "../../src/app.js";
 import type { LlmProvider } from "../../src/providers/types.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
@@ -22,6 +22,9 @@ import { ToolRegistry } from "../../src/tools/registry.js";
 
 const apps: FastifyInstance[] = [];
 let tempDirs: string[] = [];
+
+const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? "postgres://postgres:postgres@localhost:5432/agent_test";
+let resetStore: PostgresAgentStore;
 
 class CapturingAgentRunQueue implements AgentRunQueue {
   readonly jobs: AgentRunJobPayload[] = [];
@@ -46,12 +49,6 @@ type TestFastifyApp = FastifyInstance & {
   testRunQueue: CapturingAgentRunQueue;
 };
 
-function createTempDatabasePath() {
-  const dir = mkdtempSync(join(tmpdir(), "agent-routes-"));
-  tempDirs.push(dir);
-  return join(dir, "agent.sqlite");
-}
-
 async function buildTestApp(options: Parameters<typeof buildApp>[0]) {
   const testRunQueue = new CapturingAgentRunQueue();
   const app = await buildApp({
@@ -61,7 +58,7 @@ async function buildTestApp(options: Parameters<typeof buildApp>[0]) {
     runQueue: testRunQueue,
     cancellationStore: options.cancellationStore ?? new InMemoryAgentCancellationStore(),
     runLock: options.runLock ?? new InMemoryAgentRunLock(),
-    databasePath: createTempDatabasePath()
+    databasePath: TEST_DATABASE_URL
   }) as TestFastifyApp;
   app.testRunQueue = testRunQueue;
   apps.push(app);
@@ -103,6 +100,18 @@ function createMultipartPayload(input: { fieldName: string; fileName: string; co
   };
 }
 
+beforeAll(async () => {
+  resetStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+});
+
+beforeEach(async () => {
+  await resetStore.reset();
+});
+
+afterAll(async () => {
+  await resetStore.close();
+});
+
 afterEach(async () => {
   vi.useRealTimers();
   for (const app of apps.splice(0)) {
@@ -133,7 +142,7 @@ function createTestAgentService(): AgentService {
 }
 
 async function waitForRun(app: FastifyInstance, runId: string) {
-  for (let attempt = 0; attempt < 10; attempt += 1) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
     const response = await app.inject({ method: "GET", url: `/agents/runs/${runId}` });
     const payload = response.json() as { run: { status: string } };
 
@@ -141,7 +150,7 @@ async function waitForRun(app: FastifyInstance, runId: string) {
       return payload;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
 
   throw new Error("run did not finish in time");
@@ -610,32 +619,31 @@ describe("agent routes", () => {
   });
 
   it("buildApp 启动时清理上次进程遗留的 running run", async () => {
-    const databasePath = createTempDatabasePath();
-    const store = await SqliteAgentStore.create({ databasePath });
-    const session = store.createSession("遗留运行");
-    const userMessage = store.createMessage({
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    const session = await store.createSession("遗留运行");
+    const userMessage = await store.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "再生产" }]
     });
-    const assistantMessage = store.createMessage({
+    const assistantMessage = await store.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "running",
       parts: [{ type: "text", value: "" }]
     });
-    const run = store.createRun({
+    const run = await store.createRun({
       sessionId: session.id,
       userMessageId: userMessage.id,
       assistantMessageId: assistantMessage.id,
       status: "running",
       phase: "answering"
     });
-    store.close();
+    await store.close();
 
     const app = await buildApp({
-      databasePath,
+      databasePath: TEST_DATABASE_URL,
       agentService: createTestAgentService(),
       runningStateStore: new InMemoryRunningMessageStateStore(),
       eventBus: new InMemoryAgentEventBus(),
@@ -721,7 +729,7 @@ describe("agent routes", () => {
         })
       })
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     const coordinator = new AgentMessageCoordinator(
       createAgentService(answerProvider, registry),
       store,
@@ -781,11 +789,11 @@ describe("agent routes", () => {
       const completedThirdRun = await waitForRun(app, thirdPayload.run.id) as {
         run: { status: string; phase: string; systemMessageId?: string };
       };
-      const systemMessage = store
-        .getMessagesBySession(firstPayload.session.id)
-        .find((message) => message.id === completedThirdRun.run.systemMessageId);
+      const systemMessage = (await store.getMessagesBySession(firstPayload.session.id)).find(
+        (message) => message.id === completedThirdRun.run.systemMessageId
+      );
 
-      expect(store.getSessionSummary(firstPayload.session.id)).toBeDefined();
+      expect(await store.getSessionSummary(firstPayload.session.id)).toBeDefined();
       expect(completedThirdRun.run).toMatchObject({
         status: "completed",
         phase: "completed"
@@ -796,7 +804,7 @@ describe("agent routes", () => {
         parts: [{ type: "text", value: "上下文已自动压缩" }]
       });
     } finally {
-      store.close();
+      await store.close();
     }
   });
 
@@ -836,15 +844,15 @@ describe("agent routes", () => {
     const provider: LlmProvider = {
       complete: async () => ({ content: "重新生成的回答" })
     };
-    const store = await SqliteAgentStore.create({ databasePath: createTempDatabasePath() });
-    const session = store.createSession("重新生成路由");
-    const userMessage = store.createMessage({
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    const session = await store.createSession("重新生成路由");
+    const userMessage = await store.createMessage({
       sessionId: session.id,
       role: "user",
       status: "completed",
       parts: [{ type: "text", value: "介绍 Agent" }]
     });
-    const assistantMessage = store.createMessage({
+    const assistantMessage = await store.createMessage({
       sessionId: session.id,
       role: "assistant",
       status: "completed",
@@ -877,8 +885,8 @@ describe("agent routes", () => {
     });
 
     await waitForRun(app, payload.run.id);
-    expect(store.getMessagesBySession(session.id).filter((message) => message.role === "assistant")).toHaveLength(2);
-    store.close();
+    expect((await store.getMessagesBySession(session.id)).filter((message) => message.role === "assistant")).toHaveLength(2);
+    await store.close();
   });
 
   it("同一 session 的后续 assistant message 会带上历史消息", async () => {

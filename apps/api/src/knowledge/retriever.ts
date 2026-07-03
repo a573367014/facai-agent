@@ -31,18 +31,18 @@ export class KnowledgeRetriever {
       return [];
     }
 
-    return this.options.store
-      .searchKnowledgeChunks({
-        queryEmbedding,
-        limit: input.limit ?? 5
-      })
-      .map((chunk) => ({
-        content: chunk.content,
-        source: chunk.sourceLabel,
-        score: chunk.score,
-        documentId: chunk.documentId,
-        chunkId: chunk.id,
-        documentName: chunk.documentName
-      }));
+    const chunks = await this.options.store.searchKnowledgeChunks({
+      queryEmbedding,
+      limit: input.limit ?? 5
+    });
+
+    return chunks.map((chunk) => ({
+      content: chunk.content,
+      source: chunk.sourceLabel,
+      score: chunk.score,
+      documentId: chunk.documentId,
+      chunkId: chunk.id,
+      documentName: chunk.documentName
+    }));
   }
 }

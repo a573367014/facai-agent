@@ -33,16 +33,17 @@ export function MessagePartRenderer({
   }
 
   const groups = groupAssistantParts(parts);
-  const lastTextGroupIndex = findLastTextGroupIndex(groups);
+  const lastGroupIsText = groups.length > 0 && groups[groups.length - 1].type === "text";
 
   return (
     <>
       {groups.map((group, groupIndex) => {
         if (group.type === "text") {
+          const isLastGroup = groupIndex === groups.length - 1;
           return (
             <div className="markdown-body" key={`text:${group.startIndex}`}>
               <ReactMarkdown remarkPlugins={[remarkGfm]}>{group.value}</ReactMarkdown>
-              {showCursor && groupIndex === lastTextGroupIndex ? <span className="typing-cursor" aria-hidden="true" /> : null}
+              {showCursor && isLastGroup ? <span className="typing-cursor" aria-hidden="true" /> : null}
             </div>
           );
         }
@@ -55,18 +56,9 @@ export function MessagePartRenderer({
           />
         );
       })}
+      {showCursor && !lastGroupIsText ? <span className="typing-cursor" aria-hidden="true" /> : null}
     </>
   );
-}
-
-function findLastTextGroupIndex(groups: AssistantPartGroup[]): number {
-  for (let index = groups.length - 1; index >= 0; index -= 1) {
-    if (groups[index].type === "text") {
-      return index;
-    }
-  }
-
-  return -1;
 }
 
 function groupAssistantParts(parts: MessagePart[]): AssistantPartGroup[] {
