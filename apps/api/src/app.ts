@@ -6,8 +6,7 @@ import Fastify from "fastify";
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { JsonlAgentEventLogger, type AgentEventLogger } from "./agent/agent-event-logger.js";
-import { AgentService } from "./agent/agent-service.js";
-import { AgentMessageCoordinator } from "./agent/agent-message-coordinator.js";
+import { AgentMessageCoordinator, type AgentRunner } from "./agent/agent-message-coordinator.js";
 import { RedisAgentCancellationStore, type AgentCancellationStore } from "./agent/agent-cancellation-store.js";
 import { RedisAgentEventBus, type AgentEventBus } from "./agent/agent-event-bus.js";
 import {
@@ -37,7 +36,9 @@ import {
   type KnowledgeIndexQueue
 } from "./knowledge/knowledge-run-queue.js";
 import { KnowledgeRetriever } from "./knowledge/retriever.js";
-import { OpenAiCompatibleProvider } from "./providers/openai-compatible-provider.js";
+import { createLlmModelFromEnv } from "./langchain/model-factory.js";
+import { LangChainProviderShim } from "./langchain/provider-shim.js";
+import { LangChainAgentService } from "./langchain/langchain-agent-service.js";
 import { createRedisRuntime, toBullMqRedisConnectionOptions, type RedisRuntime } from "./redis/runtime.js";
 import { registerAgentRoutes } from "./routes/agent-routes.js";
 import { registerHealthRoutes } from "./routes/health-routes.js";
@@ -47,7 +48,7 @@ import { ToolExecutor } from "./tools/executor.js";
 import { createDefaultToolRegistry } from "./tools/index.js";
 
 export interface BuildAppOptions {
-  agentService?: AgentService;
+  agentService?: AgentRunner;
   coordinator?: AgentMessageCoordinator;
   databasePath?: string;
   agentEventLogPath?: string;
@@ -130,11 +131,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
   // 当前先用 allow-list 做最小权限控制。未配置时 demo 仍开放所有默认工具；
   // 配了 AGENT_ALLOWED_TOOLS 后，LLM 只能看到这些工具，执行层也只允许这些工具。
   const toolAccessPolicy = new ToolAccessPolicy({ allowedToolNames: env.AGENT_ALLOWED_TOOLS });
-  const defaultProvider = new OpenAiCompatibleProvider({
-    apiKey: env.OPENAI_API_KEY ?? "",
-    baseUrl: env.OPENAI_BASE_URL,
-    model: env.OPENAI_MODEL ?? ""
-  });
+  const defaultProvider = new LangChainProviderShim({ model: createLlmModelFromEnv(env) });
   const embeddingService =
     options.embeddingService ??
     createEmbeddingService({
@@ -191,20 +188,22 @@ export async function buildApp(options: BuildAppOptions = {}) {
         uploadDirectory
       }
     });
+    const toolExecutor = new ToolExecutor({
+      registry: toolRegistry,
+      timeoutMs: env.AGENT_TOOL_TIMEOUT_MS,
+      accessPolicy: toolAccessPolicy
+    });
+
     const agentService =
       options.agentService ??
-      new AgentService({
-        provider: defaultProvider,
+      new LangChainAgentService({
+        model: createLlmModelFromEnv(env),
         toolRegistry,
         toolAccessPolicy,
-        // 工具超时放在 executor，而不是每个工具自己处理，保证所有工具都有统一兜底。
-        toolExecutor: new ToolExecutor({
-          registry: toolRegistry,
-          timeoutMs: env.AGENT_TOOL_TIMEOUT_MS,
-          accessPolicy: toolAccessPolicy
-        }),
+        toolExecutor,
         defaultMaxIterations: env.AGENT_MAX_ITERATIONS
       });
+
     const agentEventLogger =
       options.agentEventLogger ??
       new JsonlAgentEventLogger(resolve(options.agentEventLogPath ?? env.AGENT_EVENT_LOG_PATH));

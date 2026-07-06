@@ -7,7 +7,7 @@ import {
   summarizeToolResult
 } from "./agent-message-projection-utils.js";
 
-type AppendExecutionEvent = (messageId: string, event: AgentStreamEvent, runId?: string) => void;
+type AppendExecutionEvent = (messageId: string, event: AgentStreamEvent, runId?: string) => Promise<void> | void;
 
 // AgentProcessStepProjector 把底层流式事件转换成“用户能看懂的任务进度”。
 // AgentService 发的是 iteration/llm/tool 的技术事件；前端聊天区更需要稳定的步骤：
@@ -252,7 +252,7 @@ export class AgentProcessStepProjector {
       return undefined;
     }
 
-    this.appendEvent(messageId, { type: "process.step.updated", step }, runId);
+    await this.appendEvent(messageId, { type: "process.step.updated", step }, runId);
     return step;
   }
 

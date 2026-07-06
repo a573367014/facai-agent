@@ -1,7 +1,5 @@
 import { AppError } from "../errors/app-error.js";
 import type { AgentSummaryService } from "./agent-summary-service.js";
-import type { AgentService } from "./agent-service.js";
-import { AgentContextBuilder } from "./context-builder.js";
 import {
   createTextPart,
   ensureAppendableTextPart,
@@ -16,7 +14,12 @@ import {
   PassthroughToolResourceStorage,
   type ToolResourceStorage
 } from "./tool-resource-storage.js";
-import type { AgentErrorDetail, AgentMessage, AgentExecutionInput, AgentStreamEvent, JsonObject, ToolCall } from "./types.js";
+import type { AgentErrorDetail, AgentMessage, AgentExecutionInput, AgentExecutionResult, AgentStreamEvent, JsonObject, ToolCall } from "./types.js";
+import { AgentContextBuilder } from "./context-builder.js";
+
+export interface AgentRunner {
+  run(input: AgentExecutionInput): Promise<AgentExecutionResult>;
+}
 import type {
   AgentEventListener,
   AgentMessagePage,
@@ -96,7 +99,7 @@ export class AgentMessageCoordinator {
   private readonly cleanupService: AgentRunCleanupService;
 
   constructor(
-    private readonly agentService: AgentService,
+    private readonly agentService: AgentRunner,
     private readonly store: AgentStore,
     private readonly contextBuilder = new AgentContextBuilder(),
     private readonly summaryService?: AgentSummaryService,
@@ -108,7 +111,7 @@ export class AgentMessageCoordinator {
     // 运行中草稿、进度步骤、媒体资源、重启清理分别交给小类，避免这个文件重新膨胀。
     this.draftManager = new AgentRunningDraftManager(this.store, this.runningStateStore);
     this.processStepProjector = new AgentProcessStepProjector(this.store, (messageId, event, runId) => {
-      this.appendEvent(messageId, event, runId);
+      return this.appendEvent(messageId, event, runId);
     });
     this.mediaOutputProjector = new AgentMediaOutputProjector({
       store: this.store,
@@ -652,6 +655,14 @@ export class AgentMessageCoordinator {
 
           if (event.type === "final_answer") {
             finalAnswerEvent = event;
+            return;
+          }
+
+          // run 生命周期事件（run_completed / error / cancelled）由 coordinator 在
+          // executeRun 的收尾阶段统一发出。AgentService 只负责执行层事件，如果它
+          // 误发了终态事件，绝不能透传给 SSE —— 否则 SSE 会提前关闭连接，导致
+          // completeRunning 的 process.step.updated 无法到达前端。
+          if (event.type === "run_completed" || event.type === "error" || event.type === "cancelled") {
             return;
           }
 

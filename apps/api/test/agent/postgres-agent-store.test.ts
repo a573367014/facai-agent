@@ -3,11 +3,11 @@ import { InMemoryAgentCancellationStore } from "../../src/agent/agent-cancellati
 import { InMemoryAgentEventBus } from "../../src/agent/agent-event-bus.js";
 import { InMemoryAgentRunLock } from "../../src/agent/agent-run-lock.js";
 import type { AgentRunJobPayload, AgentRunQueue } from "../../src/agent/agent-run-queue.js";
-import { AgentService } from "../../src/agent/agent-service.js";
+import { LangChainAgentService } from "../../src/langchain/langchain-agent-service.js";
 import { PostgresAgentStore } from "../../src/agent/postgres-agent-store.js";
 import { InMemoryRunningMessageStateStore } from "../../src/agent/running-message-state-store.js";
 import { buildApp } from "../../src/app.js";
-import type { LlmProvider } from "../../src/providers/types.js";
+import { createMockModel } from "../helpers/mock-model.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
 import { ToolRegistry } from "../../src/tools/registry.js";
 import type { MessagePart } from "../../src/agent/message-parts.js";
@@ -22,13 +22,10 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function createTestAgentService(): AgentService {
+function createTestAgentService(): LangChainAgentService {
   const registry = new ToolRegistry();
-  const provider: LlmProvider = {
-    complete: async () => ({ content: "测试回答" })
-  };
-  return new AgentService({
-    provider,
+  return new LangChainAgentService({
+    model: createMockModel([{ content: "测试回答" }]),
     toolRegistry: registry,
     toolExecutor: new ToolExecutor({ registry, timeoutMs: 100 }),
     defaultMaxIterations: 4

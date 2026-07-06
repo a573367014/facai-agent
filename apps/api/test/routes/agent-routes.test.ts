@@ -11,14 +11,15 @@ import { AgentContextBuilder } from "../../src/agent/context-builder.js";
 import { AgentMessageCoordinator } from "../../src/agent/agent-message-coordinator.js";
 import { InMemoryAgentRunLock } from "../../src/agent/agent-run-lock.js";
 import type { AgentRunJobPayload, AgentRunQueue } from "../../src/agent/agent-run-queue.js";
-import { AgentService } from "../../src/agent/agent-service.js";
 import { AgentSummaryService } from "../../src/agent/agent-summary-service.js";
 import { InMemoryRunningMessageStateStore } from "../../src/agent/running-message-state-store.js";
 import { PostgresAgentStore } from "../../src/agent/postgres-agent-store.js";
 import { buildApp } from "../../src/app.js";
+import { LangChainAgentService } from "../../src/langchain/langchain-agent-service.js";
 import type { LlmProvider } from "../../src/providers/types.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
 import { ToolRegistry } from "../../src/tools/registry.js";
+import { createMockModel, type MockModelResponse } from "../helpers/mock-model.js";
 
 const apps: FastifyInstance[] = [];
 let tempDirs: string[] = [];
@@ -124,21 +125,18 @@ afterEach(async () => {
   tempDirs = [];
 });
 
-function createAgentService(provider: LlmProvider, registry: ToolRegistry): AgentService {
-  return new AgentService({
-    provider,
+function createAgentService(responses: MockModelResponse[], registry: ToolRegistry): LangChainAgentService {
+  return new LangChainAgentService({
+    model: createMockModel(responses),
     toolRegistry: registry,
     toolExecutor: new ToolExecutor({ registry, timeoutMs: 100 }),
     defaultMaxIterations: 4
   });
 }
 
-function createTestAgentService(): AgentService {
+function createTestAgentService(): LangChainAgentService {
   const registry = new ToolRegistry();
-  const provider: LlmProvider = {
-    complete: async () => ({ content: "测试回答" })
-  };
-  return createAgentService(provider, registry);
+  return createAgentService([{ content: "测试回答" }], registry);
 }
 
 async function waitForRun(app: FastifyInstance, runId: string) {
@@ -707,14 +705,7 @@ describe("agent routes", () => {
   });
 
   it("POST /agents/sessions/:sessionId/runs 不返回压缩 prelude，压缩进度通过 run 持久化", async () => {
-    let answerCount = 0;
     const registry = new ToolRegistry();
-    const answerProvider: LlmProvider = {
-      complete: async () => {
-        answerCount += 1;
-        return { content: `第 ${answerCount} 轮回答` };
-      }
-    };
     const summaryProvider: LlmProvider = {
       complete: async () => ({
         content: JSON.stringify({
@@ -731,7 +722,14 @@ describe("agent routes", () => {
     };
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     const coordinator = new AgentMessageCoordinator(
-      createAgentService(answerProvider, registry),
+      createAgentService(
+        [
+          { content: "第 1 轮回答" },
+          { content: "第 2 轮回答" },
+          { content: "第 3 轮回答" }
+        ],
+        registry
+      ),
       store,
       new AgentContextBuilder({ maxHistoryMessages: 10 }),
       new AgentSummaryService({
@@ -841,9 +839,6 @@ describe("agent routes", () => {
 
   it("POST /agents/messages/:messageId/regenerate 会基于旧 assistant 重新创建 run", async () => {
     const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async () => ({ content: "重新生成的回答" })
-    };
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     const session = await store.createSession("重新生成路由");
     const userMessage = await store.createMessage({
@@ -859,7 +854,7 @@ describe("agent routes", () => {
       parts: [{ type: "text", value: "旧回答" }]
     });
     const coordinator = new AgentMessageCoordinator(
-      createAgentService(provider, registry),
+      createAgentService([{ content: "重新生成的回答" }], registry),
       store,
       new AgentContextBuilder({ maxHistoryMessages: 10 })
     );
@@ -890,16 +885,15 @@ describe("agent routes", () => {
   });
 
   it("同一 session 的后续 assistant message 会带上历史消息", async () => {
-    const calls: string[][] = [];
     const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async ({ messages }) => {
-        calls.push(messages.map((message) => `${message.role}:${"content" in message ? message.content : ""}`));
-        return { content: calls.length === 1 ? "第一轮回答" : "第二轮回答" };
-      }
-    };
+    const model = createMockModel([{ content: "第一轮回答" }, { content: "第二轮回答" }]);
     const app = await buildTestApp({
-      agentService: createAgentService(provider, registry)
+      agentService: new LangChainAgentService({
+        model,
+        toolRegistry: registry,
+        toolExecutor: new ToolExecutor({ registry, timeoutMs: 100 }),
+        defaultMaxIterations: 4
+      })
     });
 
     const firstResponse = await app.inject({
@@ -925,6 +919,14 @@ describe("agent routes", () => {
     await executeNextQueuedRun(app);
     await waitForRun(app, secondPayload.run.id);
 
+    const calls = model.calls.map((messages) =>
+      messages.map((message) => {
+        const type = message.getType();
+        const role = type === "human" ? "user" : type === "ai" ? "assistant" : type;
+        const content = typeof message.content === "string" ? message.content : "";
+        return `${role}:${content}`;
+      })
+    );
     expect(calls[1]).toEqual([
       expect.stringMatching(/^system:/),
       "user:第一轮问题",
@@ -957,28 +959,14 @@ describe("agent routes", () => {
       })
     });
 
-    let callCount = 0;
-    const provider: LlmProvider = {
-      complete: async () => {
-        callCount += 1;
-
-        if (callCount === 1) {
-          return {
-            toolCalls: [
-              {
-                id: "call_image",
-                name: "generate_image",
-                arguments: { prompt: "温馨田园小猪" }
-              }
-            ]
-          };
-        }
-
-        return { content: "图片已经生成好了。" };
-      }
-    };
     const app = await buildTestApp({
-      agentService: createAgentService(provider, registry),
+      agentService: createAgentService(
+        [
+          { toolCalls: [{ id: "call_image", name: "generate_image", args: { prompt: "温馨田园小猪" } }] },
+          { content: "图片已经生成好了。" }
+        ],
+        registry
+      ),
       toolResourceStorage: {
         storeRemoteResource: async () => ({
           url: "http://127.0.0.1:4001/uploads/resources/images/local-pig.png",
@@ -1103,16 +1091,17 @@ describe("agent routes", () => {
   });
 
   it("GET /agents/sessions/:sessionId 默认按最近消息分页，并支持 before 游标加载更早消息", async () => {
-    let answerCount = 0;
     const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async () => {
-        answerCount += 1;
-        return { content: `第 ${answerCount} 轮回答` };
-      }
-    };
     const app = await buildTestApp({
-      agentService: createAgentService(provider, registry)
+      agentService: createAgentService(
+        [
+          { content: "第 1 轮回答" },
+          { content: "第 2 轮回答" },
+          { content: "第 3 轮回答" },
+          { content: "第 4 轮回答" }
+        ],
+        registry
+      )
     });
     const firstResponse = await app.inject({
       method: "POST",
