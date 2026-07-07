@@ -1,4 +1,5 @@
 import { AppError } from "../errors/app-error.js";
+import { type TraceContextCarrier } from "../observability/trace-context.js";
 import type { AgentSummaryService } from "./agent-summary-service.js";
 import {
   createTextPart,
@@ -220,7 +221,7 @@ export class AgentMessageCoordinator {
     );
   }
 
-  async startRun(input: AgentExecutionInput & { sessionId?: string }) {
+  async startRun(input: AgentExecutionInput & { sessionId?: string }, traceContext?: TraceContextCarrier) {
     // startRun 是 API 请求的边界：这里只创建“可恢复的任务外壳”，不在请求线程里长时间跑模型。
     // SQLite 先落 user message / run，前端马上拿到 runId；Worker 后面会用这些 id 重新读取最新状态。
     const userParts = input.parts?.length ? input.parts : [createTextPart(input.input)];
@@ -268,7 +269,8 @@ export class AgentMessageCoordinator {
           runId: queuedRun.id,
           sessionId: session.id,
           userMessageId: userMessage.id,
-          assistantMessageId: assistantMessage.id
+          assistantMessageId: assistantMessage.id,
+          traceContext: traceContext ?? undefined
         });
         this.runningRuns.delete(run.id);
 

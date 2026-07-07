@@ -245,12 +245,14 @@ export interface StartAgentRunResponse {
   run: AgentRunRecord;
   session: AgentSessionRecord;
   userMessage: AgentMessageRecord;
+  traceId?: string;
 }
 
 export interface RegenerateAgentMessageResponse {
   run: AgentRunRecord;
   session: AgentSessionRecord;
   userMessage: AgentMessageRecord;
+  traceId?: string;
 }
 
 export interface AgentSessionResponse {
@@ -376,6 +378,23 @@ function trimTrailingSlash(value: string) {
 
 export const apiBaseUrl = resolveApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
 
+// W3C traceparent 响应头格式：00-{traceId(32hex)}-{spanId(16hex)}-{traceFlags(2hex)}
+// 解析出中间的 traceId，用于去 Jaeger/SigNoz 搜索完整链路。
+// 后端 OTel 未启用或未采样时不会返回该头，此时返回 undefined，调用方不应假设它一定存在。
+export function parseTraceId(traceparent: string | null): string | undefined {
+  if (!traceparent) {
+    return undefined;
+  }
+
+  const parts = traceparent.split("-");
+  // 格式：version-traceId-spanId-flags，共 4 段，traceId 是第 2 段（32 位 hex）
+  if (parts.length !== 4 || parts[1].length !== 32) {
+    return undefined;
+  }
+
+  return parts[1];
+}
+
 function parseSseBlock<T>(block: string): T | null {
   // 后端 SSE 每个事件块形如：
   // data: {"id":"event_live_...","event":...}
@@ -414,7 +433,11 @@ export async function startAgentRun(
     throw new Error(`${errorPayload.error.code}: ${errorPayload.error.message}`);
   }
 
-  return payload as StartAgentRunResponse;
+  const successPayload = payload as StartAgentRunResponse;
+  // traceId 来自响应头 traceparent，后端 OTel 未启用时为 undefined。
+  // 这里把它附到响应体上，方便调用方按需取用，不必直接读 header。
+  successPayload.traceId = parseTraceId(response.headers.get("traceparent"));
+  return successPayload;
 }
 
 export async function regenerateAgentMessage(messageId: string): Promise<RegenerateAgentMessageResponse> {
@@ -428,7 +451,9 @@ export async function regenerateAgentMessage(messageId: string): Promise<Regener
     throw new Error(`${errorPayload.error.code}: ${errorPayload.error.message}`);
   }
 
-  return payload as RegenerateAgentMessageResponse;
+  const successPayload = payload as RegenerateAgentMessageResponse;
+  successPayload.traceId = parseTraceId(response.headers.get("traceparent"));
+  return successPayload;
 }
 
 export async function getAgentSession(sessionId: string): Promise<AgentSessionResponse> {

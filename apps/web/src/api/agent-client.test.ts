@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { resolveApiBaseUrl, startAgentRun, uploadAgentImage, uploadKnowledgeDocument } from "./agent-client";
+import { parseTraceId, resolveApiBaseUrl, startAgentRun, uploadAgentImage, uploadKnowledgeDocument } from "./agent-client";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -111,5 +111,61 @@ describe("resolveApiBaseUrl", () => {
       parts: [{ type: "text", value: "你好" }],
       sessionId: "session_1"
     });
+  });
+
+  it("startAgentRun 从 traceparent 响应头解析 traceId 并附到返回结果", async () => {
+    const traceId = "0af7651916cd43dd8448eb211c80319c";
+    const spanId = "b7ad6b7169203331";
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          run: { id: "run_1", sessionId: "session_1", status: "running", phase: "answering", userMessageId: "msg_user", createdAt: "2026-06-29T00:00:00.000Z", updatedAt: "2026-06-29T00:00:00.000Z" },
+          session: { id: "session_1", createdAt: "2026-06-29T00:00:00.000Z", updatedAt: "2026-06-29T00:00:00.000Z" },
+          userMessage: { id: "msg_user", sessionId: "session_1", role: "user", status: "completed", parts: [], createdAt: "2026-06-29T00:00:00.000Z", updatedAt: "2026-06-29T00:00:00.000Z" }
+        }),
+        { status: 202, headers: { "content-type": "application/json", traceparent: `00-${traceId}-${spanId}-01` } }
+      )
+    );
+
+    const result = await startAgentRun([{ type: "text", value: "你好" }], "session_1");
+
+    expect(result.traceId).toBe(traceId);
+  });
+
+  it("startAgentRun 在后端未返回 traceparent 时 traceId 为 undefined", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          run: { id: "run_1", sessionId: "session_1", status: "running", phase: "answering", userMessageId: "msg_user", createdAt: "2026-06-29T00:00:00.000Z", updatedAt: "2026-06-29T00:00:00.000Z" },
+          session: { id: "session_1", createdAt: "2026-06-29T00:00:00.000Z", updatedAt: "2026-06-29T00:00:00.000Z" },
+          userMessage: { id: "msg_user", sessionId: "session_1", role: "user", status: "completed", parts: [], createdAt: "2026-06-29T00:00:00.000Z", updatedAt: "2026-06-29T00:00:00.000Z" }
+        }),
+        { status: 202, headers: { "content-type": "application/json" } }
+      )
+    );
+
+    const result = await startAgentRun([{ type: "text", value: "你好" }], "session_1");
+
+    expect(result.traceId).toBeUndefined();
+  });
+});
+
+describe("parseTraceId", () => {
+  it("从标准 W3C traceparent 头解析出 traceId", () => {
+    expect(parseTraceId("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")).toBe(
+      "0af7651916cd43dd8448eb211c80319c"
+    );
+  });
+
+  it("null 输入返回 undefined", () => {
+    expect(parseTraceId(null)).toBeUndefined();
+  });
+
+  it("格式不合法（段数不足）返回 undefined", () => {
+    expect(parseTraceId("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331")).toBeUndefined();
+  });
+
+  it("traceId 长度不是 32 位返回 undefined", () => {
+    expect(parseTraceId("00-short-b7ad6b7169203331-01")).toBeUndefined();
   });
 });

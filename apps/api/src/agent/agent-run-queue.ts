@@ -1,4 +1,5 @@
 import type { JobsOptions } from "bullmq";
+import type { TraceContextCarrier } from "../observability/trace-context.js";
 
 // 队列消息只保存定位执行所需的 id。Worker 会从 SQLite 重新读取 run/message，
 // 避免把完整上下文、parts 或 summary 复制进 BullMQ 后变成过期快照。
@@ -7,6 +8,7 @@ export interface AgentRunJobPayload {
   sessionId: string;
   userMessageId: string;
   assistantMessageId: string;
+  traceContext?: TraceContextCarrier;
 }
 
 export interface AgentRunQueue {

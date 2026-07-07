@@ -8,6 +8,7 @@ import {
 import { END, StateGraph } from "@langchain/langgraph";
 import type { RunnableConfig } from "@langchain/core/runnables";
 import type { ChatOpenAI } from "@langchain/openai";
+import { trace, SpanStatusCode, type Span } from "@opentelemetry/api";
 import type {
   AgentExecutionInput,
   AgentExecutionResult,
@@ -24,6 +25,8 @@ import { ToolAccessPolicy } from "../tools/access-policy.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { AgentState, type AgentStateType, type ToolNodeEvents } from "./governed-tool-node.js";
 import { toBindingsTools } from "./tools-bridge.js";
+
+const tracer = trace.getTracer("langchain-agent-service");
 
 const MEDIA_SUMMARY_TOOL_NAMES = new Set(["generate_image", "edit_image", "generate_video"]);
 const MEDIA_FAILURE_SUMMARY_INSTRUCTION = [
@@ -103,6 +106,28 @@ export class LangChainAgentService {
   }
 
   async run(input: AgentExecutionInput): Promise<AgentExecutionResult> {
+    const span = tracer.startSpan("agent.run");
+    span.setAttributes({
+      "agent.session_id": input.sessionId ?? "",
+      "agent.message_id": input.messageId ?? "",
+      "agent.max_iterations": input.maxIterations ?? this.options.defaultMaxIterations
+    });
+
+    try {
+      const result = await this.executeGraph(input, span);
+      span.setAttribute("agent.outcome", "completed");
+      return result;
+    } catch (error) {
+      span.recordException(error as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: (error as Error).message });
+      throw error;
+    } finally {
+      span.end();
+    }
+  }
+
+  private async executeGraph(input: AgentExecutionInput, parentSpan: Span): Promise<AgentExecutionResult> {
+    parentSpan.setAttribute("agent.graph", "langgraph");
     const self = this;
     const maxIterations = input.maxIterations ?? this.options.defaultMaxIterations;
     const replayToolCalls = input.replayToolCalls?.length ? input.replayToolCalls : undefined;
@@ -120,6 +145,18 @@ export class LangChainAgentService {
     let currentIteration = 0;
 
     async function callModel(state: AgentStateType, config: RunnableConfig): Promise<Partial<AgentStateType>> {
+      return tracer.startActiveSpan("agent.call_model", async (iterSpan) => {
+        iterSpan.setAttribute("agent.iteration", currentIteration);
+        try {
+          const result = await callModelInner(state, config);
+          return result;
+        } finally {
+          iterSpan.end();
+        }
+      });
+    }
+
+    async function callModelInner(state: AgentStateType, config: RunnableConfig): Promise<Partial<AgentStateType>> {
       const signal = config.signal as AbortSignal | undefined;
       assertNotAborted(signal);
 
@@ -326,7 +363,7 @@ export class LangChainAgentService {
       return { messages: toolMessages, needsMediaSummary: false };
     }
 
-    function shouldContinue(state: AgentStateType): "tools" | "summarize_media" | typeof END {
+    function shouldContinue(state: AgentStateType): "tools" | typeof END {
       if (state.iteration >= maxIterations) {
         return END;
       }
@@ -375,7 +412,6 @@ export class LangChainAgentService {
       .addEdge("__start__", "agent")
       .addConditionalEdges("agent", shouldContinue, {
         tools: "tools",
-        summarize_media: "summarize_media",
         [END]: END
       })
       .addConditionalEdges("tools", (state: AgentStateType) => {

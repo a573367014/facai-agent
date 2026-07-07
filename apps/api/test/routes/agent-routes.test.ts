@@ -6,7 +6,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { z } from "zod";
 import type { FastifyInstance } from "fastify";
 import { InMemoryAgentCancellationStore } from "../../src/agent/agent-cancellation-store.js";
-import { InMemoryAgentEventBus } from "../../src/agent/agent-event-bus.js";
+import type { AgentEventBus } from "../../src/agent/agent-event-bus.js";
 import { AgentContextBuilder } from "../../src/agent/context-builder.js";
 import { AgentMessageCoordinator } from "../../src/agent/agent-message-coordinator.js";
 import { InMemoryAgentRunLock } from "../../src/agent/agent-run-lock.js";
@@ -20,6 +20,13 @@ import type { LlmProvider } from "../../src/providers/types.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
 import { ToolRegistry } from "../../src/tools/registry.js";
 import { createMockModel, type MockModelResponse } from "../helpers/mock-model.js";
+
+const noopEventBus: AgentEventBus = {
+  async publishRunEvent() {},
+  async subscribeRun() {
+    return () => {};
+  }
+};
 
 const apps: FastifyInstance[] = [];
 let tempDirs: string[] = [];
@@ -55,7 +62,7 @@ async function buildTestApp(options: Parameters<typeof buildApp>[0]) {
   const app = await buildApp({
     ...options,
     runningStateStore: options.runningStateStore ?? new InMemoryRunningMessageStateStore(),
-    eventBus: options.eventBus ?? new InMemoryAgentEventBus(),
+    eventBus: options.eventBus ?? noopEventBus,
     runQueue: testRunQueue,
     cancellationStore: options.cancellationStore ?? new InMemoryAgentCancellationStore(),
     runLock: options.runLock ?? new InMemoryAgentRunLock(),
@@ -564,7 +571,8 @@ describe("agent routes", () => {
         runId: payload.run.id,
         sessionId: payload.session.id,
         userMessageId: payload.userMessage.id,
-        assistantMessageId: payload.run.assistantMessageId
+        assistantMessageId: payload.run.assistantMessageId,
+        traceContext: expect.any(Object)
       }
     ]);
 
@@ -644,7 +652,7 @@ describe("agent routes", () => {
       databasePath: TEST_DATABASE_URL,
       agentService: createTestAgentService(),
       runningStateStore: new InMemoryRunningMessageStateStore(),
-      eventBus: new InMemoryAgentEventBus(),
+      eventBus: noopEventBus,
       runQueue: new CapturingAgentRunQueue(),
       cancellationStore: new InMemoryAgentCancellationStore(),
       runLock: new InMemoryAgentRunLock()

@@ -43,6 +43,7 @@ import { createRedisRuntime, toBullMqRedisConnectionOptions, type RedisRuntime }
 import { registerAgentRoutes } from "./routes/agent-routes.js";
 import { registerHealthRoutes } from "./routes/health-routes.js";
 import { registerKnowledgeRoutes } from "./routes/knowledge-routes.js";
+import { endRequestSpan, getRequestSpan, getRequestTraceparent, startRequestSpan } from "./observability/trace-context.js";
 import { ToolAccessPolicy } from "./tools/access-policy.js";
 import { ToolExecutor } from "./tools/executor.js";
 import { createDefaultToolRegistry } from "./tools/index.js";
@@ -126,6 +127,49 @@ export async function buildApp(options: BuildAppOptions = {}) {
         message: error instanceof Error ? error.message : "发生未知错误"
       }
     });
+  });
+
+  // 手动管理 Fastify 请求 span 并注入 W3C traceparent 响应头。
+  // 背景：@opentelemetry/instrumentation-fastify 在 tsx 的 ESM loader 下不生效（依赖 CJS 模块 patch），
+  // 所以这里用 onRequest 钩子手动创建 server span，挂到 request 上，onSend 时取出来构建 traceparent。
+  // traceparent 是全行业通用的跨进程 trace 传递协议，前端开发者可以用它去 Jaeger 搜索完整链路。
+  // SSE 流已经手动 writeHead 并会触发多次 onSend，这里跳过避免无效写入和干扰。
+  app.addHook("onRequest", async (request) => {
+    const routePath = request.routeOptions?.url ?? request.url;
+    startRequestSpan(request, routePath, request.method);
+  });
+
+  app.addHook("onSend", async (request, reply, payload) => {
+    if (reply.getHeader("traceparent")) {
+      return payload;
+    }
+
+    const isSseStream =
+      request.routeOptions?.url?.endsWith("/stream") ||
+      reply.getHeader("content-type") === "text/event-stream; charset=utf-8";
+    if (isSseStream) {
+      return payload;
+    }
+
+    const traceparent = getRequestTraceparent(request);
+    if (!traceparent) {
+      return payload;
+    }
+
+    reply.header("traceparent", traceparent);
+    return payload;
+  });
+
+  app.addHook("onResponse", async (request, reply) => {
+    endRequestSpan(request, reply.statusCode);
+  });
+
+  app.addHook("onError", async (request, reply, _error) => {
+    // onError 后 Fastify 仍会调用 onResponse，这里只记录错误属性，span 由 onResponse 结束。
+    const span = getRequestSpan(request);
+    if (span) {
+      span.setAttribute("error", true);
+    }
   });
 
   // 当前先用 allow-list 做最小权限控制。未配置时 demo 仍开放所有默认工具；

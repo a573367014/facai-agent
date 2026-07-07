@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { InMemoryAgentCancellationStore } from "../../src/agent/agent-cancellation-store.js";
-import { InMemoryAgentEventBus } from "../../src/agent/agent-event-bus.js";
+import type { AgentEventBus } from "../../src/agent/agent-event-bus.js";
 import { InMemoryAgentRunLock } from "../../src/agent/agent-run-lock.js";
 import type { AgentRunJobPayload, AgentRunQueue } from "../../src/agent/agent-run-queue.js";
 import { LangChainAgentService } from "../../src/langchain/langchain-agent-service.js";
@@ -11,6 +11,13 @@ import { createMockModel } from "../helpers/mock-model.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
 import { ToolRegistry } from "../../src/tools/registry.js";
 import type { MessagePart } from "../../src/agent/message-parts.js";
+
+const noopEventBus: AgentEventBus = {
+  async publishRunEvent() {},
+  async subscribeRun() {
+    return () => {};
+  }
+};
 
 const TEST_DATABASE_URL = process.env.DATABASE_URL ?? "postgres://postgres:postgres@localhost:5432/agent_test";
 
@@ -808,7 +815,7 @@ describe("PostgresAgentStore", () => {
       const app = await buildApp({
         agentService: createTestAgentService(),
         runningStateStore: new InMemoryRunningMessageStateStore(),
-        eventBus: new InMemoryAgentEventBus(),
+        eventBus: noopEventBus,
         runQueue: new NoopAgentRunQueue(),
         cancellationStore: new InMemoryAgentCancellationStore(),
         runLock: new InMemoryAgentRunLock()

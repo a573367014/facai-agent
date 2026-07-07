@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { InMemoryAgentCancellationStore } from "../../src/agent/agent-cancellation-store.js";
-import { InMemoryAgentEventBus } from "../../src/agent/agent-event-bus.js";
+import type { AgentEventBus } from "../../src/agent/agent-event-bus.js";
 import { InMemoryAgentRunLock } from "../../src/agent/agent-run-lock.js";
 import type { AgentRunJobPayload, AgentRunQueue } from "../../src/agent/agent-run-queue.js";
 import { LangChainAgentService } from "../../src/langchain/langchain-agent-service.js";
@@ -81,11 +81,18 @@ function createTestAgentService(): LangChainAgentService {
   });
 }
 
+const noopEventBus: AgentEventBus = {
+  async publishRunEvent() {},
+  async subscribeRun() {
+    return () => {};
+  }
+};
+
 async function buildKnowledgeTestApp(options: { uploadDirectory: string; knowledgeIndexQueue: KnowledgeIndexQueue }) {
   const app = (await buildApp({
     agentService: createTestAgentService(),
     runningStateStore: new InMemoryRunningMessageStateStore(),
-    eventBus: new InMemoryAgentEventBus(),
+    eventBus: noopEventBus,
     runQueue: new NoopAgentRunQueue(),
     cancellationStore: new InMemoryAgentCancellationStore(),
     runLock: new InMemoryAgentRunLock(),
