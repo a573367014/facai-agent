@@ -22,7 +22,7 @@ import { AgentContextBuilder } from "./agent/context-builder.js";
 import type { RunningMessageStateStore } from "./agent/running-message-state-store.js";
 import { RedisRunningMessageStateStore } from "./agent/redis-running-message-state-store.js";
 import { PostgresAgentStore } from "./agent/postgres-agent-store.js";
-import { LocalToolResourceStorage, type ToolResourceStorage } from "./agent/tool-resource-storage.js";
+import { S3ToolResourceStorage, type ToolResourceStorage } from "./agent/tool-resource-storage.js";
 import { createCorsOriginChecker } from "./config/cors.js";
 import { loadEnv } from "./config/env.js";
 import { AppError } from "./errors/app-error.js";
@@ -40,6 +40,7 @@ import { createLlmModelFromEnv } from "./langchain/model-factory.js";
 import { LangChainProviderShim } from "./langchain/provider-shim.js";
 import { LangChainAgentService } from "./langchain/langchain-agent-service.js";
 import { createRedisRuntime, toBullMqRedisConnectionOptions, type RedisRuntime } from "./redis/runtime.js";
+import { initS3Storage } from "./storage/s3-client.js";
 import { registerAgentRoutes } from "./routes/agent-routes.js";
 import { registerHealthRoutes } from "./routes/health-routes.js";
 import { registerKnowledgeRoutes } from "./routes/knowledge-routes.js";
@@ -85,6 +86,16 @@ export async function buildApp(options: BuildAppOptions = {}) {
   const uploadDirectory = resolve(options.uploadDirectory ?? env.AGENT_UPLOAD_DIR);
   const publicBaseUrl = env.AGENT_PUBLIC_BASE_URL ?? `http://127.0.0.1:${env.PORT}`;
   await mkdir(uploadDirectory, { recursive: true });
+
+  // 初始化 S3 兼容对象存储（图片上传用）。MinIO 本地开发时自动创建 bucket。
+  await initS3Storage({
+    endpoint: env.S3_ENDPOINT,
+    region: env.S3_REGION,
+    bucket: env.S3_BUCKET,
+    accessKeyId: env.S3_ACCESS_KEY_ID,
+    secretAccessKey: env.S3_SECRET_ACCESS_KEY,
+    publicBaseUrl: env.S3_PUBLIC_BASE_URL
+  });
 
   await app.register(multipart, {
     limits: {
@@ -223,13 +234,11 @@ export async function buildApp(options: BuildAppOptions = {}) {
       },
       jimengImageEdit: {
         accessKeyId: env.VOLCENGINE_ACCESS_KEY_ID,
-        secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY,
-        uploadDirectory
+        secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY
       },
       jimengVideo: {
         accessKeyId: env.VOLCENGINE_ACCESS_KEY_ID,
-        secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY,
-        uploadDirectory
+        secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY
       }
     });
     const toolExecutor = new ToolExecutor({
@@ -325,9 +334,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
       });
     const toolResourceStorage =
       options.toolResourceStorage ??
-      new LocalToolResourceStorage({
-        uploadDirectory,
-        publicBaseUrl,
+      new S3ToolResourceStorage({
         maxBytes: env.AGENT_TOOL_RESOURCE_MAX_BYTES,
         timeoutMs: env.AGENT_TOOL_RESOURCE_DOWNLOAD_TIMEOUT_MS
       });
@@ -383,7 +390,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
   }
 
   await registerHealthRoutes(app);
-  await registerAgentRoutes(app, coordinator, { uploadDirectory });
+  await registerAgentRoutes(app, coordinator);
   if (knowledgeStore && knowledgeRetriever) {
     await registerKnowledgeRoutes(app, {
       uploadDirectory,

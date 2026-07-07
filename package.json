@@ -8,13 +8,16 @@
     "apps/web"
   ],
   "scripts": {
-    "dev": "node scripts/ensure-redis.mjs && node scripts/ensure-ollama.mjs && node scripts/ensure-observability.mjs && concurrently -n api,web,worker -c cyan,magenta,yellow \"npm run dev:api\" \"npm run dev:web\" \"npm run dev:worker\"",
+    "dev": "node scripts/ensure-redis.mjs && node scripts/ensure-ollama.mjs && node scripts/ensure-observability.mjs && docker compose up -d minio && concurrently -n api,web,worker -c cyan,magenta,yellow \"npm run dev:api\" \"npm run dev:web\" \"npm run dev:worker\"",
     "dev:api": "npm run dev -w @agent/api",
     "dev:web": "npm run dev -w @agent/web",
     "dev:worker": "npm run dev:worker -w @agent/api",
     "build": "npm run build -w @agent/api && npm run build -w @agent/web",
     "test": "node --test scripts/*.test.mjs && npm run test -w @agent/api && npm run test -w @agent/web",
-    "typecheck": "npm run typecheck -w @agent/api && npm run typecheck -w @agent/web"
+    "typecheck": "npm run typecheck -w @agent/api && npm run typecheck -w @agent/web",
+    "mock:llm": "node scripts/mock-llm-server.mjs",
+    "loadtest": "k6 run scripts/k6-loadtest.js",
+    "loadtest:ingress": "MODE=ingress k6 run scripts/k6-loadtest.js"
   },
   "engines": {
     "node": ">=20"

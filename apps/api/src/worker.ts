@@ -10,13 +10,14 @@ setupObservability({
   serviceName: "agent-worker"
 });
 
-import { Worker } from "bullmq";
+import { Worker, Queue } from "bullmq";
 import { buildApp, type AgentRuntimeFastifyInstance } from "./app.js";
 import { agentRunJobName, type AgentRunJobPayload } from "./agent/agent-run-queue.js";
 import { loadEnv } from "./config/env.js";
 import { knowledgeIndexJobName, type KnowledgeIndexJobPayload } from "./knowledge/knowledge-run-queue.js";
 import { toBullMqRedisConnectionOptions } from "./redis/runtime.js";
 import { runWithParentSpan } from "./observability/trace-context.js";
+import { getMeter } from "./observability/otel.js";
 
 const env = loadEnv();
 
@@ -63,6 +64,48 @@ const worker = new Worker<AgentWorkerJobPayload>(
   }
 );
 
+// ── 队列深度监控 ──────────────────────────────────────────────
+// 每 10 秒采集 BullMQ 队列状态，上报为 OTel 自定义指标。
+// 在 Grafana (Prometheus) 里可查：
+//   bullmq_jobs_waiting   — 等待中的 job 数（堆积量）
+//   bullmq_jobs_active    — 正在处理的 job 数
+//   bullmq_jobs_failed    — 失败的 job 数
+const monitorQueue = new Queue(env.AGENT_QUEUE_NAME, {
+  connection: toBullMqRedisConnectionOptions(env.REDIS_URL)
+});
+const meter = getMeter("agent-worker");
+const jobsWaiting = meter.createObservableGauge("bullmq_jobs_waiting", {
+  description: "BullMQ 等待中的 job 数量"
+});
+const jobsActive = meter.createObservableGauge("bullmq_jobs_active", {
+  description: "BullMQ 正在处理的 job 数量"
+});
+const jobsFailed = meter.createObservableGauge("bullmq_jobs_failed", {
+  description: "BullMQ 失败的 job 数量"
+});
+
+let lastCounts = { waiting: 0, active: 0, failed: 0 };
+
+jobsWaiting.addCallback((result) => {
+  result.observe(lastCounts.waiting);
+});
+jobsActive.addCallback((result) => {
+  result.observe(lastCounts.active);
+});
+jobsFailed.addCallback((result) => {
+  result.observe(lastCounts.failed);
+});
+
+const queueMonitorTimer = setInterval(async () => {
+  try {
+    const counts = await monitorQueue.getJobCounts("waiting", "active", "failed");
+    lastCounts = { waiting: counts.waiting, active: counts.active, failed: counts.failed };
+  } catch (error) {
+    app.log.warn({ error }, "queue depth monitor: getJobCounts failed");
+  }
+}, 10000);
+queueMonitorTimer.unref();
+
 let isShuttingDown = false;
 
 async function shutdown(signal: NodeJS.Signals) {
@@ -74,7 +117,9 @@ async function shutdown(signal: NodeJS.Signals) {
   app.log.info({ signal }, "worker received shutdown signal");
 
   try {
+    clearInterval(queueMonitorTimer);
     await worker.close();
+    await monitorQueue.close();
     await app.close();
     process.exit(0);
   } catch (error) {

@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
-import { extname, join } from "node:path";
+import { extname } from "node:path";
+import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { AppError } from "../errors/app-error.js";
+import { getS3Bucket, getS3Client, getS3ObjectUrl } from "../storage/s3-client.js";
 
 export type ToolResourceType = "image" | "video";
 
@@ -35,9 +36,7 @@ export class PassthroughToolResourceStorage implements ToolResourceStorage {
   }
 }
 
-interface LocalToolResourceStorageOptions {
-  uploadDirectory: string;
-  publicBaseUrl: string;
+interface S3ToolResourceStorageOptions {
   fetchImpl?: typeof fetch;
   maxBytes?: number;
   timeoutMs?: number;
@@ -58,17 +57,15 @@ const mimeExtensions: Record<string, string> = {
   "video/quicktime": ".mov"
 };
 
-export class LocalToolResourceStorage implements ToolResourceStorage {
+export class S3ToolResourceStorage implements ToolResourceStorage {
   private readonly fetchImpl: typeof fetch;
   private readonly maxBytes: number;
   private readonly timeoutMs: number;
-  private readonly publicBaseUrl: string;
 
-  constructor(private readonly options: LocalToolResourceStorageOptions) {
+  constructor(private readonly options: S3ToolResourceStorageOptions = {}) {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.maxBytes = options.maxBytes ?? defaultMaxBytes;
     this.timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
-    this.publicBaseUrl = options.publicBaseUrl.replace(/\/$/, "");
   }
 
   async storeRemoteResource(input: StoreRemoteToolResourceInput): Promise<StoredToolResource> {
@@ -96,25 +93,24 @@ export class LocalToolResourceStorage implements ToolResourceStorage {
     const extension = getExtension(mime, parsedUrl);
     const contentHash = createHash("md5").update(buffer).digest("hex");
     const fileName = `${contentHash}${extension}`;
-    const relativePath = `resources/${input.type}s/${fileName}`;
-    const targetDirectory = join(this.options.uploadDirectory, "resources", `${input.type}s`);
-    const targetPath = join(this.options.uploadDirectory, relativePath);
+    const s3Key = `resources/${input.type}s/${fileName}`;
 
-    await mkdir(targetDirectory, { recursive: true });
-    try {
-      await writeFile(targetPath, buffer, { flag: "wx" });
-    } catch (error) {
-      if (!isFileExistsError(error)) {
-        throw error;
-      }
-    }
+    // S3 putObject 对相同 key 是幂等覆盖，不需要本地文件系统的 "wx" 去重逻辑。
+    await getS3Client().send(
+      new PutObjectCommand({
+        Bucket: getS3Bucket(),
+        Key: s3Key,
+        Body: buffer,
+        ContentType: mime
+      })
+    );
 
     return {
-      url: `${this.publicBaseUrl}/uploads/${relativePath}`,
+      url: getS3ObjectUrl(s3Key),
       mime,
       name: fileName,
       size: buffer.length,
-      relativePath
+      relativePath: s3Key
     };
   }
 
@@ -195,6 +191,4 @@ function getFileNameFromUrl(url: string): string | undefined {
   }
 }
 
-function isFileExistsError(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
-}
+

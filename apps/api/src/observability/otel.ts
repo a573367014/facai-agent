@@ -1,3 +1,4 @@
+import { metrics } from "@opentelemetry/api";
 import { NodeSDK } from "@opentelemetry/sdk-node";
 import { getNodeAutoInstrumentations } from "@opentelemetry/auto-instrumentations-node";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
@@ -11,6 +12,14 @@ import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic
 export interface OtelOptions {
   endpoint: string;
   serviceName: string;
+}
+
+/**
+ * 获取 OTel meter，用于创建自定义指标。
+ * 必须在 setupObservability 调用之后使用。
+ */
+export function getMeter(name = "agent-custom") {
+  return metrics.getMeter(name);
 }
 
 export function setupObservability(options: OtelOptions): NodeSDK | null {
