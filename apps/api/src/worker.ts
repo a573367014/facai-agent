@@ -3,12 +3,20 @@ import { config } from "dotenv";
 config({ path: "../../.env" });
 config();
 
+import { setupObservability } from "./observability/otel.js";
+
+setupObservability({
+  endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? "http://localhost:4318",
+  serviceName: "agent-worker"
+});
+
 import { Worker } from "bullmq";
 import { buildApp, type AgentRuntimeFastifyInstance } from "./app.js";
 import { agentRunJobName, type AgentRunJobPayload } from "./agent/agent-run-queue.js";
 import { loadEnv } from "./config/env.js";
 import { knowledgeIndexJobName, type KnowledgeIndexJobPayload } from "./knowledge/knowledge-run-queue.js";
 import { toBullMqRedisConnectionOptions } from "./redis/runtime.js";
+import { runWithParentSpan } from "./observability/trace-context.js";
 
 const env = loadEnv();
 
@@ -35,7 +43,10 @@ const worker = new Worker<AgentWorkerJobPayload>(
     if (job.name === agentRunJobName) {
       // job.data 只是一组 id。真正执行前由 coordinator 从 SQLite 重新读取 run/message，
       // 再检查 cancel key 和 run lock，保证 Worker 拿到的是当前状态。
-      await coordinator.executeQueuedRun(job.data as AgentRunJobPayload);
+      const payload = job.data as AgentRunJobPayload;
+      await runWithParentSpan(payload.traceContext ?? null, `agent.run ${payload.runId}`, () =>
+        coordinator.executeQueuedRun(payload)
+      );
       return;
     }
 

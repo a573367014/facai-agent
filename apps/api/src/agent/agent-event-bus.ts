@@ -21,38 +21,6 @@ export interface RedisAgentEventBusOptions {
 
 const defaultKeyPrefix = "agent";
 
-export class InMemoryAgentEventBus implements AgentEventBus {
-  private readonly runListeners = new Map<string, Set<AgentEventListener>>();
-
-  async publishRunEvent(runId: string, event: StoredAgentEvent): Promise<void> {
-    for (const listener of this.runListeners.get(runId) ?? []) {
-      listener(event);
-    }
-  }
-
-  async subscribeRun(runId: string, listener: AgentEventListener): Promise<() => void> {
-    return this.addListener(this.runListeners, runId, listener);
-  }
-
-  private addListener(
-    listenersById: Map<string, Set<AgentEventListener>>,
-    id: string,
-    listener: AgentEventListener
-  ): () => void {
-    const listeners = listenersById.get(id) ?? new Set<AgentEventListener>();
-    listeners.add(listener);
-    listenersById.set(id, listeners);
-
-    return () => {
-      listeners.delete(listener);
-
-      if (listeners.size === 0) {
-        listenersById.delete(id);
-      }
-    };
-  }
-}
-
 export class RedisAgentEventBus implements AgentEventBus {
   private readonly keyPrefix: string;
   private readonly listenersByChannel = new Map<string, Set<AgentEventListener>>();

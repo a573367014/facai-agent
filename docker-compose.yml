@@ -18,6 +18,21 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
+  # OpenTelemetry 一站式后端：grafana/otel-lgtm
+  # 内含 OTel Collector + Prometheus + Tempo + Loki + Pyroscope + Grafana
+  # Grafana UI: http://localhost:3000 （账号 admin / admin）
+  # OTLP HTTP: http://localhost:4318
+  lgtm:
+    image: grafana/otel-lgtm:latest
+    ports:
+      - "3000:3000"
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - lgtm-data:/data
+
 volumes:
   redis-data:
   postgres-data:
+  lgtm-data:
+

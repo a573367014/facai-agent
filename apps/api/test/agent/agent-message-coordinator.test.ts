@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { AIMessage, HumanMessage, SystemMessage, ToolMessage, type BaseMessage } from "@langchain/core/messages";
+import type { ChatOpenAI } from "@langchain/openai";
 import { AgentContextBuilder } from "../../src/agent/context-builder.js";
 import { AgentMessageCoordinator } from "../../src/agent/agent-message-coordinator.js";
 import { AgentSummaryService } from "../../src/agent/agent-summary-service.js";
 import { PostgresAgentStore } from "../../src/agent/postgres-agent-store.js";
-import { AgentService } from "../../src/agent/agent-service.js";
+import { LangChainAgentService } from "../../src/langchain/langchain-agent-service.js";
 import type { AgentRunQueue, AgentRunJobPayload } from "../../src/agent/agent-run-queue.js";
 import type { AgentEventBus } from "../../src/agent/agent-event-bus.js";
 import type { AgentEventListener, StoredAgentEvent } from "../../src/agent/agent-store.js";
@@ -13,6 +15,7 @@ import type { AgentRunLock, AgentRunLockLease } from "../../src/agent/agent-run-
 import type { LlmProvider } from "../../src/providers/types.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
 import { ToolRegistry } from "../../src/tools/registry.js";
+import { createMockModel, type MockModel, type MockModelResponse } from "../helpers/mock-model.js";
 
 const TEST_DATABASE_URL = process.env.DATABASE_URL ?? "postgres://postgres:postgres@localhost:5432/agent_test";
 
@@ -102,13 +105,80 @@ function createDeferred<T>() {
   return { promise, resolve, reject };
 }
 
-function createAgentService(provider: LlmProvider, registry: ToolRegistry) {
-  return new AgentService({
-    provider,
+function createAgentService(responses: MockModelResponse[], registry: ToolRegistry) {
+  return new LangChainAgentService({
+    model: createMockModel(responses),
     toolRegistry: registry,
     toolExecutor: new ToolExecutor({ registry, timeoutMs: 100 }),
     defaultMaxIterations: 4
   });
+}
+
+function createAgentServiceWithModel(model: ChatOpenAI, registry: ToolRegistry) {
+  return new LangChainAgentService({
+    model,
+    toolRegistry: registry,
+    toolExecutor: new ToolExecutor({ registry, timeoutMs: 100 }),
+    defaultMaxIterations: 4
+  });
+}
+
+function formatBaseMessages(messages: ReadonlyArray<BaseMessage>): string[] {
+  return messages.map((message) => {
+    let role: string;
+    if (message instanceof HumanMessage) {
+      role = "user";
+    } else if (message instanceof AIMessage) {
+      role = "assistant";
+    } else if (message instanceof SystemMessage) {
+      role = "system";
+    } else if (message instanceof ToolMessage) {
+      role = "tool";
+    } else {
+      role = "unknown";
+    }
+    const content = typeof message.content === "string" ? message.content : "";
+    return `${role}:${content}`;
+  });
+}
+
+interface MockStreamChunk {
+  content: string;
+  tool_call_chunks?: Array<{ index: number; id?: string; name?: string; args?: string }>;
+}
+
+function mockResponseToChunks(response: MockModelResponse): MockStreamChunk[] {
+  const chunks: MockStreamChunk[] = [];
+  if (response.content) {
+    chunks.push({ content: response.content });
+  }
+  for (const [index, toolCall] of (response.toolCalls ?? []).entries()) {
+    chunks.push({
+      content: "",
+      tool_call_chunks: [{ index, id: toolCall.id, name: toolCall.name, args: JSON.stringify(toolCall.args) }]
+    });
+  }
+  return chunks;
+}
+
+function createHangingMockModel(): MockModel {
+  const calls: BaseMessage[][] = [];
+  const stream = async (messages?: unknown, opts?: { signal?: AbortSignal }) => {
+    if (Array.isArray(messages)) {
+      calls.push(messages as BaseMessage[]);
+    }
+    return (async function* () {
+      await new Promise<void>((_resolve, reject) => {
+        opts?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("Aborted", "AbortError"));
+        });
+      });
+      yield { content: "不会完成" };
+    })();
+  };
+  const streamTarget = { stream, invoke: stream };
+  const model = { bindTools: () => streamTarget, stream, invoke: stream, calls };
+  return model as unknown as MockModel;
 }
 
 class FakeAgentEventBus implements AgentEventBus {
@@ -174,7 +244,7 @@ describe("AgentMessageCoordinator", () => {
       enqueueRun: async () => {}
     };
     const coordinator = new AgentMessageCoordinator(
-      createAgentService({ complete: async () => ({ content: "不会在 API 执行" }) }, registry),
+      createAgentService([{ content: "不会在 API 执行" }], registry),
       store,
       undefined,
       undefined,
@@ -199,9 +269,6 @@ describe("AgentMessageCoordinator", () => {
 
   it("queue worker 写入的 run 终态事件会通过 event bus 推给 API 订阅者", async () => {
     const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async () => ({ content: "队列任务完成" })
-    };
     const enqueuedRuns: AgentRunJobPayload[] = [];
     const runQueue: AgentRunQueue = {
       enqueueRun: async (payload) => {
@@ -213,7 +280,7 @@ describe("AgentMessageCoordinator", () => {
     const workerStore = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await apiStore.reset();
     const apiCoordinator = new AgentMessageCoordinator(
-      createAgentService({ complete: async () => ({ content: "API 不执行" }) }, registry),
+      createAgentService([{ content: "API 不执行" }], registry),
       apiStore,
       undefined,
       undefined,
@@ -222,7 +289,7 @@ describe("AgentMessageCoordinator", () => {
       { eventBus, runQueue }
     );
     const workerCoordinator = new AgentMessageCoordinator(
-      createAgentService(provider, registry),
+      createAgentService([{ content: "队列任务完成" }], registry),
       workerStore,
       undefined,
       undefined,
@@ -253,13 +320,7 @@ describe("AgentMessageCoordinator", () => {
 
   it("queue 模式 startRun 只创建记录并投递任务，不在 API 进程内执行 Agent", async () => {
     const registry = new ToolRegistry();
-    let providerCalls = 0;
-    const provider: LlmProvider = {
-      complete: async () => {
-        providerCalls += 1;
-        return { content: "不应该在 API 进程内生成" };
-      }
-    };
+    const model = createMockModel([{ content: "不应该在 API 进程内生成" }]);
     const enqueuedRuns: AgentRunJobPayload[] = [];
     const runQueue: AgentRunQueue = {
       enqueueRun: async (payload) => {
@@ -269,7 +330,7 @@ describe("AgentMessageCoordinator", () => {
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const coordinator = new AgentMessageCoordinator(
-      createAgentService(provider, registry),
+      createAgentServiceWithModel(model, registry),
       store,
       undefined,
       undefined,
@@ -281,7 +342,7 @@ describe("AgentMessageCoordinator", () => {
     try {
       const started = await coordinator.startRun({ input: "生成一张图片" });
 
-      expect(providerCalls).toBe(0);
+      expect(model.calls).toHaveLength(0);
       expect(started.run).toMatchObject({
         status: "running",
         phase: "answering",
@@ -307,9 +368,6 @@ describe("AgentMessageCoordinator", () => {
 
   it("executeQueuedRun 会执行已入队 run 并复用 API 侧创建的 assistant message", async () => {
     const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async () => ({ content: "队列任务已完成" })
-    };
     const enqueuedRuns: AgentRunJobPayload[] = [];
     const runQueue: AgentRunQueue = {
       enqueueRun: async (payload) => {
@@ -319,7 +377,7 @@ describe("AgentMessageCoordinator", () => {
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const coordinator = new AgentMessageCoordinator(
-      createAgentService(provider, registry),
+      createAgentService([{ content: "队列任务已完成" }], registry),
       store,
       undefined,
       undefined,
@@ -353,9 +411,6 @@ describe("AgentMessageCoordinator", () => {
 
   it("cancelRun 会写入跨进程取消标记", async () => {
     const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async () => ({ content: "不会在 queue 模式执行" })
-    };
     const cancellationStore = new FakeAgentCancellationStore();
     const runQueue: AgentRunQueue = {
       enqueueRun: async () => {}
@@ -363,7 +418,7 @@ describe("AgentMessageCoordinator", () => {
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const coordinator = new AgentMessageCoordinator(
-      createAgentService(provider, registry),
+      createAgentService([{ content: "不会在 queue 模式执行" }], registry),
       store,
       undefined,
       undefined,
@@ -385,13 +440,7 @@ describe("AgentMessageCoordinator", () => {
 
   it("executeQueuedRun 拿不到 run lock 时不会执行 provider", async () => {
     const registry = new ToolRegistry();
-    let providerCalls = 0;
-    const provider: LlmProvider = {
-      complete: async () => {
-        providerCalls += 1;
-        return { content: "不应该执行" };
-      }
-    };
+    const model = createMockModel([{ content: "不应该执行" }]);
     const enqueuedRuns: AgentRunJobPayload[] = [];
     const runQueue: AgentRunQueue = {
       enqueueRun: async (payload) => {
@@ -404,7 +453,7 @@ describe("AgentMessageCoordinator", () => {
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const coordinator = new AgentMessageCoordinator(
-      createAgentService(provider, registry),
+      createAgentServiceWithModel(model, registry),
       store,
       undefined,
       undefined,
@@ -417,7 +466,7 @@ describe("AgentMessageCoordinator", () => {
       await coordinator.startRun({ input: "排队执行" });
       await coordinator.executeQueuedRun(enqueuedRuns[0]!);
 
-      expect(providerCalls).toBe(0);
+      expect(model.calls).toHaveLength(0);
     } finally {
       await store.close();
     }
@@ -425,9 +474,6 @@ describe("AgentMessageCoordinator", () => {
 
   it("executeQueuedRun 执行完成后释放 run lock", async () => {
     const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async () => ({ content: "锁内执行完成" })
-    };
     const enqueuedRuns: AgentRunJobPayload[] = [];
     const runQueue: AgentRunQueue = {
       enqueueRun: async (payload) => {
@@ -446,7 +492,7 @@ describe("AgentMessageCoordinator", () => {
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const coordinator = new AgentMessageCoordinator(
-      createAgentService(provider, registry),
+      createAgentService([{ content: "锁内执行完成" }], registry),
       store,
       undefined,
       undefined,
@@ -491,29 +537,32 @@ describe("AgentMessageCoordinator", () => {
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     let apiCoordinator!: AgentMessageCoordinator;
-    let providerCalls = 0;
-    const workerProvider: LlmProvider = {
-      complete: async () => {
-        providerCalls += 1;
-
-        if (providerCalls === 1) {
-          await apiCoordinator.cancelRun(enqueuedRuns[0]!.runId);
-          return {
-            toolCalls: [
-              {
-                id: "call_expensive_tool",
-                name: "expensive_tool",
-                arguments: {}
-              }
-            ]
-          };
-        }
-
-        return { content: "不应该继续生成" };
+    const workerCalls: BaseMessage[][] = [];
+    let workerCallIndex = 0;
+    const workerStream = async (messages?: unknown) => {
+      if (Array.isArray(messages)) workerCalls.push(messages as BaseMessage[]);
+      workerCallIndex += 1;
+      const response: MockModelResponse = workerCallIndex === 1
+        ? { toolCalls: [{ id: "call_expensive_tool", name: "expensive_tool", args: {} }] }
+        : { content: "不应该继续生成" };
+      if (workerCallIndex === 1) {
+        await apiCoordinator.cancelRun(enqueuedRuns[0]!.runId);
       }
+      const chunks = mockResponseToChunks(response);
+      return (async function* () {
+        for (const chunk of chunks) {
+          yield chunk;
+        }
+      })();
     };
+    const workerModel = {
+      bindTools: () => ({ stream: workerStream, invoke: workerStream }),
+      stream: workerStream,
+      invoke: workerStream,
+      calls: workerCalls
+    } as unknown as MockModel;
     apiCoordinator = new AgentMessageCoordinator(
-      createAgentService({ complete: async () => ({ content: "API 进程不执行" }) }, registry),
+      createAgentService([{ content: "API 进程不执行" }], registry),
       store,
       undefined,
       undefined,
@@ -522,7 +571,7 @@ describe("AgentMessageCoordinator", () => {
       { cancellationStore, runQueue }
     );
     const workerCoordinator = new AgentMessageCoordinator(
-      createAgentService(workerProvider, registry),
+      createAgentServiceWithModel(workerModel, registry),
       store,
       undefined,
       undefined,
@@ -536,7 +585,7 @@ describe("AgentMessageCoordinator", () => {
 
       await workerCoordinator.executeQueuedRun(enqueuedRuns[0]!);
 
-      expect(providerCalls).toBe(1);
+      expect(workerCalls).toHaveLength(1);
       expect(toolExecutions).toBe(0);
       expect((await workerCoordinator.getRun(started.run.id)).run).toMatchObject({
         status: "cancelled",
@@ -549,9 +598,6 @@ describe("AgentMessageCoordinator", () => {
 
   it("启动恢复会把上次进程遗留的 running run 收敛为 failed", async () => {
     const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async () => ({ content: "不会执行" })
-    };
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const session = await store.createSession("遗留运行");
@@ -605,7 +651,7 @@ describe("AgentMessageCoordinator", () => {
       status: "running",
       orderIndex: 0
     });
-    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+    const coordinator = new AgentMessageCoordinator(createAgentService([{ content: "不会执行" }], registry), store);
 
     const result = await coordinator.cleanupStaleRunningExecutions("服务重启后清理遗留运行");
 
@@ -670,20 +716,9 @@ describe("AgentMessageCoordinator", () => {
 
   it("shutdown 会取消当前进程内的 running run", async () => {
     const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async ({ signal }) => {
-        await new Promise((_resolve, reject) => {
-          signal?.addEventListener("abort", () => {
-            reject(new DOMException("Aborted", "AbortError"));
-          });
-        });
-
-        return { content: "不会完成" };
-      }
-    };
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
-    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+    const coordinator = new AgentMessageCoordinator(createAgentServiceWithModel(createHangingMockModel(), registry), store);
     const started = await coordinator.startRun({ input: "生成长任务" });
 
     await coordinator.shutdown("服务关闭");
@@ -698,15 +733,13 @@ describe("AgentMessageCoordinator", () => {
   });
 
   it("run 会在本轮回答前执行上下文压缩，并用 system message 展示压缩状态", async () => {
-    const answerCalls: string[][] = [];
     const summaryCalls: string[][] = [];
     const registry = new ToolRegistry();
-    const answerProvider: LlmProvider = {
-      complete: async ({ messages }) => {
-        answerCalls.push(messages.map((message) => `${message.role}:${"content" in message ? message.content : ""}`));
-        return { content: `第 ${answerCalls.length} 轮回答` };
-      }
-    };
+    const model = createMockModel([
+      { content: "第 1 轮回答" },
+      { content: "第 2 轮回答" },
+      { content: "第 3 轮回答" }
+    ]);
     const summaryProvider: LlmProvider = {
       complete: async ({ messages }) => {
         summaryCalls.push(messages.map((message) => `${message.role}:${"content" in message ? message.content : ""}`));
@@ -727,7 +760,7 @@ describe("AgentMessageCoordinator", () => {
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const coordinator = new AgentMessageCoordinator(
-      createAgentService(answerProvider, registry),
+      createAgentServiceWithModel(model, registry),
       store,
       new AgentContextBuilder({ maxHistoryMessages: 10 }),
       new AgentSummaryService({
@@ -756,28 +789,22 @@ describe("AgentMessageCoordinator", () => {
       expect(summaryCalls).toHaveLength(1);
       expect(summaryCalls[0]?.join("\n")).toContain("第一轮问题");
       expect(summaryCalls[0]?.join("\n")).not.toContain("第三轮问题");
-      expect(answerCalls[2]).toEqual([
+      expect(formatBaseMessages(model.calls[2]!)).toEqual([
         expect.stringMatching(/^system:/),
         expect.stringContaining("以下是此前对话的结构化摘要"),
         "user:第二轮问题",
         "assistant:第 2 轮回答",
         "user:第三轮问题"
       ]);
-      expect(answerCalls[2]?.join("\n")).not.toContain("上下文自动压缩");
+      expect(formatBaseMessages(model.calls[2]!).join("\n")).not.toContain("上下文自动压缩");
     } finally {
       await store.close();
     }
   });
 
   it("重新生成会使用目标回答当时可用的 summary 版本，不混入后续对话", async () => {
-    const answerCalls: string[][] = [];
     const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async ({ messages }) => {
-        answerCalls.push(messages.map((message) => `${message.role}:${"content" in message ? message.content : ""}`));
-        return { content: "重新生成的回答" };
-      }
-    };
+    const model = createMockModel([{ content: "重新生成的回答" }]);
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const session = await store.createSession("重新生成会话");
@@ -846,7 +873,7 @@ describe("AgentMessageCoordinator", () => {
       }
     });
     const coordinator = new AgentMessageCoordinator(
-      createAgentService(provider, registry),
+      createAgentServiceWithModel(model, registry),
       store,
       new AgentContextBuilder({ maxHistoryMessages: 10 })
     );
@@ -856,7 +883,7 @@ describe("AgentMessageCoordinator", () => {
 
       await waitForRun(coordinator, regenerated.run.id);
 
-      const prompt = answerCalls[0]?.join("\n") ?? "";
+      const prompt = formatBaseMessages(model.calls[0] ?? []).join("\n");
       const messages = (await coordinator.getSession(session.id)).messages;
       const regeneratedAssistant = messages.find(
         (message) => message.role === "assistant" && message.parts[0]?.type === "text" && message.parts[0].value === "重新生成的回答"
@@ -916,23 +943,6 @@ describe("AgentMessageCoordinator", () => {
         };
       }
     });
-    const provider: LlmProvider = {
-      complete: async ({ messages, tools }) => {
-        if (tools.length > 0 && !messages.some((message) => message.role === "tool")) {
-          return {
-            toolCalls: [
-              {
-                id: "call_model_single",
-                name: "generate_image",
-                arguments: { prompt: "模型退化成单张" }
-              }
-            ]
-          };
-        }
-
-        return { content: "图片已重新生成。" };
-      }
-    };
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const session = await store.createSession("连续重试媒体回答");
@@ -959,7 +969,7 @@ describe("AgentMessageCoordinator", () => {
         items: [{ prompt: "小猫" }, { prompt: "小狗" }]
       }
     });
-    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+    const coordinator = new AgentMessageCoordinator(createAgentService([{ content: "图片已重新生成。" }], registry), store);
 
     try {
       const regenerated = await coordinator.regenerateMessage(targetAssistant.id);
@@ -982,15 +992,8 @@ describe("AgentMessageCoordinator", () => {
   });
 
   it("重新生成由重试产生的回答时使用 run 记录的原始用户消息，而不是最近用户消息", async () => {
-    const answerInputs: string[] = [];
     const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async ({ messages }) => {
-        const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
-        answerInputs.push(lastUserMessage && "content" in lastUserMessage ? lastUserMessage.content : "");
-        return { content: `回答 ${answerInputs.length}` };
-      }
-    };
+    const model = createMockModel([{ content: "回答 1" }, { content: "回答 2" }]);
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const session = await store.createSession("连续重试原始用户绑定");
@@ -1018,7 +1021,7 @@ describe("AgentMessageCoordinator", () => {
       status: "completed",
       parts: [{ type: "text", value: "后续回答" }]
     });
-    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+    const coordinator = new AgentMessageCoordinator(createAgentServiceWithModel(model, registry), store);
 
     try {
       const firstRegeneration = await coordinator.regenerateMessage(originalAssistant.id);
@@ -1033,6 +1036,16 @@ describe("AgentMessageCoordinator", () => {
       const secondRegeneration = await coordinator.regenerateMessage(firstRegeneratedAssistantId);
 
       await waitForRun(coordinator, secondRegeneration.run.id);
+
+      const answerInputs = model.calls.map((messages) => {
+        for (let i = messages.length - 1; i >= 0; i -= 1) {
+          const message = messages[i]!;
+          if (message instanceof HumanMessage) {
+            return typeof message.content === "string" ? message.content : "";
+          }
+        }
+        return "";
+      });
 
       expect(firstRegeneration.userMessage.id).toBe(originalUser.id);
       expect(secondRegeneration.userMessage.id).toBe(originalUser.id);
@@ -1050,21 +1063,29 @@ describe("AgentMessageCoordinator", () => {
     const registry = new ToolRegistry();
     let shouldHangOnAnswer = false;
     let answerCallStarted = false;
-    const answerProvider: LlmProvider = {
-      complete: async ({ messages, signal }) => {
-        answerCallStarted = true;
-
-        if (shouldHangOnAnswer) {
-          await new Promise((_resolve, reject) => {
-            signal?.addEventListener("abort", () => {
-              reject(new DOMException("Aborted", "AbortError"));
-            });
-          });
-        }
-
-        return { content: `回答：${"content" in messages[messages.length - 1] ? messages[messages.length - 1].content : ""}` };
+    const answerCalls: BaseMessage[][] = [];
+    const answerStream = async (messages?: unknown, opts?: { signal?: AbortSignal }) => {
+      if (Array.isArray(messages)) {
+        answerCalls.push(messages as BaseMessage[]);
       }
+      answerCallStarted = true;
+      if (shouldHangOnAnswer) {
+        await new Promise<void>((_resolve, reject) => {
+          opts?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("Aborted", "AbortError"));
+          });
+        });
+      }
+      return (async function* () {
+        yield { content: "回答" };
+      })();
     };
+    const answerModel = {
+      bindTools: () => ({ stream: answerStream, invoke: answerStream }),
+      stream: answerStream,
+      invoke: answerStream,
+      calls: answerCalls
+    } as unknown as MockModel;
     const summaryProvider: LlmProvider = {
       complete: async ({ messages }) => {
         summaryCalls.push(messages.map((message) => `${message.role}:${"content" in message ? message.content : ""}`));
@@ -1085,7 +1106,7 @@ describe("AgentMessageCoordinator", () => {
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const coordinator = new AgentMessageCoordinator(
-      createAgentService(answerProvider, registry),
+      createAgentServiceWithModel(answerModel, registry),
       store,
       new AgentContextBuilder({ maxHistoryMessages: 10 }),
       new AgentSummaryService({
@@ -1135,9 +1156,6 @@ describe("AgentMessageCoordinator", () => {
   it("短消息虽然超过条数阈值，但有效内容太少时不会触发 run 前置压缩", async () => {
     const summaryCalls: string[][] = [];
     const registry = new ToolRegistry();
-    const answerProvider: LlmProvider = {
-      complete: async () => ({ content: "好" })
-    };
     const summaryProvider: LlmProvider = {
       complete: async ({ messages }) => {
         summaryCalls.push(messages.map((message) => `${message.role}:${"content" in message ? message.content : ""}`));
@@ -1158,7 +1176,7 @@ describe("AgentMessageCoordinator", () => {
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const coordinator = new AgentMessageCoordinator(
-      createAgentService(answerProvider, registry),
+      createAgentService([{ content: "好" }], registry),
       store,
       new AgentContextBuilder({ maxHistoryMessages: 10 }),
       new AgentSummaryService({
@@ -1190,9 +1208,6 @@ describe("AgentMessageCoordinator", () => {
   it("大量取消消息不会占掉待压缩窗口，未压缩上下文总量超过阈值时会触发压缩", async () => {
     const summaryCalls: string[][] = [];
     const registry = new ToolRegistry();
-    const answerProvider: LlmProvider = {
-      complete: async () => ({ content: "继续回答" })
-    };
     const summaryProvider: LlmProvider = {
       complete: async ({ messages }) => {
         summaryCalls.push(messages.map((message) => `${message.role}:${"content" in message ? message.content : ""}`));
@@ -1273,7 +1288,7 @@ describe("AgentMessageCoordinator", () => {
     });
 
     const coordinator = new AgentMessageCoordinator(
-      createAgentService(answerProvider, registry),
+      createAgentService([{ content: "继续回答" }], registry),
       store,
       new AgentContextBuilder({ maxHistoryMessages: 10 }),
       new AgentSummaryService({
@@ -1300,18 +1315,16 @@ describe("AgentMessageCoordinator", () => {
   });
 
   it("启动同一 session 的新 assistant message 时使用历史 messages 构造上下文", async () => {
-    const calls: string[][] = [];
     const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async ({ messages }) => {
-        calls.push(messages.map((message) => `${message.role}:${"content" in message ? message.content : ""}`));
-        return { content: `第 ${calls.length} 轮回答` };
-      }
-    };
+    const model = createMockModel([
+      { content: "第 1 轮回答" },
+      { content: "第 2 轮回答" },
+      { content: "第 3 轮回答" }
+    ]);
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const coordinator = new AgentMessageCoordinator(
-      createAgentService(provider, registry),
+      createAgentServiceWithModel(model, registry),
       store,
       new AgentContextBuilder({ maxHistoryMessages: 2 })
     );
@@ -1324,7 +1337,7 @@ describe("AgentMessageCoordinator", () => {
       const third = await startRunAndWait(coordinator, { sessionId: first.session.id, input: "第三轮问题" });
       await waitForMessage(coordinator, third.assistantMessage.id);
 
-      expect(calls[2]).toEqual([
+      expect(formatBaseMessages(model.calls[2]!)).toEqual([
         expect.stringMatching(/^system:/),
         "user:第二轮问题",
         "assistant:第 2 轮回答",
@@ -1337,12 +1350,9 @@ describe("AgentMessageCoordinator", () => {
 
   it("读取 session 时只返回最近一页消息，并暴露继续加载历史的游标", async () => {
     const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async () => ({ content: "固定回答" })
-    };
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
-    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+    const coordinator = new AgentMessageCoordinator(createAgentService([{ content: "固定回答" }], registry), store);
     const session = await store.createSession("长会话");
     const messages: { id: string }[] = [];
     for (let index = 0; index < 5; index += 1) {
@@ -1401,26 +1411,6 @@ describe("AgentMessageCoordinator", () => {
         imageUrls: ["https://example.com/pig.png"]
       })
     });
-    let callCount = 0;
-    const provider: LlmProvider = {
-      complete: async () => {
-        callCount += 1;
-
-        if (callCount === 1) {
-          return {
-            toolCalls: [
-              {
-                id: "call_image",
-                name: "generate_image",
-                arguments: { prompt: "小猪" }
-              }
-            ]
-          };
-        }
-
-        return { content: "图片已生成。" };
-      }
-    };
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const resourceStorage = {
@@ -1433,7 +1423,13 @@ describe("AgentMessageCoordinator", () => {
       })
     };
     const coordinator = new AgentMessageCoordinator(
-      createAgentService(provider, registry),
+      createAgentService(
+        [
+          { toolCalls: [{ id: "call_image", name: "generate_image", args: { prompt: "小猪" } }] },
+          { content: "图片已生成。" }
+        ],
+        registry
+      ),
       store,
       undefined,
       undefined,
@@ -1524,26 +1520,6 @@ describe("AgentMessageCoordinator", () => {
         aspectRatio: "16:9"
       })
     });
-    let callCount = 0;
-    const provider: LlmProvider = {
-      complete: async () => {
-        callCount += 1;
-
-        if (callCount === 1) {
-          return {
-            toolCalls: [
-              {
-                id: "call_video",
-                name: "generate_video",
-                arguments: { prompt: "小猪在草地奔跑" }
-              }
-            ]
-          };
-        }
-
-        return { content: "视频已生成。" };
-      }
-    };
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const resourceStorage = {
@@ -1556,7 +1532,13 @@ describe("AgentMessageCoordinator", () => {
       })
     };
     const coordinator = new AgentMessageCoordinator(
-      createAgentService(provider, registry),
+      createAgentService(
+        [
+          { toolCalls: [{ id: "call_video", name: "generate_video", args: { prompt: "小猪在草地奔跑" } }] },
+          { content: "视频已生成。" }
+        ],
+        registry
+      ),
       store,
       undefined,
       undefined,
@@ -1653,32 +1635,29 @@ describe("AgentMessageCoordinator", () => {
         imageUrls: ["https://example.com/edited-pig.png"]
       })
     });
-    let callCount = 0;
-    const provider: LlmProvider = {
-      complete: async () => {
-        callCount += 1;
-
-        if (callCount === 1) {
-          return {
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService(
+        [
+          {
             toolCalls: [
               {
                 id: "call_edit_image",
                 name: "edit_image",
-                arguments: {
+                args: {
                   prompt: "把小猪改成水彩风格",
                   imageUrl: "https://cdn.example.com/source-pig.png"
                 }
               }
             ]
-          };
-        }
-
-        return { content: "图片已编辑完成。" };
-      }
-    };
-    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
-    await store.reset();
-    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+          },
+          { content: "图片已编辑完成。" }
+        ],
+        registry
+      ),
+      store
+    );
 
     try {
       const started = await startRunAndWait(coordinator, { input: "把这张小猪图改成水彩风格" });
@@ -1729,19 +1708,9 @@ describe("AgentMessageCoordinator", () => {
 
   it("流式回答会更新 assistant message 的 text part", async () => {
     const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async () => {
-        throw new Error("streaming path should be used");
-      },
-      completeStream: async (_request, onDelta) => {
-        await onDelta("你好");
-        await onDelta("世界");
-        return { content: "你好世界" };
-      }
-    };
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
-    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+    const coordinator = new AgentMessageCoordinator(createAgentService([{ content: "你好世界" }], registry), store);
 
     try {
       const started = await startRunAndWait(coordinator, { input: "问候一下" });
@@ -1759,21 +1728,23 @@ describe("AgentMessageCoordinator", () => {
     const registry = new ToolRegistry();
     const firstDeltaReceived = createDeferred<void>();
     const allowFinish = createDeferred<void>();
-    const provider: LlmProvider = {
-      complete: async () => {
-        throw new Error("streaming path should be used");
-      },
-      completeStream: async (_request, onDelta) => {
-        await onDelta("正在生成");
+    const controlledStream = async () => {
+      return (async function* () {
+        yield { content: "正在生成" };
         firstDeltaReceived.resolve();
         await allowFinish.promise;
-        await onDelta("完成");
-        return { content: "正在生成完成" };
-      }
+        yield { content: "完成" };
+      })();
     };
+    const controlledModel = {
+      bindTools: () => ({ stream: controlledStream, invoke: controlledStream }),
+      stream: controlledStream,
+      invoke: controlledStream,
+      calls: [] as BaseMessage[][]
+    } as unknown as MockModel;
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
-    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+    const coordinator = new AgentMessageCoordinator(createAgentServiceWithModel(controlledModel, registry), store);
 
     try {
       const started = await coordinator.startRun({ input: "写一段话" });
@@ -1818,29 +1789,18 @@ describe("AgentMessageCoordinator", () => {
         imageUrls: ["https://example.com/pig.png"]
       })
     });
-    let callCount = 0;
-    const provider: LlmProvider = {
-      complete: async () => {
-        callCount += 1;
-
-        if (callCount === 1) {
-          return {
-            toolCalls: [
-              {
-                id: "call_image",
-                name: "generate_image",
-                arguments: { prompt: "小猪" }
-              }
-            ]
-          };
-        }
-
-        return { content: "图片已生成。" };
-      }
-    };
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
-    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService(
+        [
+          { toolCalls: [{ id: "call_image", name: "generate_image", args: { prompt: "小猪" } }] },
+          { content: "图片已生成。" }
+        ],
+        registry
+      ),
+      store
+    );
 
     try {
       const started = await startRunAndWait(coordinator, { input: "生成一张小猪图片" });
@@ -1901,29 +1861,18 @@ describe("AgentMessageCoordinator", () => {
         imageUrls: ["https://example.com/pig.png"]
       })
     });
-    let callCount = 0;
-    const provider: LlmProvider = {
-      complete: async () => {
-        callCount += 1;
-
-        if (callCount === 1) {
-          return {
-            toolCalls: [
-              {
-                id: "call_image",
-                name: "generate_image",
-                arguments: { prompt: "小猪" }
-              }
-            ]
-          };
-        }
-
-        return { content: "图片已生成。" };
-      }
-    };
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
-    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService(
+        [
+          { toolCalls: [{ id: "call_image", name: "generate_image", args: { prompt: "小猪" } }] },
+          { content: "图片已生成。" }
+        ],
+        registry
+      ),
+      store
+    );
 
     try {
       const started = await startRunAndWait(coordinator, { input: "生成一张小猪图片" });
@@ -1963,12 +1912,12 @@ describe("AgentMessageCoordinator", () => {
 
   it("纯文本回答的过程步骤不暴露模型内部文案", async () => {
     const registry = new ToolRegistry();
-    const provider: LlmProvider = {
-      complete: async () => ({ content: "Agent 会先理解用户需求，再决定是否调用工具。" })
-    };
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
-    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService([{ content: "Agent 会先理解用户需求，再决定是否调用工具。" }], registry),
+      store
+    );
 
     try {
       const started = await startRunAndWait(coordinator, { input: "解释一下 Agent 流程" });
@@ -2045,42 +1994,68 @@ describe("AgentMessageCoordinator", () => {
       }
     });
 
-    let callCount = 0;
     const toolCountsByCall: number[] = [];
     const summaryPrompts: string[][] = [];
-    const provider: LlmProvider = {
-      complete: async ({ messages, tools }) => {
-        callCount += 1;
-        toolCountsByCall.push(tools.length);
-
-        if (callCount === 1) {
-          return {
-            toolCalls: [
-              {
-                id: "call_batch",
-                name: "generate_image",
-                arguments: {
-                  items: [
-                    { prompt: "宝宝", width: 1328, height: 1328 },
-                    { prompt: "狗狗", width: 1328, height: 1328 }
-                  ]
-                }
+    const allCalls: BaseMessage[][] = [];
+    let boundToolCount = 0;
+    let callCount = 0;
+    const pickResponse = (): MockModelResponse => {
+      const responses: MockModelResponse[] = [
+        {
+          toolCalls: [
+            {
+              id: "call_batch",
+              name: "generate_image",
+              args: {
+                items: [
+                  { prompt: "宝宝", width: 1328, height: 1328 },
+                  { prompt: "狗狗", width: 1328, height: 1328 }
+                ]
               }
-            ]
-          };
-        }
-
-        if (callCount === 2) {
-          summaryPrompts.push(messages.map((message) => `${message.role}:${"content" in message ? message.content : ""}`));
-          return { content: "狗狗图片已生成，宝宝图片因并发限制失败。可以稍后再试。" };
-        }
-
-        throw new Error("不应该继续进入第三轮模型调用");
-      }
+            }
+          ]
+        },
+        { content: "狗狗图片已生成，宝宝图片因并发限制失败。可以稍后再试。" }
+      ];
+      const response = responses[Math.min(callCount, responses.length - 1)];
+      callCount += 1;
+      return response;
     };
+    const streamFromResponse = async (response: MockModelResponse) => {
+      const chunks = mockResponseToChunks(response);
+      return (async function* () {
+        for (const chunk of chunks) {
+          yield chunk;
+        }
+      })();
+    };
+    const boundStream = async (messages?: unknown) => {
+      if (Array.isArray(messages)) allCalls.push(messages as BaseMessage[]);
+      toolCountsByCall.push(boundToolCount);
+      return streamFromResponse(pickResponse());
+    };
+    const summaryStream = async (messages?: unknown) => {
+      if (Array.isArray(messages)) {
+        const arr = messages as BaseMessage[];
+        allCalls.push(arr);
+        summaryPrompts.push(formatBaseMessages(arr));
+      }
+      toolCountsByCall.push(0);
+      return streamFromResponse(pickResponse());
+    };
+    const boundTarget = { stream: boundStream, invoke: boundStream };
+    const batchModel = {
+      bindTools: (tools: unknown[]) => {
+        boundToolCount = tools.length;
+        return boundTarget;
+      },
+      stream: summaryStream,
+      invoke: summaryStream,
+      calls: allCalls
+    } as unknown as MockModel;
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
-    const coordinator = new AgentMessageCoordinator(createAgentService(provider, registry), store);
+    const coordinator = new AgentMessageCoordinator(createAgentServiceWithModel(batchModel, registry), store);
 
     try {
       const started = await startRunAndWait(coordinator, { input: "分别生成宝宝和狗狗图片" });

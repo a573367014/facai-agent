@@ -4,10 +4,10 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { InMemoryAgentCancellationStore } from "../../src/agent/agent-cancellation-store.js";
-import { InMemoryAgentEventBus } from "../../src/agent/agent-event-bus.js";
+import type { AgentEventBus } from "../../src/agent/agent-event-bus.js";
 import { InMemoryAgentRunLock } from "../../src/agent/agent-run-lock.js";
 import type { AgentRunJobPayload, AgentRunQueue } from "../../src/agent/agent-run-queue.js";
-import { AgentService } from "../../src/agent/agent-service.js";
+import { LangChainAgentService } from "../../src/langchain/langchain-agent-service.js";
 import { PostgresAgentStore } from "../../src/agent/postgres-agent-store.js";
 import { InMemoryRunningMessageStateStore } from "../../src/agent/running-message-state-store.js";
 import { buildApp } from "../../src/app.js";
@@ -15,7 +15,7 @@ import type { EmbeddingService } from "../../src/knowledge/embedding-service.js"
 import type { KnowledgeIndexJobPayload, KnowledgeIndexQueue } from "../../src/knowledge/knowledge-run-queue.js";
 import type { KnowledgeIndexingService } from "../../src/knowledge/indexing-service.js";
 import type { KnowledgeDocumentRecord } from "../../src/knowledge/types.js";
-import type { LlmProvider } from "../../src/providers/types.js";
+import { createMockModel } from "../helpers/mock-model.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
 import { ToolRegistry } from "../../src/tools/registry.js";
 
@@ -70,25 +70,29 @@ function createMultipartPayload(input: { fieldName: string; fileName: string; co
   };
 }
 
-function createTestAgentService(): AgentService {
+function createTestAgentService(): LangChainAgentService {
   const registry = new ToolRegistry();
-  const provider: LlmProvider = {
-    complete: async () => ({ content: "测试回答" })
-  };
 
-  return new AgentService({
-    provider,
+  return new LangChainAgentService({
+    model: createMockModel([{ content: "测试回答" }]),
     toolRegistry: registry,
     toolExecutor: new ToolExecutor({ registry, timeoutMs: 100 }),
     defaultMaxIterations: 4
   });
 }
 
+const noopEventBus: AgentEventBus = {
+  async publishRunEvent() {},
+  async subscribeRun() {
+    return () => {};
+  }
+};
+
 async function buildKnowledgeTestApp(options: { uploadDirectory: string; knowledgeIndexQueue: KnowledgeIndexQueue }) {
   const app = (await buildApp({
     agentService: createTestAgentService(),
     runningStateStore: new InMemoryRunningMessageStateStore(),
-    eventBus: new InMemoryAgentEventBus(),
+    eventBus: noopEventBus,
     runQueue: new NoopAgentRunQueue(),
     cancellationStore: new InMemoryAgentCancellationStore(),
     runLock: new InMemoryAgentRunLock(),

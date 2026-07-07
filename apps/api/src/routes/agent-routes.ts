@@ -13,6 +13,7 @@ import {
   type MessagePart
 } from "../agent/message-parts.js";
 import { AppError } from "../errors/app-error.js";
+import { getRequestTraceContext } from "../observability/trace-context.js";
 
 const partExtraSchema = z.record(z.unknown());
 const textPartSchema = z
@@ -270,7 +271,7 @@ export async function registerAgentRoutes(
 
   app.post("/agents/runs", async (request, reply) => {
     const input = parseMessageStartRequest(request.body);
-    reply.status(202).send(await coordinator.startRun(input));
+    reply.status(202).send(await coordinator.startRun(input, getRequestTraceContext(request) ?? undefined));
   });
 
   app.post("/agents/uploads/images", async (request, reply) => {
@@ -318,7 +319,7 @@ export async function registerAgentRoutes(
   app.post("/agents/sessions/:sessionId/runs", async (request, reply) => {
     const { sessionId } = parseSessionParams(request.params);
     const input = parseMessageRequest(request.body);
-    reply.status(202).send(await coordinator.startRun({ ...input, sessionId }));
+    reply.status(202).send(await coordinator.startRun({ ...input, sessionId }, getRequestTraceContext(request) ?? undefined));
   });
 
   app.get("/agents/messages/:messageId", async (request) => {

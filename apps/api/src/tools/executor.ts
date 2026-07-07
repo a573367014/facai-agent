@@ -1,8 +1,11 @@
 import { ZodError } from "zod";
+import { trace, SpanStatusCode } from "@opentelemetry/api";
 import { AppError } from "../errors/app-error.js";
 import { ToolAccessPolicy } from "./access-policy.js";
 import type { ToolRegistry } from "./registry.js";
 import type { JsonObject, ToolExecutionInput, ToolExecutionResult, ToolOutput } from "./types.js";
+
+const tracer = trace.getTracer("tool-executor");
 
 export interface ToolExecutorOptions {
   registry: ToolRegistry;
@@ -31,6 +34,36 @@ export class ToolExecutor {
   }
 
   async execute(input: ToolExecutionInput): Promise<ToolExecutionResult> {
+    return tracer.startActiveSpan(`tool.${input.toolName}`, async (span) => {
+      span.setAttributes({
+        "tool.name": input.toolName,
+        "tool.call_id": input.toolCallId,
+        "tool.session_id": input.sessionId ?? "",
+        "tool.message_id": input.messageId ?? ""
+      });
+
+      try {
+        const result = await this.doExecute(input);
+        span.setAttributes({
+          "tool.success": result.ok,
+          "tool.duration_ms": result.durationMs
+        });
+        if (!result.ok) {
+          span.setAttribute("tool.error.recoverable", result.error.recoverable);
+          span.setStatus({ code: SpanStatusCode.ERROR, message: result.error.message });
+        }
+        return result;
+      } catch (error) {
+        span.recordException(error as Error);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: (error as Error).message });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
+  }
+
+  private async doExecute(input: ToolExecutionInput): Promise<ToolExecutionResult> {
     const startedAt = Date.now();
     const tool = this.options.registry.getTool(input.toolName);
 

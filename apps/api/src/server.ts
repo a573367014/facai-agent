@@ -3,6 +3,13 @@ import { config } from "dotenv";
 config({ path: "../../.env" });
 config();
 
+import { setupObservability } from "./observability/otel.js";
+
+setupObservability({
+  endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? "http://localhost:4318",
+  serviceName: "agent-api"
+});
+
 import { buildApp } from "./app.js";
 import { loadEnv } from "./config/env.js";
 
