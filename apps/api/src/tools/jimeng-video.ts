@@ -1,6 +1,4 @@
 import { createHash, createHmac } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import { AppError } from "../errors/app-error.js";
 import type { JsonObject, RegisteredTool, ToolExecutionContext } from "./types.js";
@@ -90,7 +88,6 @@ type VideoResponse = z.infer<typeof videoResponseSchema>;
 export interface JimengVideoToolOptions {
   accessKeyId?: string;
   secretAccessKey?: string;
-  uploadDirectory?: string;
   endpoint?: string;
   region?: string;
   service?: string;
@@ -140,39 +137,28 @@ function isLocalhost(hostname: string) {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
 }
 
-function isPathInside(basePath: string, targetPath: string) {
-  const childPath = relative(basePath, targetPath);
-  return childPath === "" || (!childPath.startsWith("..") && !childPath.startsWith(sep) && childPath !== "..");
-}
-
-async function tryReadLocalUploadAsBase64(imageUrl: string, uploadDirectory?: string) {
-  if (!uploadDirectory) {
-    return undefined;
-  }
-
-  // 视频首尾帧也可能来自本地上传目录。第三方服务拉不到 localhost，
-  // 所以本地 /uploads 图片会在服务端安全读取后改用 base64 提交。
+// 第三方服务（火山引擎）无法访问 localhost 地址的图片。
+// 如果图片 URL 是 localhost，服务端先 fetch 下载再转 base64 提交。
+// 生产环境用公网域名时（R2/CDN），火山引擎可以直接访问，不需要转 base64。
+async function tryReadLocalUploadAsBase64(imageUrl: string) {
   const parsedUrl = new URL(imageUrl);
 
-  if (!isLocalhost(parsedUrl.hostname) || !parsedUrl.pathname.startsWith("/uploads/")) {
+  if (!isLocalhost(parsedUrl.hostname)) {
     return undefined;
   }
 
-  const relativeUploadPath = decodeURIComponent(parsedUrl.pathname.slice("/uploads/".length));
-  const rootPath = resolve(uploadDirectory);
-  const filePath = resolve(rootPath, relativeUploadPath);
+  const response = await fetch(imageUrl);
 
-  if (!isPathInside(rootPath, filePath)) {
-    throw new AppError("VALIDATION_ERROR", "视频首尾帧图片地址不在允许的上传目录内", 400);
+  if (!response.ok) {
+    throw new AppError("VALIDATION_ERROR", `读取本地图片失败，HTTP ${response.status}`, 400);
   }
 
-  // TODO: 后续上传切到 OSS/CDN 公网地址后，移除这段 localhost 图片转 base64 的兼容逻辑。
-  const buffer = await readFile(filePath);
+  const buffer = Buffer.from(await response.arrayBuffer());
   return buffer.toString("base64");
 }
 
-async function toVideoFrameInput(frameUrls: string[], uploadDirectory?: string) {
-  const base64Frames = await Promise.all(frameUrls.map((url) => tryReadLocalUploadAsBase64(url, uploadDirectory)));
+async function toVideoFrameInput(frameUrls: string[]) {
+  const base64Frames = await Promise.all(frameUrls.map((url) => tryReadLocalUploadAsBase64(url)));
 
   if (base64Frames.every(Boolean)) {
     return { binary_data_base64: base64Frames as string[] };
@@ -211,7 +197,7 @@ function selectVideoMode(
   };
 }
 
-async function toSubmitBody(args: VideoArgs, mode: VideoMode, uploadDirectory?: string) {
+async function toSubmitBody(args: VideoArgs, mode: VideoMode) {
   if (mode.type === "text_to_video") {
     return {
       req_key: mode.reqKey,
@@ -228,7 +214,7 @@ async function toSubmitBody(args: VideoArgs, mode: VideoMode, uploadDirectory?: 
   return {
     req_key: mode.reqKey,
     prompt: args.prompt,
-    ...(await toVideoFrameInput(frameUrls, uploadDirectory)),
+    ...(await toVideoFrameInput(frameUrls)),
     seed: args.seed ?? DEFAULT_SEED,
     frames: args.frames ?? DEFAULT_FRAMES
   };
@@ -458,7 +444,7 @@ export function createJimengVideoTool(options: JimengVideoToolOptions): Register
   ): Promise<{ taskId: string; videoUrl: string }> => {
     // 即梦视频生成也是异步任务：提交后只拿 taskId，真正的视频 URL 要轮询获取。
     // 轮询过程使用 context.signal，所以用户取消 run 时这里会尽快停止等待。
-    const submitPayload = await request("CVSync2AsyncSubmitTask", await toSubmitBody(args, mode, options.uploadDirectory), context);
+    const submitPayload = await request("CVSync2AsyncSubmitTask", await toSubmitBody(args, mode), context);
     ensureSuccessfulResponse(submitPayload, "提交任务");
 
     const taskId = submitPayload.data?.task_id ?? submitPayload.task_id;

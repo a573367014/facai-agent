@@ -16,7 +16,6 @@ describe("loadEnv", () => {
     expect(env.AGENT_SUMMARY_TRIGGER_MESSAGES).toBe(8);
     expect(env.AGENT_SUMMARY_KEEP_RECENT_MESSAGES).toBe(4);
     expect(env.AGENT_SUMMARY_TRIGGER_CHARS).toBe(1000);
-    expect(env.AGENT_EVENT_LOG_PATH).toBe("./data/agent-events.jsonl");
     expect(env.AGENT_PUBLIC_BASE_URL).toBeUndefined();
     expect(env.AGENT_TOOL_RESOURCE_MAX_BYTES).toBe(200 * 1024 * 1024);
     expect(env.AGENT_TOOL_RESOURCE_DOWNLOAD_TIMEOUT_MS).toBe(60000);
@@ -35,12 +34,12 @@ describe("loadEnv", () => {
     expect("VOLCENGINE_VIDEO_REQ_KEY" in env).toBe(false);
   });
 
-  it("解析本地 agent 事件日志路径", () => {
+  it("忽略旧的本地 agent 事件日志路径配置", () => {
     const env = loadEnv({
       AGENT_EVENT_LOG_PATH: "./tmp/agent-events.jsonl"
     });
 
-    expect(env.AGENT_EVENT_LOG_PATH).toBe("./tmp/agent-events.jsonl");
+    expect("AGENT_EVENT_LOG_PATH" in env).toBe(false);
   });
 
   it("解析 Redis 连接和 key 配置", () => {

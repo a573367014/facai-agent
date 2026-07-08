@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: agent-runtime
+    orgId: 1
+    folder: Agent
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    options:
+      path: /otel-lgtm/grafana/conf/provisioning/dashboards/agent-runtime.json

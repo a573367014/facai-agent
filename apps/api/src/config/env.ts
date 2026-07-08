@@ -43,7 +43,6 @@ const envSchema = z.object({
   AGENT_SUMMARY_KEEP_RECENT_MESSAGES: z.coerce.number().int().min(1).max(50).default(8),
   AGENT_SUMMARY_TRIGGER_CHARS: z.coerce.number().int().min(0).max(200_000).default(2000),
   AGENT_TOOL_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
-  AGENT_EVENT_LOG_PATH: z.string().default("./data/agent-events.jsonl"),
   AGENT_PUBLIC_BASE_URL: z.string().url().optional(),
   AGENT_TOOL_RESOURCE_MAX_BYTES: z.coerce.number().int().positive().default(200 * 1024 * 1024),
   AGENT_TOOL_RESOURCE_DOWNLOAD_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
@@ -63,7 +62,17 @@ const envSchema = z.object({
   VOLCENGINE_ACCESS_KEY_ID: z.string().optional(),
   VOLCENGINE_SECRET_ACCESS_KEY: z.string().optional(),
   AGENT_UPLOAD_DIR: z.string().default("./data/uploads"),
-  DATABASE_URL: z.string().url().default("postgres://postgres:postgres@localhost:5432/agent")
+  DATABASE_URL: z.string().url().default("postgres://postgres:postgres@localhost:5432/agent"),
+  // S3 兼容对象存储（MinIO / Cloudflare R2 / AWS S3）。
+  // 开发用本地 MinIO，生产把 endpoint 换成 R2 即可，代码不用动。
+  S3_ENDPOINT: envUrlWithDefault("http://localhost:9000"),
+  S3_REGION: envStringWithDefault("us-east-1"),
+  S3_BUCKET: envStringWithDefault("agent-uploads"),
+  S3_ACCESS_KEY_ID: envStringWithDefault("minioadmin"),
+  S3_SECRET_ACCESS_KEY: envStringWithDefault("minioadmin"),
+  // 访问图片用的公开 base URL。MinIO 默认就是 endpoint 本身；
+  // R2 需要填绑定的公开域名。留空则自动用 S3_ENDPOINT。
+  S3_PUBLIC_BASE_URL: optionalEnvUrl
 });
 
 export type Env = z.infer<typeof envSchema>;

@@ -1,8 +1,8 @@
 import type { OutgoingHttpHeaders } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
-import type { FastifyInstance, FastifyRequest } from "fastify";
+import { basename } from "node:path";
+import { PutObjectCommand } from "@aws-sdk/client-s3";
+import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { AgentMessageCoordinator } from "../agent/agent-message-coordinator.js";
 import type { StoredAgentEvent } from "../agent/agent-store.js";
@@ -14,6 +14,7 @@ import {
 } from "../agent/message-parts.js";
 import { AppError } from "../errors/app-error.js";
 import { getRequestTraceContext } from "../observability/trace-context.js";
+import { getS3Bucket, getS3Client, getS3ObjectUrl } from "../storage/s3-client.js";
 
 const partExtraSchema = z.record(z.unknown());
 const textPartSchema = z
@@ -224,23 +225,9 @@ function getImageExtension(mime: string, fileName: string) {
   return extension ? extension.toLowerCase() : ".img";
 }
 
-function isFileExistsError(error: unknown) {
-  return (
-    error instanceof Error &&
-    "code" in error &&
-    (error as NodeJS.ErrnoException).code === "EEXIST"
-  );
-}
-
-function getRequestOrigin(request: FastifyRequest) {
-  const host = typeof request.headers.host === "string" ? request.headers.host : "localhost";
-  return `http://${host}`;
-}
-
 export async function registerAgentRoutes(
   app: FastifyInstance,
-  coordinator: AgentMessageCoordinator,
-  options: { uploadDirectory: string }
+  coordinator: AgentMessageCoordinator
 ): Promise<void> {
   app.post("/agents/sessions", async (request, reply) => {
     const { title } = parseSessionRequest(request.body);
@@ -294,22 +281,23 @@ export async function registerAgentRoutes(
     const extension = getImageExtension(file.mimetype, file.filename);
     const contentHash = createHash("md5").update(buffer).digest("hex");
     const storedFileName = `${contentHash}${extension}`;
-    const relativePath = `images/${storedFileName}`;
+    const s3Key = `images/${storedFileName}`;
 
-    await mkdir(join(options.uploadDirectory, "images"), { recursive: true });
-    try {
-      await writeFile(join(options.uploadDirectory, relativePath), buffer, { flag: "wx" });
-    } catch (error) {
-      if (!isFileExistsError(error)) {
-        throw error;
-      }
-    }
+    // S3 putObject 对相同 key 是幂等覆盖，不需要本地文件系统的 "wx" 去重逻辑。
+    await getS3Client().send(
+      new PutObjectCommand({
+        Bucket: getS3Bucket(),
+        Key: s3Key,
+        Body: buffer,
+        ContentType: file.mimetype
+      })
+    );
 
     reply.status(201).send({
       file: {
         type: "media",
         mime: file.mimetype,
-        url: `${getRequestOrigin(request)}/uploads/${relativePath}`,
+        url: getS3ObjectUrl(s3Key),
         name: basename(file.filename),
         size: buffer.length
       }

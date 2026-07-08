@@ -1,10 +1,12 @@
 import { spawnSync } from "node:child_process";
-import { resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseEnvFile } from "./ensure-redis.mjs";
 
 const lgtmContainerName = "agent-lgtm-1";
 const otlpPort = 4318;
-const grafanaPort = 3000;
+const defaultGrafanaPort = 3001;
 
 const dockerExtraPaths = [
   "/Applications/Docker.app/Contents/Resources/bin",
@@ -14,6 +16,26 @@ const dockerExtraPaths = [
 function dockerEnv() {
   const path = [process.env.PATH, ...dockerExtraPaths].filter(Boolean).join(":");
   return { ...process.env, PATH: path };
+}
+
+function readLocalEnvFile(cwd) {
+  try {
+    return readFileSync(join(cwd, ".env"), "utf8");
+  } catch {
+    return "";
+  }
+}
+
+export function resolveGrafanaPort({ cwd = process.cwd(), env = process.env, envFile } = {}) {
+  const fileEnv = parseEnvFile(envFile ?? readLocalEnvFile(cwd));
+  const rawPort = env.GRAFANA_PORT ?? fileEnv.GRAFANA_PORT;
+  const parsedPort = Number(rawPort ?? defaultGrafanaPort);
+
+  if (Number.isInteger(parsedPort) && parsedPort > 0) {
+    return parsedPort;
+  }
+
+  return defaultGrafanaPort;
 }
 
 function findDocker() {
@@ -46,7 +68,7 @@ function startLgtm(cwd) {
   }
 }
 
-async function waitForGrafana() {
+async function waitForGrafana(grafanaPort) {
   for (let attempt = 0; attempt < 60; attempt += 1) {
     const result = spawnSync("curl", ["-s", "-o", "/dev/null", "-w", "%{http_code}", `http://localhost:${grafanaPort}/api/health`], {
       encoding: "utf8",
@@ -64,6 +86,7 @@ async function waitForGrafana() {
 }
 
 export async function ensureObservability({ cwd = process.cwd() } = {}) {
+  const grafanaPort = resolveGrafanaPort({ cwd });
   const docker = findDocker();
 
   if (!docker) {
@@ -79,7 +102,7 @@ export async function ensureObservability({ cwd = process.cwd() } = {}) {
   console.log("[observability] 正在启动 grafana/otel-lgtm...");
   startLgtm(resolve(cwd));
 
-  if (!(await waitForGrafana())) {
+  if (!(await waitForGrafana(grafanaPort))) {
     console.warn(`[observability] lgtm 容器已启动，但 Grafana 端口 ${grafanaPort} 未就绪，可能需要等待。`);
     return;
   }

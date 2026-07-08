@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -189,33 +189,30 @@ function parseSseEvents(body: string) {
 }
 
 describe("agent routes", () => {
-  it("执行 run 会把 agent 过程事件写入本地 JSONL 日志", async () => {
+  it("执行 run 不再写入本地 JSONL 日志", async () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-event-log-"));
     tempDirs.push(dir);
     const eventLogPath = join(dir, "agent-events.jsonl");
-    const app = await buildTestApp({
-      agentService: createTestAgentService(),
-      agentEventLogPath: eventLogPath
-    });
-    const createResponse = await app.inject({
-      method: "POST",
-      url: "/agents/runs",
-      payload: { input: "你好" }
-    });
-    const { run } = createResponse.json() as { run: { id: string } };
+    const originalLogPath = process.env.AGENT_EVENT_LOG_PATH;
+    process.env.AGENT_EVENT_LOG_PATH = eventLogPath;
 
-    await executeNextQueuedRun(app);
+    try {
+      const app = await buildTestApp({ agentService: createTestAgentService() });
+      await app.inject({
+        method: "POST",
+        url: "/agents/runs",
+        payload: { input: "你好" }
+      });
+      await executeNextQueuedRun(app);
+    } finally {
+      if (originalLogPath === undefined) {
+        delete process.env.AGENT_EVENT_LOG_PATH;
+      } else {
+        process.env.AGENT_EVENT_LOG_PATH = originalLogPath;
+      }
+    }
 
-    expect(existsSync(eventLogPath)).toBe(true);
-    const logLines = readFileSync(eventLogPath, "utf8")
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as { kind: string; eventType: string; runId: string });
-
-    expect(logLines.map((line) => line.eventType)).toEqual(
-      expect.arrayContaining(["session.message.created", "final_answer", "session.message.updated", "run_completed"])
-    );
-    expect(logLines.every((line) => line.kind === "agent_event" && line.runId === run.id)).toBe(true);
+    expect(existsSync(eventLogPath)).toBe(false);
   });
 
   it("GET /health 返回 ok", async () => {
@@ -255,13 +252,12 @@ describe("agent routes", () => {
       name: "hello.png",
       size: 8
     });
-    expect(payload.file.url).toMatch(/^http:\/\/127\.0\.0\.1:4001\/uploads\/images\/.+\.png$/);
+    expect(payload.file.url).toMatch(/^http:\/\/localhost:9000\/agent-uploads\/images\/.+\.png$/);
 
-    const uploadedPath = new URL(payload.file.url).pathname;
-    const fileResponse = await app.inject({ method: "GET", url: uploadedPath });
+    const fileResponse = await fetch(payload.file.url);
 
-    expect(fileResponse.statusCode).toBe(200);
-    expect(fileResponse.headers["content-type"]).toContain("image/png");
+    expect(fileResponse.status).toBe(200);
+    expect(fileResponse.headers.get("content-type")).toContain("image/png");
   });
 
   it("POST /agents/uploads/images 相同图片内容复用同一个存储文件", async () => {
@@ -296,11 +292,10 @@ describe("agent routes", () => {
     const second = await upload("second.png");
     const expectedFileName = `${createHash("md5").update(imageContent).digest("hex")}.png`;
 
-    expect(first.file.url).toBe(`http://127.0.0.1:4001/uploads/images/${expectedFileName}`);
+    expect(first.file.url).toBe(`http://localhost:9000/agent-uploads/images/${expectedFileName}`);
     expect(second.file.url).toBe(first.file.url);
     expect(first.file.name).toBe("first.png");
     expect(second.file.name).toBe("second.png");
-    expect(readdirSync(join(uploadDirectory, "images"))).toEqual([expectedFileName]);
   });
 
   it("POST /agents/uploads/images 拒绝非图片文件", async () => {

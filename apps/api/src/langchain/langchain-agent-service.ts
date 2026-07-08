@@ -20,6 +20,12 @@ import type {
 } from "../agent/types.js";
 import { SYSTEM_INSTRUCTIONS } from "../agent/instructions.js";
 import { AppError, type AppErrorCode } from "../errors/app-error.js";
+import {
+  getAgentObservability,
+  toObservationErrorCode,
+  type AgentObservability,
+  type AgentLlmCallObservation
+} from "../observability/agent-observability.js";
 import type { ToolExecutor } from "../tools/executor.js";
 import { ToolAccessPolicy } from "../tools/access-policy.js";
 import type { ToolRegistry } from "../tools/registry.js";
@@ -96,13 +102,16 @@ export interface LangChainAgentServiceOptions {
   toolExecutor: ToolExecutor;
   toolAccessPolicy?: ToolAccessPolicy;
   defaultMaxIterations: number;
+  observability?: AgentObservability;
 }
 
 export class LangChainAgentService {
   private readonly toolAccessPolicy: ToolAccessPolicy;
+  private readonly observability: AgentObservability;
 
   constructor(private readonly options: LangChainAgentServiceOptions) {
     this.toolAccessPolicy = options.toolAccessPolicy ?? ToolAccessPolicy.allowAll();
+    this.observability = options.observability ?? getAgentObservability();
   }
 
   async run(input: AgentExecutionInput): Promise<AgentExecutionResult> {
@@ -184,27 +193,30 @@ export class LangChainAgentService {
         const messages = isFinalIteration
           ? [...state.messages, new SystemMessage({ content: MAX_ITERATIONS_REACHED_PROMPT })]
           : state.messages;
-        const stream = await activeModel.stream(messages, { signal });
         const contentParts: string[] = [];
         const toolCallMap = new Map<number, { id?: string; name?: string; args: string }>();
 
-        for await (const chunk of stream) {
-          const text = extractTextContent(chunk.content);
-          if (text) {
-            contentParts.push(text);
-            await emit({ type: "answer_delta", iteration, delta: text });
-          }
+        await self.observeLlmCall(input, iteration, isFinalIteration ? "final" : "tool_bound", async () => {
+          const stream = await activeModel.stream(messages, { signal });
 
-          const rawChunks = (chunk as { tool_call_chunks?: Array<{ index?: number; id?: string; name?: string; args?: string }> }).tool_call_chunks;
-          for (const tcChunk of rawChunks ?? []) {
-            const idx = tcChunk.index ?? 0;
-            const existing = toolCallMap.get(idx) ?? { id: undefined, name: undefined, args: "" };
-            if (tcChunk.id) existing.id = tcChunk.id;
-            if (tcChunk.name) existing.name = tcChunk.name;
-            existing.args += tcChunk.args ?? "";
-            toolCallMap.set(idx, existing);
+          for await (const chunk of stream) {
+            const text = extractTextContent(chunk.content);
+            if (text) {
+              contentParts.push(text);
+              await emit({ type: "answer_delta", iteration, delta: text });
+            }
+
+            const rawChunks = (chunk as { tool_call_chunks?: Array<{ index?: number; id?: string; name?: string; args?: string }> }).tool_call_chunks;
+            for (const tcChunk of rawChunks ?? []) {
+              const idx = tcChunk.index ?? 0;
+              const existing = toolCallMap.get(idx) ?? { id: undefined, name: undefined, args: "" };
+              if (tcChunk.id) existing.id = tcChunk.id;
+              if (tcChunk.name) existing.name = tcChunk.name;
+              existing.args += tcChunk.args ?? "";
+              toolCallMap.set(idx, existing);
+            }
           }
-        }
+        });
 
         const content = contentParts.join("") || undefined;
         const toolCalls = [...toolCallMap.values()].map((tc) => {
@@ -384,16 +396,19 @@ export class LangChainAgentService {
       await emit({ type: "agent_state", iteration, state: "thinking", label: "生成媒体总结" });
       await emit({ type: "llm_start", iteration });
 
-      const stream = await summaryModel.stream(messagesWithInstruction, { signal });
       const contentParts: string[] = [];
 
-      for await (const chunk of stream) {
-        const text = extractTextContent(chunk.content);
-        if (text) {
-          contentParts.push(text);
-          await emit({ type: "answer_delta", iteration, delta: text });
+      await self.observeLlmCall(input, iteration, "summary", async () => {
+        const stream = await summaryModel.stream(messagesWithInstruction, { signal });
+
+        for await (const chunk of stream) {
+          const text = extractTextContent(chunk.content);
+          if (text) {
+            contentParts.push(text);
+            await emit({ type: "answer_delta", iteration, delta: text });
+          }
         }
-      }
+      });
 
       const content = contentParts.join("") || "";
       await emit({ type: "llm_response", iteration, content });
@@ -449,6 +464,47 @@ export class LangChainAgentService {
     }
 
     return { answer };
+  }
+
+  private async observeLlmCall<T>(
+    input: AgentExecutionInput,
+    iteration: number,
+    mode: AgentLlmCallObservation["mode"],
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const startedAt = Date.now();
+    let status: AgentLlmCallObservation["status"] = "succeeded";
+    let errorCode: string | undefined;
+
+    try {
+      return await operation();
+    } catch (error) {
+      status = "failed";
+      errorCode = toObservationErrorCode(error, "PROVIDER_ERROR");
+      throw error;
+    } finally {
+      this.observability.recordLlmCall({
+        sessionId: input.sessionId,
+        messageId: input.messageId,
+        iteration,
+        provider: "openai-compatible",
+        model: this.getModelName(),
+        mode,
+        status,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        errorCode
+      });
+    }
+  }
+
+  private getModelName(): string {
+    const model = this.options.model as {
+      model?: unknown;
+      modelName?: unknown;
+      lc_kwargs?: { model?: unknown; modelName?: unknown };
+    };
+    const candidate = model.model ?? model.modelName ?? model.lc_kwargs?.model ?? model.lc_kwargs?.modelName;
+    return typeof candidate === "string" && candidate.trim() ? candidate : "unknown";
   }
 }
 

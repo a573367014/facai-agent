@@ -1,5 +1,9 @@
 import { AppError } from "../errors/app-error.js";
 import { type TraceContextCarrier } from "../observability/trace-context.js";
+import {
+  getAgentObservability,
+  type AgentObservability
+} from "../observability/agent-observability.js";
 import type { AgentSummaryService } from "./agent-summary-service.js";
 import {
   createTextPart,
@@ -64,6 +68,7 @@ export interface AgentMessageCoordinatorOptions {
   cancellationStore?: AgentCancellationStore;
   runLock?: AgentRunLock;
   agentEventLogger?: AgentEventLogger;
+  observability?: AgentObservability;
 }
 
 function toErrorDetail(error: unknown): AgentErrorDetail {
@@ -98,6 +103,7 @@ export class AgentMessageCoordinator {
   private readonly processStepProjector: AgentProcessStepProjector;
   private readonly mediaOutputProjector: AgentMediaOutputProjector;
   private readonly cleanupService: AgentRunCleanupService;
+  private readonly observability: AgentObservability;
 
   constructor(
     private readonly agentService: AgentRunner,
@@ -110,6 +116,7 @@ export class AgentMessageCoordinator {
   ) {
     // coordinator 保留“主流程编排”：建 run、排队、取消、最终落库。
     // 运行中草稿、进度步骤、媒体资源、重启清理分别交给小类，避免这个文件重新膨胀。
+    this.observability = options.observability ?? getAgentObservability();
     this.draftManager = new AgentRunningDraftManager(this.store, this.runningStateStore);
     this.processStepProjector = new AgentProcessStepProjector(this.store, (messageId, event, runId) => {
       return this.appendEvent(messageId, event, runId);
@@ -591,6 +598,7 @@ export class AgentMessageCoordinator {
     input: AgentExecutionInput,
     options: { history?: AgentMessage[]; skipSummaryRefresh?: boolean; assistantMessageId?: string } = {}
   ) {
+    const startedAt = Date.now();
     // executeRun 是真正的执行循环：Worker 会走这里，regenerate 的本地执行也走这里。
     // 这里的设计重点是把高频运行态和最终数据分开：
     // - answer_delta / running parts 写 runningStateStore，通常是 Redis；
@@ -737,6 +745,18 @@ export class AgentMessageCoordinator {
         completedAt: now()
       });
     } finally {
+      const finalRun = await this.store.getRun(runId);
+      if (finalRun) {
+        this.observability.recordRun({
+          runId,
+          sessionId: finalRun.sessionId,
+          messageId: assistantMessage?.id ?? finalRun.assistantMessageId ?? finalRun.systemMessageId,
+          status: finalRun.status === "running" ? "skipped" : finalRun.status,
+          phase: finalRun.phase,
+          durationMs: Math.max(0, Date.now() - startedAt),
+          errorCode: finalRun.error?.code
+        });
+      }
       this.runningRuns.delete(runId);
       if (assistantMessage) {
         // 不论成功、失败还是被取消，run 结束后都清理 draft；最终可恢复状态应来自 SQLite。
@@ -943,7 +963,7 @@ export class AgentMessageCoordinator {
   }
 
   private async appendRunEvent(runId: string, event: AgentStreamEvent, messageId?: string): Promise<StoredAgentEvent | undefined> {
-    // 事件不再写 SQLite：当前连接通过 store/Redis live fanout 接收，历史排查写本地 JSONL 日志。
+    // 事件不再写 SQLite：当前连接通过 store/Redis live fanout 接收，历史排查走 OTel logs/Loki。
     const storedEvent = await this.store.appendRunEvent(runId, event, messageId);
 
     if (storedEvent) {
@@ -974,7 +994,7 @@ export class AgentMessageCoordinator {
 
   private publishStoredEvent(event: StoredAgentEvent) {
     if (event.runId) {
-      // Pub/Sub 是实时推送通道；断线恢复靠 message snapshot，排查靠本地 JSONL 日志。
+      // Pub/Sub 是实时推送通道；断线恢复靠 message snapshot，排查靠 OTel logs/Loki。
       // Redis 短暂不可用时不能让这个 best-effort 发布变成未处理 Promise rejection。
       void this.options.eventBus?.publishRunEvent(event.runId, event).catch(() => {});
     }

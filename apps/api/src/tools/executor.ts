@@ -1,6 +1,11 @@
 import { ZodError } from "zod";
 import { trace, SpanStatusCode } from "@opentelemetry/api";
 import { AppError } from "../errors/app-error.js";
+import {
+  getAgentObservability,
+  toObservationErrorCode,
+  type AgentObservability
+} from "../observability/agent-observability.js";
 import { ToolAccessPolicy } from "./access-policy.js";
 import type { ToolRegistry } from "./registry.js";
 import type { JsonObject, ToolExecutionInput, ToolExecutionResult, ToolOutput } from "./types.js";
@@ -11,6 +16,7 @@ export interface ToolExecutorOptions {
   registry: ToolRegistry;
   timeoutMs: number;
   accessPolicy?: ToolAccessPolicy;
+  observability?: AgentObservability;
 }
 
 type TimedExecutionResult =
@@ -28,12 +34,15 @@ interface NormalizedToolOutput {
 // 以后要加权限、审计、重试、取消，都优先放在这一层，而不是塞回 AgentService。
 export class ToolExecutor {
   private readonly accessPolicy: ToolAccessPolicy;
+  private readonly observability: AgentObservability;
 
   constructor(private readonly options: ToolExecutorOptions) {
     this.accessPolicy = options.accessPolicy ?? ToolAccessPolicy.allowAll();
+    this.observability = options.observability ?? getAgentObservability();
   }
 
   async execute(input: ToolExecutionInput): Promise<ToolExecutionResult> {
+    const startedAt = Date.now();
     return tracer.startActiveSpan(`tool.${input.toolName}`, async (span) => {
       span.setAttributes({
         "tool.name": input.toolName,
@@ -44,6 +53,15 @@ export class ToolExecutor {
 
       try {
         const result = await this.doExecute(input);
+        this.observability.recordToolCall({
+          sessionId: input.sessionId,
+          messageId: input.messageId,
+          toolCallId: input.toolCallId,
+          toolName: input.toolName,
+          status: result.ok ? "succeeded" : "failed",
+          durationMs: result.durationMs,
+          errorCode: result.ok ? undefined : result.error.code
+        });
         span.setAttributes({
           "tool.success": result.ok,
           "tool.duration_ms": result.durationMs
@@ -54,6 +72,15 @@ export class ToolExecutor {
         }
         return result;
       } catch (error) {
+        this.observability.recordToolCall({
+          sessionId: input.sessionId,
+          messageId: input.messageId,
+          toolCallId: input.toolCallId,
+          toolName: input.toolName,
+          status: "failed",
+          durationMs: this.durationSince(startedAt),
+          errorCode: toObservationErrorCode(error, "TOOL_EXECUTION_ERROR")
+        });
         span.recordException(error as Error);
         span.setStatus({ code: SpanStatusCode.ERROR, message: (error as Error).message });
         throw error;
