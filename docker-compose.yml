@@ -35,20 +35,21 @@ services:
 
   # OpenTelemetry 一站式后端：grafana/otel-lgtm
   # 内含 OTel Collector + Prometheus + Tempo + Loki + Pyroscope + Grafana
-  # Grafana UI: http://localhost:3000 （账号 admin / admin）
+  # Grafana UI: http://localhost:${GRAFANA_PORT:-3001} （账号 admin / admin）
   # OTLP HTTP: http://localhost:4318
   lgtm:
     image: grafana/otel-lgtm:latest
     ports:
-      - "3000:3000"
+      - "${GRAFANA_PORT:-3001}:3000"
       - "4317:4317"
       - "4318:4318"
     volumes:
       - lgtm-data:/data
+      - ./observability/grafana/provisioning/dashboards/agent-runtime.yml:/otel-lgtm/grafana/conf/provisioning/dashboards/agent-runtime.yml:ro
+      - ./observability/grafana/dashboards/agent-runtime.json:/otel-lgtm/grafana/conf/provisioning/dashboards/agent-runtime.json:ro
 
 volumes:
   redis-data:
   postgres-data:
   lgtm-data:
   minio-data:
-

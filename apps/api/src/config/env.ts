@@ -43,7 +43,6 @@ const envSchema = z.object({
   AGENT_SUMMARY_KEEP_RECENT_MESSAGES: z.coerce.number().int().min(1).max(50).default(8),
   AGENT_SUMMARY_TRIGGER_CHARS: z.coerce.number().int().min(0).max(200_000).default(2000),
   AGENT_TOOL_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
-  AGENT_EVENT_LOG_PATH: z.string().default("./data/agent-events.jsonl"),
   AGENT_PUBLIC_BASE_URL: z.string().url().optional(),
   AGENT_TOOL_RESOURCE_MAX_BYTES: z.coerce.number().int().positive().default(200 * 1024 * 1024),
   AGENT_TOOL_RESOURCE_DOWNLOAD_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),

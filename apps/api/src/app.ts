@@ -5,7 +5,7 @@ import { Queue } from "bullmq";
 import Fastify from "fastify";
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
-import { JsonlAgentEventLogger, type AgentEventLogger } from "./agent/agent-event-logger.js";
+import { OtelAgentEventLogger, type AgentEventLogger } from "./agent/agent-event-logger.js";
 import { AgentMessageCoordinator, type AgentRunner } from "./agent/agent-message-coordinator.js";
 import { RedisAgentCancellationStore, type AgentCancellationStore } from "./agent/agent-cancellation-store.js";
 import { RedisAgentEventBus, type AgentEventBus } from "./agent/agent-event-bus.js";
@@ -53,7 +53,6 @@ export interface BuildAppOptions {
   agentService?: AgentRunner;
   coordinator?: AgentMessageCoordinator;
   databasePath?: string;
-  agentEventLogPath?: string;
   agentEventLogger?: AgentEventLogger;
   runningStateStore?: RunningMessageStateStore;
   eventBus?: AgentEventBus;
@@ -257,9 +256,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
         defaultMaxIterations: env.AGENT_MAX_ITERATIONS
       });
 
-    const agentEventLogger =
-      options.agentEventLogger ??
-      new JsonlAgentEventLogger(resolve(options.agentEventLogPath ?? env.AGENT_EVENT_LOG_PATH));
+    const agentEventLogger = options.agentEventLogger ?? new OtelAgentEventLogger();
     let redisRuntime: RedisRuntime | undefined;
     let runQueueClient: { close(): Promise<void> } | undefined;
     let knowledgeQueueClient: { close(): Promise<void> } | undefined;
