@@ -48,6 +48,7 @@ import { AgentProcessStepProjector } from "./agent-process-step-projector.js";
 import { AgentResourceOutputProjector } from "./agent-resource-output-projector.js";
 import {
   isResourceOutputToolName,
+  sanitizeToolResultEventForPublication,
   summarizeToolResult
 } from "./agent-message-projection-utils.js";
 import { AgentRunCleanupService, type StaleRunningCleanupResult } from "./agent-run-cleanup-service.js";
@@ -900,8 +901,9 @@ export class AgentMessageCoordinator {
       }
     }
 
-    await this.processStepProjector.project(messageId, event, runId);
-    await this.appendEvent(messageId, event, runId);
+    const eventForPublication = sanitizeToolResultEventForPublication(event);
+    await this.processStepProjector.project(messageId, eventForPublication, runId);
+    await this.appendEvent(messageId, eventForPublication, runId);
   }
 
   private async ensureToolCallRecord(

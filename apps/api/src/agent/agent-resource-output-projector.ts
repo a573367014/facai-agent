@@ -1,4 +1,5 @@
-import { Buffer } from "node:buffer";
+import { createReadStream } from "node:fs";
+import { stat, unlink } from "node:fs/promises";
 import { AppError } from "../errors/app-error.js";
 import type { AgentErrorDetail, AgentStreamEvent } from "./types.js";
 import type {
@@ -629,18 +630,17 @@ export class AgentResourceOutputProjector {
     }
 
     for (const asset of assets) {
-      const bytes = Buffer.from(asset.contentBase64, "base64");
       const metadata = buildDocumentMetadata({
         title: toOptionalString(asset.metadata.title) ?? requestedTitle,
         fileName: asset.name,
         format: toOptionalString(asset.metadata.format) ?? requestedFormat,
         outputIndex: asset.index,
         provider: asset.metadata.provider,
-        size: asset.size ?? bytes.length
+        size: asset.size
       });
       const storedAsset = await this.storeGeneratedToolResource(messageId, runId, {
         type: "document",
-        bytes,
+        source: asset.source,
         mime: asset.mime,
         fileName: asset.name,
         toolName: event.toolName,
@@ -664,7 +664,7 @@ export class AgentResourceOutputProjector {
         format: toOptionalString(asset.metadata.format) ?? requestedFormat,
         outputIndex: asset.index,
         provider: asset.metadata.provider,
-        size: storedAsset.size ?? asset.size ?? bytes.length
+        size: storedAsset.size ?? asset.size
       });
       const resource = await this.upsertResource(messageId, {
         type: "document",
@@ -769,7 +769,10 @@ export class AgentResourceOutputProjector {
     runId: string | undefined,
     input: {
       type: ToolResourceType;
-      bytes: Buffer;
+      source: {
+        type: "local_file";
+        path: string;
+      };
       mime?: string;
       fileName?: string;
       toolName: string;
@@ -784,12 +787,15 @@ export class AgentResourceOutputProjector {
     }
   ): Promise<StoredToolResource | undefined> {
     try {
-      if (!this.resourceStorage.storeGeneratedResource) {
-        throw new AppError("TOOL_EXECUTION_ERROR", "当前资源存储不支持生成文件转储", 500);
+      if (!this.resourceStorage.storeGeneratedResourceStream) {
+        throw new AppError("TOOL_EXECUTION_ERROR", "当前资源存储不支持生成文件流式转储", 500);
       }
 
-      return await this.resourceStorage.storeGeneratedResource({
-        bytes: input.bytes,
+      const fileStats = await stat(input.source.path);
+
+      return await this.resourceStorage.storeGeneratedResourceStream({
+        stream: createReadStream(input.source.path),
+        size: fileStats.size,
         type: input.type,
         mime: input.mime,
         fileName: input.fileName
@@ -835,6 +841,8 @@ export class AgentResourceOutputProjector {
       }, runId);
 
       return undefined;
+    } finally {
+      await unlink(input.source.path).catch(() => undefined);
     }
   }
 

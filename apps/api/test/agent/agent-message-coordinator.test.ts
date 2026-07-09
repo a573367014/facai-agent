@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { Buffer } from "node:buffer";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { z } from "zod";
 import { AIMessage, HumanMessage, SystemMessage, ToolMessage, type BaseMessage } from "@langchain/core/messages";
 import type { ChatOpenAI } from "@langchain/openai";
@@ -19,6 +22,16 @@ import { ToolRegistry } from "../../src/tools/registry.js";
 import { createMockModel, type MockModel, type MockModelResponse } from "../helpers/mock-model.js";
 
 const TEST_DATABASE_URL = process.env.DATABASE_URL ?? "postgres://postgres:postgres@localhost:5432/agent_test";
+
+async function readStreamAsUtf8(stream: AsyncIterable<Buffer | Uint8Array | string>) {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  return Buffer.concat(chunks).toString("utf8");
+}
 
 async function waitForMessage(coordinator: AgentMessageCoordinator, messageId: string) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -1616,6 +1629,8 @@ describe("AgentMessageCoordinator", () => {
   });
 
   it("文档工具结果写入资源表，并让 assistant resource part 引用资源", async () => {
+    const outputDirectory = await mkdtemp(join(tmpdir(), "agent-document-output-"));
+    const outputPath = join(outputDirectory, "年度复盘.md");
     const registry = new ToolRegistry();
     registry.register({
       name: "generate_document",
@@ -1634,31 +1649,43 @@ describe("AgentMessageCoordinator", () => {
         fileName: z.string().optional(),
         content: z.string()
       }),
-      execute: ({ content }) => ({
-        data: {
-          provider: "agent_document",
-          status: "done",
-          documents: [
-            {
-              name: "年度复盘.md",
-              mime: "text/markdown",
-              contentBase64: Buffer.from(String(content), "utf8").toString("base64"),
-              size: Buffer.byteLength(String(content), "utf8")
-            }
-          ]
-        },
-        llmContent: "已生成文档：年度复盘.md"
-      })
+      execute: async ({ content }) => {
+        await writeFile(outputPath, String(content));
+
+        return {
+          data: {
+            provider: "agent_document",
+            status: "done",
+            documents: [
+              {
+                name: "年度复盘.md",
+                mime: "text/markdown",
+                source: {
+                  type: "local_file",
+                  path: outputPath
+                },
+                size: Buffer.byteLength(String(content), "utf8")
+              }
+            ]
+          },
+          llmContent: "已生成文档：年度复盘.md"
+        };
+      }
     });
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const storedGeneratedResources: unknown[] = [];
+    const loggedEvents: StoredAgentEvent[] = [];
     const resourceStorage = {
       storeRemoteResource: async () => {
         throw new Error("文档资源不应该走远端 URL 转储");
       },
-      storeGeneratedResource: async (input: unknown) => {
-        storedGeneratedResources.push(input);
+      storeGeneratedResourceStream: async (input: unknown) => {
+        const streamInput = input as { stream: AsyncIterable<Buffer | Uint8Array | string> };
+        storedGeneratedResources.push({
+          ...(input as Record<string, unknown>),
+          streamText: await readStreamAsUtf8(streamInput.stream)
+        });
         return {
           url: "http://127.0.0.1:4001/uploads/resources/documents/local-review.md",
           mime: "text/markdown",
@@ -1688,24 +1715,44 @@ describe("AgentMessageCoordinator", () => {
       undefined,
       undefined,
       undefined,
-      resourceStorage
+      resourceStorage,
+      {
+        agentEventLogger: {
+          log: (event) => {
+            loggedEvents.push(event);
+          }
+        }
+      }
     );
 
     try {
       const started = await startRunAndWait(coordinator, { input: "生成一份年度复盘 Markdown 文档" });
 
       await waitForMessage(coordinator, started.assistantMessage.id);
+      const runEvents = loggedEvents.map((event) => event.event);
+      const documentToolResult = runEvents.find(
+        (event) => event.type === "tool_result" && event.toolName === "generate_document"
+      );
+      const documentResult = documentToolResult?.type === "tool_result"
+        ? documentToolResult.result as { documents?: Array<{ source?: { path?: string; status?: string } }> }
+        : undefined;
       const session = await coordinator.getSession(started.session.id);
       const assistant = session.messages.find((message) => message.id === started.assistantMessage.id);
       const resourcePart = assistant?.parts.find((part) => part.type === "resource");
       const resourceId = resourcePart?.extra?.resource?.id;
 
+      expect(documentResult?.documents?.[0]?.source).toEqual({
+        type: "local_file",
+        status: "consumed"
+      });
+      expect(documentResult?.documents?.[0]?.source?.path).toBeUndefined();
       expect(storedGeneratedResources).toEqual([
         expect.objectContaining({
           type: "document",
           mime: "text/markdown",
           fileName: "年度复盘.md",
-          bytes: Buffer.from("# 年度复盘\n\n增长 20%", "utf8")
+          size: Buffer.byteLength("# 年度复盘\n\n增长 20%", "utf8"),
+          streamText: "# 年度复盘\n\n增长 20%"
         })
       ]);
       expect(resourceId).toMatch(/^res_/);
@@ -1737,6 +1784,7 @@ describe("AgentMessageCoordinator", () => {
         })
       ]);
     } finally {
+      await rm(outputDirectory, { recursive: true, force: true });
       await store.close();
     }
   });

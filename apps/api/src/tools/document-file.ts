@@ -1,5 +1,9 @@
 import { Buffer } from "node:buffer";
-import { extname } from "node:path";
+import { createWriteStream } from "node:fs";
+import { mkdtemp, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { extname, join } from "node:path";
+import { finished } from "node:stream/promises";
 import JSZip from "jszip";
 import { z } from "zod";
 import type { RegisteredTool, ToolOutput } from "./types.js";
@@ -11,7 +15,10 @@ type DocumentFormat = "txt" | "markdown" | "docx";
 interface GeneratedDocument {
   name: string;
   mime: string;
-  contentBase64: string;
+  source: {
+    type: "local_file";
+    path: string;
+  };
   size: number;
 }
 
@@ -82,16 +89,32 @@ async function generateDocument(input: {
   const mime = getDocumentMime(input.format);
   const extension = getDocumentExtension(input.format);
   const name = normalizeDocumentFileName(input.fileName ?? input.title ?? "document", extension);
-  const buffer = input.format === "docx"
-    ? await createDocxBuffer({ title: input.title, content: input.content })
-    : Buffer.from(input.content, "utf8");
+  const outputDirectory = await mkdtemp(join(tmpdir(), "agent-document-"));
+  const outputPath = join(outputDirectory, name);
+
+  if (input.format === "docx") {
+    await writeFile(outputPath, await createDocxBuffer({ title: input.title, content: input.content }));
+  } else {
+    await writeUtf8File(outputPath, input.content);
+  }
+
+  const fileStats = await stat(outputPath);
 
   return {
     name,
     mime,
-    contentBase64: buffer.toString("base64"),
-    size: buffer.length
+    source: {
+      type: "local_file",
+      path: outputPath
+    },
+    size: fileStats.size
   };
+}
+
+async function writeUtf8File(path: string, content: string): Promise<void> {
+  const stream = createWriteStream(path, { encoding: "utf8" });
+  stream.end(content);
+  await finished(stream);
 }
 
 function getDocumentMime(format: DocumentFormat): string {

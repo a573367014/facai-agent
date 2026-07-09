@@ -62,7 +62,10 @@ export interface DocumentRequestSlot {
 export interface ExtractedDocumentResult {
   name: string;
   mime: string;
-  contentBase64: string;
+  source: {
+    type: "local_file";
+    path: string;
+  };
   size?: number;
   index: number;
   metadata: JsonObject;
@@ -124,10 +127,44 @@ export function isResourceOutputToolName(toolName: string): boolean {
   return isImageOutputToolName(toolName) || isVideoOutputToolName(toolName) || isDocumentOutputToolName(toolName);
 }
 
+export function sanitizeToolResultEventForPublication(event: AgentStreamEvent): AgentStreamEvent {
+  if (event.type !== "tool_result" || !isDocumentOutputToolName(event.toolName) || !isRecord(event.result)) {
+    return event;
+  }
+
+  const documents = Array.isArray(event.result.documents)
+    ? event.result.documents.map((document) => sanitizeDocumentResultForPublication(document))
+    : event.result.documents;
+
+  return {
+    ...event,
+    result: {
+      ...event.result,
+      documents
+    }
+  };
+}
+
 export function isImageToolResultWithId(
   event: AgentStreamEvent
 ): event is Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: string; toolCallId: string } {
   return event.type === "tool_result" && isImageOutputToolName(event.toolName) && typeof event.toolCallId === "string";
+}
+
+function sanitizeDocumentResultForPublication(document: unknown): unknown {
+  if (!isRecord(document)) {
+    return document;
+  }
+
+  const { contentBase64, source, ...rest } = document;
+  const safeSource = isRecord(source) && toOptionalString(source.type) === "local_file"
+    ? { type: "local_file", status: "consumed" }
+    : source;
+
+  return compactJsonObject({
+    ...rest,
+    source: safeSource
+  });
 }
 
 export function isVideoToolResultWithId(
@@ -433,9 +470,11 @@ export function extractDocumentAssets(result: unknown, startIndex: number): Extr
   let nextIndex = startIndex;
 
   return documents.flatMap((document) => {
-    const contentBase64 = toOptionalString(document.contentBase64);
+    const source = isRecord(document.source) ? document.source : undefined;
+    const sourceType = toOptionalString(source?.type);
+    const sourcePath = toOptionalString(source?.path);
 
-    if (!contentBase64) {
+    if (sourceType !== "local_file" || !sourcePath) {
       return [];
     }
 
@@ -449,7 +488,10 @@ export function extractDocumentAssets(result: unknown, startIndex: number): Extr
       {
         name,
         mime,
-        contentBase64,
+        source: {
+          type: "local_file",
+          path: sourcePath
+        },
         size,
         index,
         metadata: compactJsonObject({

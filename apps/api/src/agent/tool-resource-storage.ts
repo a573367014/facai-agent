@@ -1,5 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { extname } from "node:path";
+import type { Readable } from "node:stream";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { trace, SpanStatusCode } from "@opentelemetry/api";
 import { AppError } from "../errors/app-error.js";
@@ -25,6 +26,14 @@ export interface StoreGeneratedToolResourceInput {
   fileName?: string;
 }
 
+export interface StoreGeneratedToolResourceStreamInput {
+  stream: Readable;
+  size: number;
+  type: ToolResourceType;
+  mime?: string;
+  fileName?: string;
+}
+
 export interface StoredToolResource {
   url: string;
   mime?: string;
@@ -36,6 +45,7 @@ export interface StoredToolResource {
 export interface ToolResourceStorage {
   storeRemoteResource(input: StoreRemoteToolResourceInput): Promise<StoredToolResource>;
   storeGeneratedResource?(input: StoreGeneratedToolResourceInput): Promise<StoredToolResource>;
+  storeGeneratedResourceStream?(input: StoreGeneratedToolResourceStreamInput): Promise<StoredToolResource>;
 }
 
 export class PassthroughToolResourceStorage implements ToolResourceStorage {
@@ -61,6 +71,16 @@ export class PassthroughToolResourceStorage implements ToolResourceStorage {
       size: buffer.length,
       relativePath: ""
     };
+  }
+
+  async storeGeneratedResourceStream(input: StoreGeneratedToolResourceStreamInput): Promise<StoredToolResource> {
+    const buffer = await readReadableStream(input.stream);
+    return this.storeGeneratedResource({
+      bytes: buffer,
+      type: input.type,
+      mime: input.mime,
+      fileName: input.fileName
+    });
   }
 }
 
@@ -252,6 +272,67 @@ export class S3ToolResourceStorage implements ToolResourceStorage {
     });
   }
 
+  async storeGeneratedResourceStream(input: StoreGeneratedToolResourceStreamInput): Promise<StoredToolResource> {
+    const startedAt = Date.now();
+    const mime = normalizeMime(input.mime) ?? getDefaultMime(input.type);
+    let bytes: number | undefined = input.size;
+
+    return tracer.startActiveSpan(`resource.store.${input.type}`, async (span) => {
+      span.setAttributes({
+        "resource.type": input.type,
+        "resource.mime": mime
+      });
+
+      try {
+        if (input.size > this.maxBytes) {
+          throw new AppError("VALIDATION_ERROR", `工具资源超过最大转储限制 ${this.maxBytes} 字节`, 413);
+        }
+
+        const extension = getExtension(mime, undefined, input.fileName);
+        const objectName = `${randomUUID()}${extension}`;
+        const s3Key = this.buildResourceKey(input.type, objectName);
+        const name = normalizeGeneratedFileName(input.fileName, extension);
+
+        await this.putStream(s3Key, input.stream, mime, input.size, name);
+
+        this.observability.recordResourceTransfer({
+          resourceType: input.type,
+          mime,
+          status: "succeeded",
+          durationMs: this.durationSince(startedAt),
+          bytes
+        });
+        span.setAttributes({
+          "resource.bytes": input.size,
+          "resource.duration_ms": this.durationSince(startedAt)
+        });
+
+        return {
+          url: this.getS3ObjectUrl(s3Key),
+          mime,
+          name,
+          size: input.size,
+          relativePath: s3Key
+        };
+      } catch (error) {
+        const errorCode = toObservationErrorCode(error, "TOOL_EXECUTION_ERROR");
+        this.observability.recordResourceTransfer({
+          resourceType: input.type,
+          mime,
+          status: "failed",
+          durationMs: this.durationSince(startedAt),
+          bytes,
+          errorCode
+        });
+        span.recordException(error as Error);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: error instanceof Error ? error.message : errorCode });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
+  }
+
   private parseHttpUrl(url: string): URL {
     let parsedUrl: URL;
 
@@ -292,6 +373,19 @@ export class S3ToolResourceStorage implements ToolResourceStorage {
         Key: s3Key,
         Body: buffer,
         ContentType: mime,
+        ContentDisposition: fileName ? buildContentDisposition(fileName) : undefined
+      })
+    );
+  }
+
+  private async putStream(s3Key: string, stream: Readable, mime: string, size: number, fileName?: string) {
+    await this.getS3Client().send(
+      new PutObjectCommand({
+        Bucket: this.getS3Bucket(),
+        Key: s3Key,
+        Body: stream,
+        ContentType: mime,
+        ContentLength: size,
         ContentDisposition: fileName ? buildContentDisposition(fileName) : undefined
       })
     );
@@ -386,6 +480,16 @@ function toBuffer(bytes: StoreGeneratedToolResourceInput["bytes"]): Buffer {
   }
 
   return Buffer.from(bytes);
+}
+
+async function readReadableStream(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  return Buffer.concat(chunks);
 }
 
 function normalizeGeneratedFileName(fileName: string | undefined, extension: string): string {
