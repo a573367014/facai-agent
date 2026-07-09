@@ -7,6 +7,13 @@ import App from "./App";
 
 const originalFetch = globalThis.fetch;
 const stylesPath = join(process.cwd(), "src/styles.css");
+const maxAttachmentBytes = 20 * 1024 * 1024;
+
+function createFileWithSize(name: string, type: string, size: number) {
+  const file = new File(["x"], name, { type });
+  Object.defineProperty(file, "size", { value: size });
+  return file;
+}
 
 function createSseResponse(events: string[]): Response {
   const encoder = new TextEncoder();
@@ -1052,6 +1059,29 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "发送" })).toHaveClass("MuiIconButton-root");
     expect(screen.queryByRole("button", { name: "运行" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "流式运行" })).not.toBeInTheDocument();
+  });
+
+  it("附件前端预检失败时用 toast 提示且不调用上传接口", async () => {
+    mockAppFetch((url) => {
+      if (url.endsWith("/agents/uploads/documents")) {
+        return jsonResponse({ error: { code: "VALIDATION_ERROR", message: "附件不能超过 20MB" } }, false);
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await userEvent.click(screen.getByRole("button", { name: "上传文档" }));
+    await userEvent.upload(
+      screen.getByLabelText("选择文档"),
+      createFileWithSize("large.md", "text/markdown", maxAttachmentBytes + 1)
+    );
+
+    await waitFor(() => {
+      expect(document.querySelector(".attachment-toast")).toHaveTextContent("附件不能超过 20MB");
+    });
+    expect(vi.mocked(globalThis.fetch).mock.calls.some(([url]) => String(url).endsWith("/agents/uploads/documents"))).toBe(false);
   });
 
   it("左下角展示 GitHub 登录状态并移除 API 健康状态", async () => {

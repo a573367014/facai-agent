@@ -1,6 +1,6 @@
-import { Box, Chip, IconButton, Paper, Typography } from "@mui/material";
+import { Alert, Box, Chip, IconButton, Paper, Snackbar, Typography } from "@mui/material";
 import { ChevronsLeft, ChevronsRight } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type SyntheticEvent } from "react";
 import {
   authSessionChangedEvent,
   cancelAgentRun,
@@ -19,6 +19,7 @@ import {
   readAuthSession,
   startAgentRun,
   streamAgentRunEvents,
+  uploadAgentDocument,
   uploadAgentImage,
   uploadKnowledgeDocument,
   type AgentMessagePageInfo,
@@ -631,6 +632,7 @@ export default function App() {
   const [messagePageInfo, setMessagePageInfo] = useState<AgentMessagePageInfo>(() => createDefaultMessagePageInfo());
   const [isLoadingOlderMessages, setIsLoadingOlderMessages] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [attachmentToastMessage, setAttachmentToastMessage] = useState<string | null>(null);
   const [knowledgeDocuments, setKnowledgeDocuments] = useState<KnowledgeDocumentRecord[]>([]);
   const [isKnowledgeLoading, setIsKnowledgeLoading] = useState(false);
   const [isKnowledgeUploading, setIsKnowledgeUploading] = useState(false);
@@ -652,6 +654,22 @@ export default function App() {
   const runningRunsBySessionRef = useRef<RunningRunsBySession>(readRunningRunsBySession());
   // 这些 ref 是为了给异步 SSE 回调读“最新状态”。
   // React state 在闭包里可能是旧值，ref.current 可以避免旧流把事件写进新的会话。
+
+  const closeAttachmentToast = useCallback(() => {
+    setAttachmentToastMessage(null);
+  }, []);
+
+  const handleAttachmentToastClose = useCallback((_event: SyntheticEvent | Event, reason?: string) => {
+    if (reason === "clickaway") {
+      return;
+    }
+
+    closeAttachmentToast();
+  }, [closeAttachmentToast]);
+
+  const handleAttachmentUploadNotice = useCallback((message: string | null) => {
+    setAttachmentToastMessage(message);
+  }, []);
 
   const loadKnowledgeDocuments = useCallback(async () => {
     if (!authSession) {
@@ -1695,6 +1713,8 @@ export default function App() {
             onPartsChange={setComposerParts}
             onSubmit={handleSubmitMessage}
             onCancel={handleCancelMessage}
+            onUploadDocument={uploadAgentDocument}
+            onUploadError={handleAttachmentUploadNotice}
             onUploadImage={uploadAgentImage}
           />
         </Box>
@@ -1726,6 +1746,17 @@ export default function App() {
           </Paper>
         </Box>
       </Box>
+      <Snackbar
+        className="attachment-toast"
+        open={Boolean(attachmentToastMessage)}
+        autoHideDuration={3600}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+        onClose={handleAttachmentToastClose}
+      >
+        <Alert className="attachment-toast-alert" severity="warning" variant="filled" onClose={closeAttachmentToast}>
+          {attachmentToastMessage}
+        </Alert>
+      </Snackbar>
     </Box>
   );
 }

@@ -27,7 +27,9 @@ export function partsToDoc(parts: RuntimePart[]): ProseMirrorNode {
         size: part.size ?? null,
         width: part.width ?? null,
         height: part.height ?? null,
-        extra: part.extra ?? null
+        extra: part.extra ?? null,
+        uploading: getRuntimeBoolean(part, "$uploading"),
+        uploadId: getRuntimeString(part, "$uploadId")
       })
     ];
   });
@@ -69,7 +71,9 @@ export function docToParts(doc: ProseMirrorNode): MessagePart[] {
         ...(typeof node.attrs.size === "number" ? { size: node.attrs.size } : {}),
         ...(typeof node.attrs.width === "number" ? { width: node.attrs.width } : {}),
         ...(typeof node.attrs.height === "number" ? { height: node.attrs.height } : {}),
-        ...(isPartExtra(node.attrs.extra) ? { extra: node.attrs.extra } : {})
+        ...(isPartExtra(node.attrs.extra) ? { extra: node.attrs.extra } : {}),
+        ...(node.attrs.uploading === true ? { $uploading: true } : {}),
+        ...(typeof node.attrs.uploadId === "string" ? { $uploadId: node.attrs.uploadId } : {})
       });
       return false;
     }
@@ -148,12 +152,24 @@ function resourceNodeToPart(node: ProseMirrorNode): MessagePart {
     ...(typeof node.attrs.size === "number" ? { size: node.attrs.size } : {}),
     ...(typeof node.attrs.width === "number" ? { width: node.attrs.width } : {}),
     ...(typeof node.attrs.height === "number" ? { height: node.attrs.height } : {}),
-    ...(isPartExtra(node.attrs.extra) ? { extra: node.attrs.extra } : {})
+    ...(isPartExtra(node.attrs.extra) ? { extra: node.attrs.extra } : {}),
+    ...(node.attrs.uploading === true ? { $uploading: true } : {}),
+    ...(typeof node.attrs.uploadId === "string" ? { $uploadId: node.attrs.uploadId } : {})
   };
 }
 
 function isPartExtra(value: unknown): value is NonNullable<MessagePart["extra"]> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function getRuntimeBoolean(part: RuntimePart, key: `$${string}`) {
+  const value = (part as Record<`$${string}`, unknown>)[key];
+  return value === true;
+}
+
+function getRuntimeString(part: RuntimePart, key: `$${string}`) {
+  const value = (part as Record<`$${string}`, unknown>)[key];
+  return typeof value === "string" ? value : null;
 }
 
 function textToInlineNodes(value: string): ProseMirrorNode[] {

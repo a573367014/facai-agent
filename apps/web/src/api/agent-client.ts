@@ -295,6 +295,10 @@ export interface UploadAgentImageResponse {
   file: ResourcePart;
 }
 
+export interface UploadAgentDocumentResponse {
+  file: ResourcePart;
+}
+
 export type KnowledgeDocumentStatus = "pending" | "indexing" | "ready" | "failed";
 
 export interface KnowledgeDocumentRecord {
@@ -752,6 +756,24 @@ export async function uploadAgentImage(file: File): Promise<ResourcePart> {
   }
 
   return (payload as UploadAgentImageResponse).file;
+}
+
+export async function uploadAgentDocument(file: File): Promise<ResourcePart> {
+  const body = new FormData();
+  body.append("document", file);
+
+  const response = await authenticatedFetch(`${apiBaseUrl}/agents/uploads/documents`, {
+    method: "POST",
+    body
+  });
+  const payload = (await response.json()) as UploadAgentDocumentResponse | ApiErrorResponse;
+
+  if (!response.ok) {
+    const errorPayload = payload as ApiErrorResponse;
+    throw new Error(`${errorPayload.error.code}: ${errorPayload.error.message}`);
+  }
+
+  return (payload as UploadAgentDocumentResponse).file;
 }
 
 export async function listKnowledgeDocuments(): Promise<KnowledgeDocumentRecord[]> {

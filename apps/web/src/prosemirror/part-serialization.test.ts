@@ -44,4 +44,30 @@ describe("part prosemirror serialization", () => {
       { type: "text", value: "你好" }
     ]);
   });
+
+  it("keeps uploading runtime fields inside editor and strips them before submit", () => {
+    const parts: RuntimePart[] = [
+      {
+        type: "resource",
+        mime: "text/markdown",
+        url: "",
+        name: "report.md",
+        size: 8,
+        $uploading: true,
+        $uploadId: "upload_1"
+      }
+    ];
+    const roundTripped = docToParts(partsToDoc(parts));
+
+    expect(roundTripped).toEqual(parts);
+    expect(stripRuntimeFields(roundTripped)).toEqual([
+      {
+        type: "resource",
+        mime: "text/markdown",
+        url: "",
+        name: "report.md",
+        size: 8
+      }
+    ]);
+  });
 });

@@ -24,8 +24,8 @@ export interface InlineAtomSelectionHighlightPluginOptions {
   domSelector?: string;
 }
 
-export interface ImageUploadEntryPluginOptions {
-  onImageFile: (view: EditorView, file: File) => void;
+export interface AttachmentUploadEntryPluginOptions {
+  onAttachmentFile: (view: EditorView, file: File) => void;
 }
 
 export interface DropCursorOptions {
@@ -357,41 +357,53 @@ export function createClearSelectionOnOutsidePointerPlugin() {
   });
 }
 
-export function createImageUploadEntryPlugin(options: ImageUploadEntryPluginOptions) {
+export function createAttachmentUploadEntryPlugin(options: AttachmentUploadEntryPluginOptions) {
   return new Plugin({
     props: {
       handleDOMEvents: {
         paste(view, event) {
-          // 粘贴/拖拽图片文件时直接进入上传流程；
+          // 粘贴/拖拽文件时直接进入上传流程；
           // 普通文本粘贴交给 createPlainTextPastePlugin 处理。
-          const image = getFirstImageFile((event as ClipboardEvent).clipboardData?.files);
+          const file = getFirstFile((event as ClipboardEvent).clipboardData?.files);
 
-          if (!image) {
+          if (!file) {
             return false;
           }
 
           event.preventDefault();
-          options.onImageFile(view, image);
+          options.onAttachmentFile(view, file);
           return true;
         },
         dragover(_view, event) {
-          if (!getFirstImageFile((event as DragEvent).dataTransfer?.files)) {
+          if (!hasDraggedFile((event as DragEvent).dataTransfer)) {
             return false;
           }
 
+          _view.dom.classList.add("is-attachment-dragover");
           event.preventDefault();
           return true;
         },
-        drop(view, event) {
-          const image = getFirstImageFile((event as DragEvent).dataTransfer?.files);
+        dragleave(view, event) {
+          const nextTarget = (event as DragEvent).relatedTarget;
 
-          if (!image) {
+          if (!view.dom.contains(nextTarget as Node | null)) {
+            view.dom.classList.remove("is-attachment-dragover");
+          }
+
+          return false;
+        },
+        drop(view, event) {
+          const file = getFirstFile((event as DragEvent).dataTransfer?.files);
+
+          view.dom.classList.remove("is-attachment-dragover");
+
+          if (!file) {
             return false;
           }
 
           event.preventDefault();
           syncSelectionToDropPoint(view, event as DragEvent);
-          options.onImageFile(view, image);
+          options.onAttachmentFile(view, file);
           return true;
         }
       }
@@ -563,8 +575,16 @@ function resolveAtomicDeleteRange(view: EditorView, key: "Backspace" | "Delete",
   };
 }
 
-function getFirstImageFile(files?: FileList | File[] | null) {
-  return Array.from(files ?? []).find((file) => file.type.startsWith("image/"));
+function getFirstFile(files?: FileList | File[] | null) {
+  return Array.from(files ?? [])[0];
+}
+
+function hasDraggedFile(dataTransfer?: DataTransfer | null) {
+  if (!dataTransfer) {
+    return false;
+  }
+
+  return Boolean(getFirstFile(dataTransfer.files)) || Array.from(dataTransfer.types ?? []).includes("Files");
 }
 
 function normalizePlainText(text: string) {

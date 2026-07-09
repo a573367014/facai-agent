@@ -53,6 +53,8 @@ import { endRequestSpan, getRequestSpan, getRequestTraceparent, startRequestSpan
 import { ToolAccessPolicy } from "./tools/access-policy.js";
 import { ToolExecutor } from "./tools/executor.js";
 import { createDefaultToolRegistry } from "./tools/index.js";
+import { MAX_ATTACHMENT_BYTES } from "./uploads/attachment-upload.js";
+import { LocalUploadInputResourceResolver } from "./agent/input-resource-resolver.js";
 
 export interface BuildAppOptions {
   agentService?: AgentRunner;
@@ -68,6 +70,7 @@ export interface BuildAppOptions {
   runLock?: AgentRunLock;
   toolResourceStorage?: ToolResourceStorage;
   uploadDirectory?: string;
+  uploadResponseDelayMs?: number;
   skipStaleCleanup?: boolean;
   skipAgentRuntime?: boolean;
   skipAuth?: boolean;
@@ -108,7 +111,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
     await app.register(multipart, {
       limits: {
         files: 1,
-        fileSize: 10 * 1024 * 1024
+        fileSize: MAX_ATTACHMENT_BYTES
       }
     });
 
@@ -401,7 +404,8 @@ export async function buildApp(options: BuildAppOptions = {}) {
         runQueue,
         cancellationStore,
         runLock,
-        agentEventLogger
+        agentEventLogger,
+        inputResourceResolver: new LocalUploadInputResourceResolver({ uploadDirectory })
       }
     );
     (app as typeof app & { agentCoordinator?: AgentMessageCoordinator }).agentCoordinator = coordinator;
@@ -433,7 +437,11 @@ export async function buildApp(options: BuildAppOptions = {}) {
 
   await registerHealthRoutes(app);
   if (coordinator) {
-    await registerAgentRoutes(app, coordinator);
+    await registerAgentRoutes(app, coordinator, {
+      uploadDirectory,
+      publicBaseUrl,
+      uploadResponseDelayMs: options.uploadResponseDelayMs ?? env.AGENT_UPLOAD_RESPONSE_DELAY_MS
+    });
   }
   if (knowledgeStore && knowledgeRetriever) {
     await registerKnowledgeRoutes(app, {

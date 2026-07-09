@@ -80,6 +80,14 @@ describe("loadEnv", () => {
     expect(env.AGENT_TOOL_RESOURCE_DOWNLOAD_TIMEOUT_MS).toBe(30000);
   });
 
+  it("解析上传响应延迟配置", () => {
+    const env = loadEnv({
+      AGENT_UPLOAD_RESPONSE_DELAY_MS: "1500"
+    });
+
+    expect(env.AGENT_UPLOAD_RESPONSE_DELAY_MS).toBe(1500);
+  });
+
   it("解析 GitHub 登录和 JWT 授权配置", () => {
     const env = loadEnv({
       GITHUB_OAUTH_CLIENT_ID: "github-client-id",

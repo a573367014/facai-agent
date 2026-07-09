@@ -1,6 +1,7 @@
 import type { OutgoingHttpHeaders } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
-import { basename } from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
+import { basename, extname, join } from "node:path";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 import type { FastifyInstance } from "fastify";
 import type { FastifyRequest } from "fastify";
@@ -17,6 +18,7 @@ import { getAuthenticatedUser } from "../auth/auth-guard.js";
 import { AppError } from "../errors/app-error.js";
 import { getRequestTraceContext } from "../observability/trace-context.js";
 import { getS3Bucket, getS3Client, getS3ObjectUrl } from "../storage/s3-client.js";
+import { readAttachmentBuffer, waitForUploadResponseDelay } from "../uploads/attachment-upload.js";
 
 const partExtraSchema = z.record(z.unknown());
 const textPartSchema = z
@@ -32,6 +34,7 @@ const resourcePartSchema = z
     mime: z.string().min(1).optional(),
     url: z.string().optional(),
     name: z.string().optional(),
+    size: z.number().optional(),
     width: z.number().optional(),
     height: z.number().optional(),
     extra: partExtraSchema.optional()
@@ -74,7 +77,20 @@ const imageMimeExtensions: Record<string, string> = {
   "image/avif": ".avif",
   "image/svg+xml": ".svg"
 };
+const documentMimeExtensions: Record<string, string> = {
+  "text/plain": ".txt",
+  "text/markdown": ".md",
+  "application/markdown": ".md",
+  "application/msword": ".doc",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx"
+};
 const defaultRouteUserId = "user_system";
+
+export interface RegisterAgentRoutesOptions {
+  uploadDirectory?: string;
+  publicBaseUrl?: string;
+  uploadResponseDelayMs?: number;
+}
 
 function parseMessageRequest(body: unknown) {
   const parsed = messageRequestSchema.safeParse(body);
@@ -228,13 +244,77 @@ function getImageExtension(mime: string, fileName: string) {
   return extension ? extension.toLowerCase() : ".img";
 }
 
+function getDocumentExtension(name: string, mimeType: string) {
+  const extension = extname(name);
+
+  if (extension) {
+    return extension.toLowerCase();
+  }
+
+  return documentMimeExtensions[mimeType.toLowerCase()] ?? ".bin";
+}
+
+function getDocumentMimeTypeFromName(name: string): string {
+  const lowerName = name.toLowerCase();
+
+  if (lowerName.endsWith(".md") || lowerName.endsWith(".markdown")) {
+    return "text/markdown";
+  }
+
+  if (lowerName.endsWith(".txt")) {
+    return "text/plain";
+  }
+
+  if (lowerName.endsWith(".docx")) {
+    return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  }
+
+  if (lowerName.endsWith(".doc")) {
+    return "application/msword";
+  }
+
+  return "application/octet-stream";
+}
+
+function normalizeAgentDocumentMime(mimeType: string, name: string): string {
+  const normalizedMime = mimeType.split(";")[0]?.trim().toLowerCase() || getDocumentMimeTypeFromName(name);
+
+  if (normalizedMime === "application/octet-stream") {
+    return getDocumentMimeTypeFromName(name);
+  }
+
+  return normalizedMime;
+}
+
+function isSupportedAgentInputDocument(input: { mimeType: string; name: string }) {
+  const lowerName = input.name.toLowerCase();
+  return (
+    input.mimeType.startsWith("text/") ||
+    input.mimeType === "application/markdown" ||
+    input.mimeType === "text/markdown" ||
+    input.mimeType === "application/msword" ||
+    input.mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+    lowerName.endsWith(".txt") ||
+    lowerName.endsWith(".md") ||
+    lowerName.endsWith(".markdown") ||
+    lowerName.endsWith(".doc") ||
+    lowerName.endsWith(".docx")
+  );
+}
+
+function getPublicBaseUrl(options: RegisterAgentRoutesOptions, request: FastifyRequest): string {
+  const fallbackHost = request.headers.host ?? "127.0.0.1:4001";
+  return (options.publicBaseUrl ?? `http://${fallbackHost}`).replace(/\/$/, "");
+}
+
 function getRequestUserId(request: FastifyRequest): string {
   return getAuthenticatedUser(request)?.sub ?? defaultRouteUserId;
 }
 
 export async function registerAgentRoutes(
   app: FastifyInstance,
-  coordinator: AgentMessageCoordinator
+  coordinator: AgentMessageCoordinator,
+  options: RegisterAgentRoutesOptions = {}
 ): Promise<void> {
   app.post("/agents/sessions", async (request, reply) => {
     const { title } = parseSessionRequest(request.body);
@@ -279,7 +359,7 @@ export async function registerAgentRoutes(
       throw new AppError("VALIDATION_ERROR", "当前只支持上传图片", 400);
     }
 
-    const buffer = await file.toBuffer();
+    const buffer = await readAttachmentBuffer(file);
 
     if (buffer.length === 0) {
       throw new AppError("VALIDATION_ERROR", "图片内容不能为空", 400);
@@ -300,6 +380,8 @@ export async function registerAgentRoutes(
       })
     );
 
+    await waitForUploadResponseDelay(options.uploadResponseDelayMs ?? 0);
+
     reply.status(201).send({
       file: {
         type: "resource",
@@ -307,6 +389,57 @@ export async function registerAgentRoutes(
         url: getS3ObjectUrl(s3Key),
         name: basename(file.filename),
         size: buffer.length
+      }
+    });
+  });
+
+  app.post("/agents/uploads/documents", async (request, reply) => {
+    const file = await request.file();
+
+    if (!file) {
+      throw new AppError("VALIDATION_ERROR", "请选择要上传的文档", 400);
+    }
+
+    const name = basename(file.filename);
+    const mimeType = normalizeAgentDocumentMime(file.mimetype || getDocumentMimeTypeFromName(name), name);
+
+    if (!isSupportedAgentInputDocument({ mimeType, name })) {
+      throw new AppError("VALIDATION_ERROR", "当前只支持上传 TXT、Markdown 和 Word 文档", 400);
+    }
+
+    const buffer = await readAttachmentBuffer(file);
+
+    if (buffer.length === 0) {
+      throw new AppError("VALIDATION_ERROR", "文档内容不能为空", 400);
+    }
+
+    if (!options.uploadDirectory) {
+      throw new AppError("RUNTIME_DEPENDENCY_ERROR", "未配置附件上传目录", 503);
+    }
+
+    const extension = getDocumentExtension(name, mimeType);
+    const contentHash = createHash("sha256").update(buffer).digest("hex");
+    const storedFileName = `${contentHash}${extension}`;
+    const targetDirectory = join(options.uploadDirectory, "agent-documents");
+    const sourcePath = join(targetDirectory, storedFileName);
+
+    await mkdir(targetDirectory, { recursive: true });
+    await writeFile(sourcePath, buffer);
+
+    await waitForUploadResponseDelay(options.uploadResponseDelayMs ?? 0);
+
+    reply.status(201).send({
+      file: {
+        type: "resource",
+        mime: mimeType,
+        url: `${getPublicBaseUrl(options, request)}/uploads/agent-documents/${storedFileName}`,
+        name,
+        size: buffer.length,
+        extra: {
+          inputResource: {
+            type: "document"
+          }
+        }
       }
     });
   });

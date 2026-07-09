@@ -52,6 +52,7 @@ import {
   summarizeToolResult
 } from "./agent-message-projection-utils.js";
 import { AgentRunCleanupService, type StaleRunningCleanupResult } from "./agent-run-cleanup-service.js";
+import type { InputResourceResolver } from "./input-resource-resolver.js";
 
 const DEFAULT_SESSION_MESSAGE_LIMIT = 30;
 const DEFAULT_SESSION_PAGE_LIMIT = 30;
@@ -74,6 +75,7 @@ export interface AgentMessageCoordinatorOptions {
   runLock?: AgentRunLock;
   agentEventLogger?: AgentEventLogger;
   observability?: AgentObservability;
+  inputResourceResolver?: InputResourceResolver;
 }
 
 function toErrorDetail(error: unknown): AgentErrorDetail {
@@ -238,7 +240,7 @@ export class AgentMessageCoordinator {
     // startRun 是 API 请求的边界：这里只创建“可恢复的任务外壳”，不在请求线程里长时间跑模型。
     // SQLite 先落 user message / run，前端马上拿到 runId；Worker 后面会用这些 id 重新读取最新状态。
     const userParts = input.parts?.length ? input.parts : [createTextPart(input.input)];
-    const userText = partsToLlmText(userParts);
+    const userText = await this.resolveInputPartsToLlmText(userParts);
     const session = input.sessionId
       ? (await this.getSession(input.sessionId, { userId: input.userId })).session
       : await this.store.createSession(userText.slice(0, 32), input.userId);
@@ -371,7 +373,7 @@ export class AgentMessageCoordinator {
     }
 
     const session = (await this.getSession(sourceAssistantMessage.sessionId, { userId })).session;
-    const userText = partsToLlmText(userMessage.parts);
+    const userText = await this.resolveInputPartsToLlmText(userMessage.parts);
     const run = await this.store.createRun({
       sessionId: session.id,
       userMessageId: userMessage.id,
@@ -521,7 +523,7 @@ export class AgentMessageCoordinator {
       await this.executeRun(
         run.id,
         {
-          input: partsToLlmText(userMessage.parts),
+          input: await this.resolveInputPartsToLlmText(userMessage.parts),
           parts: userMessage.parts,
           maxIterations: assistantMessage.maxIterations,
           sessionId: run.sessionId,
@@ -1055,6 +1057,10 @@ export class AgentMessageCoordinator {
         : await this.store.getRecentContextMessagesBefore(sessionId, beforeMessageId, summary?.coveredMessageId, messageLimit);
 
     return this.contextBuilder.buildConversationHistory(messages, summary);
+  }
+
+  private async resolveInputPartsToLlmText(parts: MessagePart[]): Promise<string> {
+    return this.options.inputResourceResolver?.resolvePartsToLlmText(parts) ?? partsToLlmText(parts);
   }
 
   private async refreshSessionSummaryBeforeAnswer(

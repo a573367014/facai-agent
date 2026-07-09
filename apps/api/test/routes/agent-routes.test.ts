@@ -452,6 +452,99 @@ describe("agent routes", () => {
     });
   });
 
+  it("POST /agents/uploads/images 拒绝超过 20MB 的附件", async () => {
+    const uploadDirectory = mkdtempSync(join(tmpdir(), "agent-upload-images-"));
+    tempDirs.push(uploadDirectory);
+    const app = await buildTestApp({ agentService: createTestAgentService(), uploadDirectory });
+    const multipart = createMultipartPayload({
+      fieldName: "image",
+      fileName: "large.png",
+      contentType: "image/png",
+      content: Buffer.alloc(20 * 1024 * 1024 + 1)
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/agents/uploads/images",
+      headers: multipart.headers,
+      payload: multipart.payload
+    });
+
+    expect(response.statusCode).toBe(413);
+    expect(response.json()).toMatchObject({
+      error: {
+        code: "VALIDATION_ERROR",
+        message: "附件不能超过 20MB"
+      }
+    });
+  });
+
+  it("POST /agents/uploads/documents 保存聊天文档并返回 resource part", async () => {
+    const uploadDirectory = mkdtempSync(join(tmpdir(), "agent-upload-documents-"));
+    tempDirs.push(uploadDirectory);
+    const app = await buildTestApp({ agentService: createTestAgentService(), uploadDirectory });
+    const markdown = "# 年度复盘\n\n收入增长 20%";
+    const multipart = createMultipartPayload({
+      fieldName: "document",
+      fileName: "年度复盘.md",
+      contentType: "text/markdown",
+      content: markdown
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/agents/uploads/documents",
+      headers: {
+        host: "127.0.0.1:4001",
+        ...multipart.headers
+      },
+      payload: multipart.payload
+    });
+    const payload = response.json() as { file: { type: string; mime: string; name: string; url: string; size: number; extra?: unknown } };
+
+    expect(response.statusCode).toBe(201);
+    expect(payload.file).toMatchObject({
+      type: "resource",
+      mime: "text/markdown",
+      name: "年度复盘.md",
+      size: Buffer.byteLength(markdown, "utf8"),
+      extra: {
+        inputResource: {
+          type: "document"
+        }
+      }
+    });
+    expect(payload.file.url).toMatch(/^http:\/\/127\.0\.0\.1:4001\/uploads\/agent-documents\/[a-f0-9]{64}\.md$/);
+    expect(existsSync(join(uploadDirectory, "agent-documents", payload.file.url.split("/").at(-1)!))).toBe(true);
+  });
+
+  it("POST /agents/uploads/documents 拒绝超过 20MB 的附件", async () => {
+    const uploadDirectory = mkdtempSync(join(tmpdir(), "agent-upload-documents-"));
+    tempDirs.push(uploadDirectory);
+    const app = await buildTestApp({ agentService: createTestAgentService(), uploadDirectory });
+    const multipart = createMultipartPayload({
+      fieldName: "document",
+      fileName: "large.md",
+      contentType: "text/markdown",
+      content: Buffer.alloc(20 * 1024 * 1024 + 1)
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/agents/uploads/documents",
+      headers: multipart.headers,
+      payload: multipart.payload
+    });
+
+    expect(response.statusCode).toBe(413);
+    expect(response.json()).toMatchObject({
+      error: {
+        code: "VALIDATION_ERROR",
+        message: "附件不能超过 20MB"
+      }
+    });
+  });
+
   it("允许 127.0.0.1 前端访问 API", async () => {
     const app = await buildTestApp({ agentService: createTestAgentService() });
     const response = await app.inject({

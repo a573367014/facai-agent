@@ -7,6 +7,7 @@ import {
   readAuthSession,
   resolveApiBaseUrl,
   startAgentRun,
+  uploadAgentDocument,
   uploadAgentImage,
   uploadKnowledgeDocument,
   writeAuthSession
@@ -65,6 +66,41 @@ describe("resolveApiBaseUrl", () => {
         body: expect.any(FormData)
       })
     );
+  });
+
+  it("uploadAgentDocument 使用 document 字段上传聊天文档并返回 resource part", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          file: {
+            type: "resource",
+            mime: "text/markdown",
+            url: "http://localhost:4001/uploads/agent-documents/a.md",
+            name: "a.md",
+            size: 3
+          }
+        }),
+        { status: 201, headers: { "content-type": "application/json" } }
+      )
+    );
+
+    await expect(uploadAgentDocument(new File(["abc"], "a.md", { type: "text/markdown" }))).resolves.toEqual({
+      type: "resource",
+      mime: "text/markdown",
+      url: "http://localhost:4001/uploads/agent-documents/a.md",
+      name: "a.md",
+      size: 3
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4001/agents/uploads/documents",
+      expect.objectContaining({
+        method: "POST",
+        body: expect.any(FormData)
+      })
+    );
+    const body = fetchMock.mock.calls[0][1]?.body as FormData;
+    expect(body.get("document")).toBeInstanceOf(File);
   });
 
   it("uploadKnowledgeDocument 使用 document 字段上传文件并返回文档记录", async () => {

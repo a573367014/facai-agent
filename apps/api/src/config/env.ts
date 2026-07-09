@@ -46,6 +46,7 @@ const envSchema = z.object({
   AGENT_PUBLIC_BASE_URL: z.string().url().optional(),
   AGENT_TOOL_RESOURCE_MAX_BYTES: z.coerce.number().int().positive().default(200 * 1024 * 1024),
   AGENT_TOOL_RESOURCE_DOWNLOAD_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
+  AGENT_UPLOAD_RESPONSE_DELAY_MS: z.coerce.number().int().min(0).max(10_000).default(0),
   GITHUB_OAUTH_CLIENT_ID: optionalEnvString,
   GITHUB_OAUTH_CLIENT_SECRET: optionalEnvString,
   GITHUB_OAUTH_REDIRECT_URI: optionalEnvUrl,

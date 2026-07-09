@@ -64,6 +64,7 @@ export interface ResourcePart extends PartBase {
   mime?: string;
   url?: string;
   name?: string;
+  size?: number;
   width?: number;
   height?: number;
 }

@@ -304,4 +304,32 @@ describe("knowledge routes", () => {
       content: "请假需要直属主管审批。"
     });
   });
+
+  it("拒绝超过 20MB 的知识库附件", async () => {
+    const uploadDirectory = mkdtempSync(join(tmpdir(), "knowledge-upload-"));
+    uploadDirs.push(uploadDirectory);
+    const queue = new CapturingKnowledgeIndexQueue();
+    const app = await buildKnowledgeTestApp({ uploadDirectory, knowledgeIndexQueue: queue });
+    const multipart = createMultipartPayload({
+      fieldName: "document",
+      fileName: "large.md",
+      contentType: "text/markdown",
+      content: Buffer.alloc(20 * 1024 * 1024 + 1)
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/knowledge/documents/upload",
+      headers: multipart.headers,
+      payload: multipart.payload
+    });
+
+    expect(response.statusCode).toBe(413);
+    expect(response.json()).toMatchObject({
+      error: {
+        code: "VALIDATION_ERROR",
+        message: "附件不能超过 20MB"
+      }
+    });
+  });
 });

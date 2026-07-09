@@ -28,7 +28,9 @@ export const partSchema = new Schema({
         size: { default: null },
         width: { default: null },
         height: { default: null },
-        extra: { default: null }
+        extra: { default: null },
+        uploading: { default: false },
+        uploadId: { default: null }
       },
       parseDOM: [
         {
@@ -43,22 +45,25 @@ export const partSchema = new Schema({
               size: element.dataset.size ? Number(element.dataset.size) : null,
               width: element.dataset.width ? Number(element.dataset.width) : null,
               height: element.dataset.height ? Number(element.dataset.height) : null,
-              extra: parseJsonDataAttribute(element.dataset.extra)
+              extra: parseJsonDataAttribute(element.dataset.extra),
+              uploading: element.dataset.uploading === "true",
+              uploadId: element.dataset.uploadId ?? null
             };
           }
         }
       ],
       toDOM: (node) => {
         const isImage = isImageMime(node.attrs.mime);
+        const isUploading = node.attrs.uploading === true;
         const resourceLabel = getResourceLabel(node.attrs.mime);
         const label = node.attrs.name || resourceLabel;
         const attrs: Record<string, string> = {
-          class: "pm-part pm-part--resource",
+          class: `pm-part pm-part--resource${isUploading ? " is-uploading" : ""}`,
           contenteditable: "false",
           "data-mime": String(node.attrs.mime ?? ""),
           "data-url": String(node.attrs.url ?? ""),
           "data-name": String(node.attrs.name ?? ""),
-          title: isImage ? "点击替换图片" : `已引用${resourceLabel}`
+          title: isUploading ? `正在上传${resourceLabel}` : isImage ? "点击替换图片" : `已引用${resourceLabel}`
         };
 
         if (node.attrs.size !== null && node.attrs.size !== undefined) {
@@ -73,14 +78,29 @@ export const partSchema = new Schema({
         if (node.attrs.extra !== null && node.attrs.extra !== undefined) {
           attrs["data-extra"] = JSON.stringify(node.attrs.extra);
         }
+        if (isUploading) {
+          attrs["data-uploading"] = "true";
+        }
+        if (node.attrs.uploadId !== null && node.attrs.uploadId !== undefined) {
+          attrs["data-upload-id"] = String(node.attrs.uploadId);
+        }
+
+        const leadingNode = isUploading
+          ? ["span", { class: "pm-part-resource-spinner", "aria-hidden": "true" }]
+          : node.attrs.url && isImage
+            ? ["img", { class: "pm-part-resource-thumb", src: node.attrs.url, alt: label, draggable: "false" }]
+            : ["span", { class: "pm-part-resource-placeholder" }, resourceLabel];
+        const nameNode = ["span", { class: "pm-part-resource-name" }, label];
+
+        if (isUploading) {
+          return ["span", attrs, leadingNode, nameNode];
+        }
 
         return [
           "span",
           attrs,
-          node.attrs.url && isImage
-            ? ["img", { class: "pm-part-resource-thumb", src: node.attrs.url, alt: label, draggable: "false" }]
-            : ["span", { class: "pm-part-resource-placeholder" }, resourceLabel],
-          ["span", { class: "pm-part-resource-name" }, label],
+          leadingNode,
+          nameNode,
           [
             "button",
             {

@@ -6,6 +6,24 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { PartComposer } from "./PartComposer";
 
 const stylesPath = join(process.cwd(), "src/styles.css");
+const maxAttachmentBytes = 20 * 1024 * 1024;
+
+function createFileWithSize(name: string, type: string, size: number) {
+  const file = new File(["x"], name, { type });
+  Object.defineProperty(file, "size", { value: size });
+  return file;
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+
+  return { promise, resolve, reject };
+}
 
 afterEach(() => {
   cleanup();
@@ -107,6 +125,251 @@ describe("PartComposer", () => {
         { type: "text", value: "后" }
       ]);
     });
+  });
+
+  it("拖拽文档后会上传并插入 resource part", async () => {
+    const onChange = vi.fn();
+    const onUploadDocument = vi.fn().mockResolvedValue({
+      type: "resource",
+      mime: "text/markdown",
+      url: "http://localhost:4001/uploads/agent-documents/report.md",
+      name: "report.md",
+      size: 8,
+      extra: {
+        inputResource: {
+          type: "document"
+        }
+      }
+    });
+
+    render(
+      <PartComposer
+        parts={[{ type: "text", value: "" }]}
+        onCancel={vi.fn()}
+        onChange={onChange}
+        onSubmit={vi.fn()}
+        onUploadDocument={onUploadDocument}
+      />
+    );
+
+    const textbox = screen.getByRole("textbox", { name: "发消息" });
+    fireEvent.drop(textbox, {
+      dataTransfer: {
+        files: [new File(["# report"], "report.md", { type: "text/markdown" })]
+      }
+    });
+
+    await waitFor(() => {
+      expect(onUploadDocument).toHaveBeenCalledWith(expect.objectContaining({ name: "report.md", type: "text/markdown" }));
+    });
+    await waitFor(() => {
+      expect(onChange).toHaveBeenLastCalledWith([
+        {
+          type: "resource",
+          mime: "text/markdown",
+          url: "http://localhost:4001/uploads/agent-documents/report.md",
+          name: "report.md",
+          size: 8,
+          extra: {
+            inputResource: {
+              type: "document"
+            }
+          }
+        }
+      ]);
+    });
+  });
+
+  it("拖拽文档后立即显示上传中占位，成功后原地替换", async () => {
+    const onChange = vi.fn();
+    const deferred = createDeferred<Parameters<typeof PartComposer>[0]["parts"][number]>();
+    const onUploadDocument = vi.fn().mockReturnValue(deferred.promise);
+
+    render(
+      <PartComposer
+        parts={[{ type: "text", value: "" }]}
+        onCancel={vi.fn()}
+        onChange={onChange}
+        onSubmit={vi.fn()}
+        onUploadDocument={onUploadDocument}
+      />
+    );
+
+    const textbox = screen.getByRole("textbox", { name: "发消息" });
+    fireEvent.drop(textbox, {
+      dataTransfer: {
+        files: [new File(["# report"], "report.md", { type: "text/markdown" })]
+      }
+    });
+
+    const uploadingPart = await screen.findByText("report.md");
+    const uploadingResource = uploadingPart.closest(".pm-part--resource");
+    expect(uploadingResource).toHaveClass("is-uploading");
+    expect(uploadingResource?.querySelector(".pm-part-resource-spinner")).toBeInTheDocument();
+    expect(onChange).toHaveBeenLastCalledWith([
+      expect.objectContaining({
+        type: "resource",
+        mime: "text/markdown",
+        name: "report.md",
+        size: 8,
+        $uploading: true,
+        $uploadId: expect.any(String)
+      })
+    ]);
+
+    deferred.resolve({
+      type: "resource",
+      mime: "text/markdown",
+      url: "http://localhost:4001/uploads/agent-documents/report.md",
+      name: "report.md",
+      size: 8
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("report.md").closest(".pm-part--resource")).not.toHaveClass("is-uploading");
+    });
+    await waitFor(() => {
+      expect(onChange).toHaveBeenLastCalledWith([
+        {
+          type: "resource",
+          mime: "text/markdown",
+          url: "http://localhost:4001/uploads/agent-documents/report.md",
+          name: "report.md",
+          size: 8
+        }
+      ]);
+    });
+  });
+
+  it("上传中撤销后，上传完成再重做会续上真实资源", async () => {
+    const onChange = vi.fn();
+    const deferred = createDeferred<Parameters<typeof PartComposer>[0]["parts"][number]>();
+    const onUploadDocument = vi.fn().mockReturnValue(deferred.promise);
+
+    render(
+      <PartComposer
+        parts={[{ type: "text", value: "" }]}
+        onCancel={vi.fn()}
+        onChange={onChange}
+        onSubmit={vi.fn()}
+        onUploadDocument={onUploadDocument}
+      />
+    );
+
+    const textbox = screen.getByRole("textbox", { name: "发消息" });
+    fireEvent.drop(textbox, {
+      dataTransfer: {
+        files: [new File(["# report"], "report.md", { type: "text/markdown" })]
+      }
+    });
+
+    expect(await screen.findByText("report.md")).toBeInTheDocument();
+
+    fireEvent.keyDown(textbox, { key: "z", code: "KeyZ", ctrlKey: true });
+
+    await waitFor(() => {
+      expect(screen.queryByText("report.md")).not.toBeInTheDocument();
+    });
+
+    deferred.resolve({
+      type: "resource",
+      mime: "text/markdown",
+      url: "http://localhost:4001/uploads/agent-documents/report.md",
+      name: "report.md",
+      size: 8
+    });
+
+    await waitFor(() => {
+      expect(onUploadDocument).toHaveBeenCalledTimes(1);
+    });
+    expect(screen.queryByText("report.md")).not.toBeInTheDocument();
+
+    fireEvent.keyDown(textbox, { key: "y", code: "KeyY", ctrlKey: true });
+
+    await waitFor(() => {
+      expect(screen.getByText("report.md").closest(".pm-part--resource")).not.toHaveClass("is-uploading");
+    });
+    await waitFor(() => {
+      expect(onChange).toHaveBeenLastCalledWith([
+        {
+          type: "resource",
+          mime: "text/markdown",
+          url: "http://localhost:4001/uploads/agent-documents/report.md",
+          name: "report.md",
+          size: 8
+        }
+      ]);
+    });
+  });
+
+  it("上传成功后的自动替换不进入历史，撤销不会回到上传中状态", async () => {
+    const onChange = vi.fn();
+    const deferred = createDeferred<Parameters<typeof PartComposer>[0]["parts"][number]>();
+    const onUploadDocument = vi.fn().mockReturnValue(deferred.promise);
+
+    render(
+      <PartComposer
+        parts={[{ type: "text", value: "" }]}
+        onCancel={vi.fn()}
+        onChange={onChange}
+        onSubmit={vi.fn()}
+        onUploadDocument={onUploadDocument}
+      />
+    );
+
+    const textbox = screen.getByRole("textbox", { name: "发消息" });
+    fireEvent.drop(textbox, {
+      dataTransfer: {
+        files: [new File(["# report"], "report.md", { type: "text/markdown" })]
+      }
+    });
+
+    expect(await screen.findByText("report.md")).toBeInTheDocument();
+
+    deferred.resolve({
+      type: "resource",
+      mime: "text/markdown",
+      url: "http://localhost:4001/uploads/agent-documents/report.md",
+      name: "report.md",
+      size: 8
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("report.md").closest(".pm-part--resource")).not.toHaveClass("is-uploading");
+    });
+
+    fireEvent.keyDown(textbox, { key: "z", code: "KeyZ", ctrlKey: true });
+
+    await waitFor(() => {
+      expect(screen.queryByText("report.md")).not.toBeInTheDocument();
+    });
+
+    fireEvent.keyDown(textbox, { key: "y", code: "KeyY", ctrlKey: true });
+
+    await waitFor(() => {
+      expect(screen.getByText("report.md").closest(".pm-part--resource")).not.toHaveClass("is-uploading");
+    });
+  });
+
+  it("前端会拦截超过 20MB 的附件并提示", async () => {
+    const onUploadError = vi.fn();
+    const onUploadImage = vi.fn();
+
+    render(
+      <PartComposer
+        parts={[{ type: "text", value: "" }]}
+        onCancel={vi.fn()}
+        onChange={vi.fn()}
+        onSubmit={vi.fn()}
+        onUploadError={onUploadError}
+        onUploadImage={onUploadImage}
+      />
+    );
+
+    await userEvent.upload(screen.getByLabelText("选择图片"), createFileWithSize("large.png", "image/png", maxAttachmentBytes + 1));
+
+    expect(onUploadImage).not.toHaveBeenCalled();
+    expect(onUploadError).toHaveBeenCalledWith("附件不能超过 20MB");
   });
 
   it("点击已有图片 part 后重新上传会替换原 part", async () => {

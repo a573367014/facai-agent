@@ -783,6 +783,13 @@ button:not(:disabled):hover {
   margin: 0;
 }
 
+.part-composer-editor.is-attachment-dragover {
+  border-radius: 10px;
+  outline: 1px dashed #65c7dd;
+  outline-offset: 4px;
+  background: rgb(232 250 253 / 0.42);
+}
+
 .user-part-surface {
   min-width: 0;
 }
@@ -839,6 +846,13 @@ button:not(:disabled):hover {
   color: var(--eye-primary-strong);
 }
 
+.pm-part--resource.is-uploading,
+.pm-part--resource.is-uploading:hover {
+  background: #e8f8fb;
+  color: #63b8ca;
+  cursor: default;
+}
+
 .pm-part--resource.ProseMirror-selectednode {
   background: #d8eee5;
   border-radius: 0;
@@ -889,6 +903,16 @@ button:not(:disabled):hover {
   line-height: 18px;
 }
 
+.pm-part-resource-spinner {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgb(99 184 202 / 0.22);
+  border-top-color: #63b8ca;
+  border-radius: 50%;
+  animation: attachment-upload-spin 0.72s linear infinite;
+}
+
 .pm-part-resource-name {
   min-width: 0;
   max-width: 118px;
@@ -929,6 +953,12 @@ button:not(:disabled):hover {
   border-color: var(--eye-primary);
   background: var(--eye-primary);
   color: #fffdf4;
+}
+
+@keyframes attachment-upload-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .part-composer-editor.is-empty::before {

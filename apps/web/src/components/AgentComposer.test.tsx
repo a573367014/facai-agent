@@ -68,6 +68,26 @@ describe("AgentComposer", () => {
     expect(props.onSubmit).not.toHaveBeenCalled();
   });
 
+  it("有附件正在上传时不能提交", async () => {
+    const props = renderForm({
+      parts: [
+        {
+          type: "resource",
+          mime: "text/markdown",
+          name: "report.md",
+          $uploading: true,
+          $uploadId: "upload_1"
+        }
+      ]
+    });
+
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+    screen.getByLabelText("发消息").focus();
+    await userEvent.keyboard("{Enter}");
+
+    expect(props.onSubmit).not.toHaveBeenCalled();
+  });
+
   it("点击上传图片后把图片插入输入 parts", async () => {
     const imagePart = {
       type: "resource" as const,
@@ -88,6 +108,49 @@ describe("AgentComposer", () => {
     });
     await waitFor(() => {
       expect(props.onPartsChange).toHaveBeenLastCalledWith([imagePart]);
+    });
+  });
+
+  it("点击上传文档后把文档插入输入 parts", async () => {
+    const documentPart = {
+      type: "resource" as const,
+      mime: "text/markdown",
+      url: "http://localhost:4001/uploads/agent-documents/report.md",
+      name: "report.md",
+      size: 12
+    };
+    const props = renderForm({
+      parts: [{ type: "text", value: "" }],
+      onUploadDocument: vi.fn().mockResolvedValue(documentPart)
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "上传文档" }));
+    await userEvent.upload(screen.getByLabelText("选择文档"), new File(["# report"], "report.md", { type: "text/markdown" }));
+
+    await waitFor(() => {
+      expect(props.onUploadDocument).toHaveBeenCalledWith(expect.objectContaining({ name: "report.md", type: "text/markdown" }));
+    });
+    await waitFor(() => {
+      expect(props.onPartsChange).toHaveBeenLastCalledWith([documentPart]);
+    });
+  });
+
+  it("上传文档失败时把错误提示交给页面", async () => {
+    const onUploadError = vi.fn();
+    const props = renderForm({
+      parts: [{ type: "text", value: "" }],
+      onUploadDocument: vi.fn().mockRejectedValue(new Error("VALIDATION_ERROR: 附件不能超过 20MB")),
+      onUploadError
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "上传文档" }));
+    await userEvent.upload(screen.getByLabelText("选择文档"), new File(["large"], "large.md", { type: "text/markdown" }));
+
+    await waitFor(() => {
+      expect(props.onUploadDocument).toHaveBeenCalledWith(expect.objectContaining({ name: "large.md", type: "text/markdown" }));
+    });
+    await waitFor(() => {
+      expect(onUploadError).toHaveBeenCalledWith("VALIDATION_ERROR: 附件不能超过 20MB");
     });
   });
 });
