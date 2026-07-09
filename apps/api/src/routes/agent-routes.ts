@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 import type { FastifyInstance } from "fastify";
+import type { FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { AgentMessageCoordinator } from "../agent/agent-message-coordinator.js";
 import type { StoredAgentEvent } from "../agent/agent-store.js";
@@ -12,6 +13,7 @@ import {
   stripRuntimePartFields,
   type MessagePart
 } from "../agent/message-parts.js";
+import { getAuthenticatedUser } from "../auth/auth-guard.js";
 import { AppError } from "../errors/app-error.js";
 import { getRequestTraceContext } from "../observability/trace-context.js";
 import { getS3Bucket, getS3Client, getS3ObjectUrl } from "../storage/s3-client.js";
@@ -72,6 +74,7 @@ const imageMimeExtensions: Record<string, string> = {
   "image/avif": ".avif",
   "image/svg+xml": ".svg"
 };
+const defaultRouteUserId = "user_system";
 
 function parseMessageRequest(body: unknown) {
   const parsed = messageRequestSchema.safeParse(body);
@@ -225,40 +228,44 @@ function getImageExtension(mime: string, fileName: string) {
   return extension ? extension.toLowerCase() : ".img";
 }
 
+function getRequestUserId(request: FastifyRequest): string {
+  return getAuthenticatedUser(request)?.sub ?? defaultRouteUserId;
+}
+
 export async function registerAgentRoutes(
   app: FastifyInstance,
   coordinator: AgentMessageCoordinator
 ): Promise<void> {
   app.post("/agents/sessions", async (request, reply) => {
     const { title } = parseSessionRequest(request.body);
-    reply.status(201).send({ session: await coordinator.createSession(title) });
+    reply.status(201).send({ session: await coordinator.createSession(title, getRequestUserId(request)) });
   });
 
   app.get("/agents/sessions", async (request) => {
-    return coordinator.listSessions(parseSessionsQuery(request.query));
+    return coordinator.listSessions({ ...parseSessionsQuery(request.query), userId: getRequestUserId(request) });
   });
 
   app.delete("/agents/sessions/:sessionId", async (request, reply) => {
     const { sessionId } = parseSessionParams(request.params);
-    await coordinator.deleteSession(sessionId);
+    await coordinator.deleteSession(sessionId, getRequestUserId(request));
     reply.status(204).send();
   });
 
   app.get("/agents/sessions/:sessionId", async (request) => {
     const { sessionId } = parseSessionParams(request.params);
     const { limit } = parseSessionMessagesQuery(request.query);
-    return coordinator.getSession(sessionId, { messageLimit: limit });
+    return coordinator.getSession(sessionId, { messageLimit: limit, userId: getRequestUserId(request) });
   });
 
   app.get("/agents/sessions/:sessionId/messages", async (request) => {
     const { sessionId } = parseSessionParams(request.params);
     const { before, limit } = parseSessionMessagesQuery(request.query);
-    return coordinator.getSessionMessages(sessionId, { before, messageLimit: limit });
+    return coordinator.getSessionMessages(sessionId, { before, messageLimit: limit, userId: getRequestUserId(request) });
   });
 
   app.post("/agents/runs", async (request, reply) => {
     const input = parseMessageStartRequest(request.body);
-    reply.status(202).send(await coordinator.startRun(input, getRequestTraceContext(request) ?? undefined));
+    reply.status(202).send(await coordinator.startRun({ ...input, userId: getRequestUserId(request) }, getRequestTraceContext(request) ?? undefined));
   });
 
   app.post("/agents/uploads/images", async (request, reply) => {
@@ -307,32 +314,35 @@ export async function registerAgentRoutes(
   app.post("/agents/sessions/:sessionId/runs", async (request, reply) => {
     const { sessionId } = parseSessionParams(request.params);
     const input = parseMessageRequest(request.body);
-    reply.status(202).send(await coordinator.startRun({ ...input, sessionId }, getRequestTraceContext(request) ?? undefined));
+    reply.status(202).send(
+      await coordinator.startRun({ ...input, sessionId, userId: getRequestUserId(request) }, getRequestTraceContext(request) ?? undefined)
+    );
   });
 
   app.get("/agents/messages/:messageId", async (request) => {
     const { messageId } = parseMessageParams(request.params);
-    return coordinator.getMessageSnapshot(messageId);
+    return coordinator.getMessageSnapshot(messageId, getRequestUserId(request));
   });
 
   app.get("/agents/runs/:runId", async (request) => {
     const { runId } = parseRunParams(request.params);
-    return coordinator.getRun(runId);
+    return coordinator.getRun(runId, getRequestUserId(request));
   });
 
   app.post("/agents/runs/:runId/cancel", async (request) => {
     const { runId } = parseRunParams(request.params);
-    return coordinator.cancelRun(runId);
+    return coordinator.cancelRun(runId, "用户中断", getRequestUserId(request));
   });
 
   app.post("/agents/messages/:messageId/regenerate", async (request, reply) => {
     const { messageId } = parseMessageParams(request.params);
-    reply.status(202).send(await coordinator.regenerateMessage(messageId));
+    reply.status(202).send(await coordinator.regenerateMessage(messageId, getRequestUserId(request)));
   });
 
   app.get("/agents/runs/:runId/stream", async (request, reply) => {
     const { runId } = parseRunParams(request.params);
-    await coordinator.getRun(runId);
+    const userId = getRequestUserId(request);
+    await coordinator.getRun(runId, userId);
 
     reply.raw.writeHead(200, buildSseHeaders(reply.getHeaders()));
 
@@ -363,7 +373,7 @@ export async function registerAgentRoutes(
       }
     };
 
-    unsubscribe = await coordinator.subscribeRun(runId, writeStoredEvent);
+    unsubscribe = await coordinator.subscribeRun(runId, writeStoredEvent, userId);
     request.raw.on("close", () => {
       if (!ended) {
         ended = true;
@@ -371,9 +381,9 @@ export async function registerAgentRoutes(
       }
     });
 
-    const { run } = await coordinator.getRun(runId);
+    const { run } = await coordinator.getRun(runId, userId);
     if (run.assistantMessageId) {
-      const { message, resources, processSteps, version } = await coordinator.getMessageSnapshot(run.assistantMessageId);
+      const { message, resources, processSteps, version } = await coordinator.getMessageSnapshot(run.assistantMessageId, userId);
       writeStoredEvent(
         createLiveSseEvent({
           runId,

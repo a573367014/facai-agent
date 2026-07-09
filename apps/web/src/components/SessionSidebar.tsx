@@ -1,5 +1,5 @@
-import { Box, Button, Chip, Divider, IconButton, List, ListItemButton, ListItemText, TextField, Typography } from "@mui/material";
-import { MessageCircle, Plus, Search, Sparkles, Trash2 } from "lucide-react";
+import { Box, Button, Chip, Divider, IconButton, List, ListItemButton, ListItemText, TextField, Tooltip, Typography } from "@mui/material";
+import { Github, LogOut, MessageCircle, Plus, Search, Sparkles, Trash2 } from "lucide-react";
 import { useMemo, useState, type UIEvent } from "react";
 
 export interface SessionHistoryItem {
@@ -10,16 +10,19 @@ export interface SessionHistoryItem {
 
 interface SessionSidebarProps {
   activeSessionId?: string;
-  health: string;
   historyItems: SessionHistoryItem[];
   isCollapsed: boolean;
   hasMoreSessions: boolean;
   isLoadingMoreSessions: boolean;
   deletingSessionIds: Set<string>;
+  githubLogin?: string;
+  isGithubLoginConfigured: boolean;
   onNewSession: () => void;
   onSelectSession: (sessionId: string) => void;
   onLoadMoreSessions: () => void;
   onDeleteSession: (sessionId: string) => void;
+  onGithubLogin: () => void;
+  onLogout: () => void;
 }
 
 function getStatusLabel(status?: SessionHistoryItem["status"]) {
@@ -36,16 +39,19 @@ function getStatusLabel(status?: SessionHistoryItem["status"]) {
 
 export function SessionSidebar({
   activeSessionId,
-  health,
   historyItems,
   isCollapsed,
   hasMoreSessions,
   isLoadingMoreSessions,
   deletingSessionIds,
+  githubLogin,
+  isGithubLoginConfigured,
   onNewSession,
   onSelectSession,
   onLoadMoreSessions,
-  onDeleteSession
+  onDeleteSession,
+  onGithubLogin,
+  onLogout
 }: SessionSidebarProps) {
   const [query, setQuery] = useState("");
   const filteredItems = useMemo(() => {
@@ -147,7 +153,29 @@ export function SessionSidebar({
         </List>
 
         <Box className="sidebar-footer">
-          <Chip className={health === "正常" ? "status ok" : "status"} color={health === "正常" ? "primary" : "default"} label={`API ${health}`} />
+          {githubLogin ? (
+            <Box className="sidebar-auth-row">
+              <Chip className="auth-chip sidebar-auth-chip" size="small" label={`@${githubLogin}`} variant="outlined" />
+              <Tooltip title="退出登录">
+                <IconButton aria-label="退出登录" className="sidebar-auth-logout" onClick={onLogout} size="small" type="button">
+                  <LogOut size={17} />
+                </IconButton>
+              </Tooltip>
+            </Box>
+          ) : (
+            <Button
+              className="github-login-button sidebar-github-login-button"
+              disabled={!isGithubLoginConfigured}
+              fullWidth
+              onClick={onGithubLogin}
+              size="small"
+              startIcon={<Github size={16} />}
+              type="button"
+              variant="outlined"
+            >
+              GitHub 登录
+            </Button>
+          )}
         </Box>
       </Box>
     </Box>

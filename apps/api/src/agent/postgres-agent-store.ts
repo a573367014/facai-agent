@@ -60,6 +60,7 @@ interface SessionCursor {
 }
 
 const contextMessageFilter = "(role = 'user' OR (role = 'assistant' AND status IN ('completed', 'failed')))";
+const defaultSessionUserId = "user_system";
 
 function createId(prefix: string) {
   return `${prefix}_${randomUUID()}`;
@@ -160,44 +161,58 @@ export class PostgresAgentStore implements AgentStore {
     return store;
   }
 
-  async createSession(title?: string): Promise<AgentSessionRecord> {
+  async createSession(title?: string, userId = defaultSessionUserId): Promise<AgentSessionRecord> {
     const timestamp = now();
     const session: AgentSessionRecord = {
       id: createId("session"),
+      userId,
       title,
       createdAt: timestamp,
       updatedAt: timestamp
     };
 
     await this.execute(
-      `INSERT INTO agent_sessions (id, title, created_at, updated_at)
-       VALUES (?, ?, ?, ?)`,
-      [session.id, title ?? null, timestamp, timestamp]
+      `INSERT INTO agent_sessions (id, user_id, title, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [session.id, userId, title ?? null, timestamp, timestamp]
     );
     return session;
   }
 
-  async getSession(sessionId: string): Promise<AgentSessionRecord | undefined> {
+  async getSession(sessionId: string, userId?: string): Promise<AgentSessionRecord | undefined> {
+    const params: SqlValue[] = [sessionId];
+
+    if (userId) {
+      params.push(userId);
+    }
+
     const row = await this.queryOne(
-      `SELECT id, title, created_at, updated_at
+      `SELECT id, user_id, title, created_at, updated_at
        FROM agent_sessions
-       WHERE id = ?`,
-      [sessionId]
+       WHERE id = ?${userId ? " AND user_id = ?" : ""}`,
+      params
     );
 
     return row ? this.toSessionRecord(row) : undefined;
   }
 
   async listSessions(options: ListAgentSessionsOptions = {}): Promise<AgentSessionRecord[]> {
-    const cursor = options.after ? await this.getSessionCursor(options.after) : undefined;
+    const cursor = options.after ? await this.getSessionCursor(options.after, options.userId) : undefined;
     const normalizedLimit = options.limit === undefined ? undefined : normalizeLimit(options.limit);
     const params: SqlValue[] = [];
+    const whereClauses: string[] = [];
 
     if (options.after && !cursor) {
       return [];
     }
 
+    if (options.userId) {
+      whereClauses.push("user_id = ?");
+      params.push(options.userId);
+    }
+
     if (cursor) {
+      whereClauses.push("(updated_at < ? OR (updated_at = ? AND seq < ?))");
       params.push(cursor.updatedAt, cursor.updatedAt, cursor.seq);
     }
 
@@ -210,9 +225,9 @@ export class PostgresAgentStore implements AgentStore {
     }
 
     const rows = await this.queryMany(
-      `SELECT id, title, created_at, updated_at
+      `SELECT id, user_id, title, created_at, updated_at
        FROM agent_sessions
-       ${cursor ? "WHERE updated_at < ? OR (updated_at = ? AND seq < ?)" : ""}
+       ${whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : ""}
        ORDER BY updated_at DESC, seq DESC
        ${normalizedLimit !== undefined ? "LIMIT ?" : ""}`,
       params
@@ -1874,10 +1889,16 @@ export class PostgresAgentStore implements AgentStore {
     };
   }
 
-  private async getSessionCursor(sessionId: string): Promise<SessionCursor | undefined> {
+  private async getSessionCursor(sessionId: string, userId?: string): Promise<SessionCursor | undefined> {
+    const params: SqlValue[] = [sessionId];
+
+    if (userId) {
+      params.push(userId);
+    }
+
     const row = await this.queryOne<{ updated_at: string; seq: number }>(
-      `SELECT updated_at, seq FROM agent_sessions WHERE id = ?`,
-      [sessionId]
+      `SELECT updated_at, seq FROM agent_sessions WHERE id = ?${userId ? " AND user_id = ?" : ""}`,
+      params
     );
 
     if (!row) {
@@ -1970,6 +1991,7 @@ export class PostgresAgentStore implements AgentStore {
   private toSessionRecord(row: QueryResultRow): AgentSessionRecord {
     return {
       id: requiredString(row.id, "id"),
+      userId: requiredString(row.user_id, "user_id"),
       title: optionalString(row.title),
       createdAt: requiredString(row.created_at, "created_at"),
       updatedAt: requiredString(row.updated_at, "updated_at")
@@ -2120,6 +2142,7 @@ export class PostgresAgentStore implements AgentStore {
     await this.execute(
       `CREATE TABLE IF NOT EXISTS agent_sessions (
          id TEXT PRIMARY KEY,
+         user_id TEXT NOT NULL DEFAULT '${defaultSessionUserId}',
          title TEXT,
          created_at TEXT NOT NULL,
          updated_at TEXT NOT NULL,
@@ -2276,7 +2299,35 @@ export class PostgresAgentStore implements AgentStore {
       await this.migrateVectorDimension(vectorDimension);
     }
 
+    await this.ensureAgentSessionUserScope();
     await this.createIndexes();
+  }
+
+  private async ensureAgentSessionUserScope(): Promise<void> {
+    const row = await this.queryOne<{ exists: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1
+         FROM information_schema.columns
+         WHERE table_name = 'agent_sessions'
+           AND column_name = 'user_id'
+       ) AS exists`
+    );
+
+    if (row?.exists) {
+      return;
+    }
+
+    await this.execute(
+      `TRUNCATE TABLE agent_resources,
+                      agent_tool_calls,
+                      agent_process_steps,
+                      agent_session_summaries,
+                      agent_runs,
+                      agent_messages,
+                      agent_sessions
+       RESTART IDENTITY CASCADE`
+    );
+    await this.execute(`ALTER TABLE agent_sessions ADD COLUMN user_id TEXT NOT NULL DEFAULT '${defaultSessionUserId}'`);
   }
 
   private async migrateVectorDimension(vectorDimension: number): Promise<void> {
@@ -2298,6 +2349,10 @@ export class PostgresAgentStore implements AgentStore {
   }
 
   private async createIndexes(): Promise<void> {
+    await this.execute(
+      `CREATE INDEX IF NOT EXISTS idx_agent_sessions_user_updated_at
+       ON agent_sessions (user_id, updated_at, seq)`
+    );
     await this.execute(
       `CREATE INDEX IF NOT EXISTS idx_agent_messages_session_id_created_at
        ON agent_messages (session_id, created_at)`

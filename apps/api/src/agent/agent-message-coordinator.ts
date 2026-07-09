@@ -62,6 +62,10 @@ type AgentMessagePageWithResources = AgentMessagePage & {
   processSteps: AgentProcessStepRecord[];
 };
 
+type AgentOwnerScope = {
+  userId?: string;
+};
+
 export interface AgentMessageCoordinatorOptions {
   runQueue?: AgentRunQueue;
   eventBus?: AgentEventBus;
@@ -140,13 +144,14 @@ export class AgentMessageCoordinator {
     );
   }
 
-  async createSession(title?: string) {
-    return this.store.createSession(title);
+  async createSession(title?: string, userId?: string) {
+    return this.store.createSession(title, userId);
   }
 
-  async listSessions(options: { after?: string; limit?: number } = {}) {
+  async listSessions(options: { after?: string; limit?: number; userId?: string } = {}) {
     const limit = this.normalizeSessionLimit(options.limit);
     const sessionsWithOverflow = await this.store.listSessions({
+      userId: options.userId,
       after: options.after,
       limit: limit + 1
     });
@@ -175,8 +180,8 @@ export class AgentMessageCoordinator {
     ]);
   }
 
-  async deleteSession(sessionId: string) {
-    const session = await this.store.getSession(sessionId);
+  async deleteSession(sessionId: string, userId?: string) {
+    const session = await this.store.getSession(sessionId, userId);
 
     if (!session) {
       throw new AppError("VALIDATION_ERROR", `未找到会话：${sessionId}`, 404);
@@ -190,8 +195,8 @@ export class AgentMessageCoordinator {
     return { session };
   }
 
-  async getSession(sessionId: string, options: { messageLimit?: number } = {}) {
-    const session = await this.store.getSession(sessionId);
+  async getSession(sessionId: string, options: { messageLimit?: number; userId?: string } = {}) {
+    const session = await this.store.getSession(sessionId, options.userId);
 
     if (!session) {
       throw new AppError("VALIDATION_ERROR", `未找到会话：${sessionId}`, 404);
@@ -209,8 +214,8 @@ export class AgentMessageCoordinator {
     };
   }
 
-  async getSessionMessages(sessionId: string, options: { before?: string; messageLimit?: number } = {}): Promise<AgentMessagePageWithResources> {
-    const session = await this.store.getSession(sessionId);
+  async getSessionMessages(sessionId: string, options: { before?: string; messageLimit?: number; userId?: string } = {}): Promise<AgentMessagePageWithResources> {
+    const session = await this.store.getSession(sessionId, options.userId);
 
     if (!session) {
       throw new AppError("VALIDATION_ERROR", `未找到会话：${sessionId}`, 404);
@@ -228,12 +233,14 @@ export class AgentMessageCoordinator {
     );
   }
 
-  async startRun(input: AgentExecutionInput & { sessionId?: string }, traceContext?: TraceContextCarrier) {
+  async startRun(input: AgentExecutionInput & { sessionId?: string; userId?: string }, traceContext?: TraceContextCarrier) {
     // startRun 是 API 请求的边界：这里只创建“可恢复的任务外壳”，不在请求线程里长时间跑模型。
     // SQLite 先落 user message / run，前端马上拿到 runId；Worker 后面会用这些 id 重新读取最新状态。
     const userParts = input.parts?.length ? input.parts : [createTextPart(input.input)];
     const userText = partsToLlmText(userParts);
-    const session = input.sessionId ? (await this.getSession(input.sessionId)).session : await this.store.createSession(userText.slice(0, 32));
+    const session = input.sessionId
+      ? (await this.getSession(input.sessionId, { userId: input.userId })).session
+      : await this.store.createSession(userText.slice(0, 32), input.userId);
     const userMessage = await this.store.createMessage({
       sessionId: session.id,
       role: "user",
@@ -347,8 +354,10 @@ export class AgentMessageCoordinator {
     };
   }
 
-  async regenerateMessage(messageId: string) {
+  async regenerateMessage(messageId: string, userId?: string) {
     const sourceAssistantMessage = await this.ensureAssistantMessage(messageId);
+
+    await this.ensureSessionOwner(sourceAssistantMessage.sessionId, userId);
 
     if (sourceAssistantMessage.status === "running") {
       throw new AppError("VALIDATION_ERROR", "运行中的回答不能重新生成，请先停止当前生成", 400);
@@ -360,7 +369,7 @@ export class AgentMessageCoordinator {
       throw new AppError("VALIDATION_ERROR", "未找到这条回答对应的用户输入，无法重新生成", 404);
     }
 
-    const session = (await this.getSession(sourceAssistantMessage.sessionId)).session;
+    const session = (await this.getSession(sourceAssistantMessage.sessionId, { userId })).session;
     const userText = partsToLlmText(userMessage.parts);
     const run = await this.store.createRun({
       sessionId: session.id,
@@ -401,8 +410,8 @@ export class AgentMessageCoordinator {
     };
   }
 
-  async cancelRun(runId: string, reason = "用户中断") {
-    const run = await this.ensureRun(runId);
+  async cancelRun(runId: string, reason = "用户中断", userId?: string) {
+    const run = await this.ensureRun(runId, { userId });
 
     if (run.status !== "running") {
       return { run };
@@ -472,8 +481,8 @@ export class AgentMessageCoordinator {
     return { run: cancelledRun };
   }
 
-  async getRun(runId: string) {
-    const run = await this.ensureRun(runId);
+  async getRun(runId: string, userId?: string) {
+    const run = await this.ensureRun(runId, { userId });
 
     return {
       run
@@ -529,8 +538,8 @@ export class AgentMessageCoordinator {
     return this.getRun(run.id);
   }
 
-  async subscribeRun(runId: string, listener: AgentEventListener) {
-    await this.ensureRun(runId);
+  async subscribeRun(runId: string, listener: AgentEventListener, userId?: string) {
+    await this.ensureRun(runId, { userId });
     // 本进程 store.subscribeRun 能接到当前 API 进程写入的事件；
     // eventBus.subscribeRun 能接到 Worker 进程通过 Redis Pub/Sub 发布的事件。
     // SSE 同时订阅两边，才兼容测试、单进程和多进程部署。
@@ -572,8 +581,10 @@ export class AgentMessageCoordinator {
     };
   }
 
-  async getMessage(messageId: string) {
+  async getMessage(messageId: string, userId?: string) {
     const message = await this.ensureAssistantMessage(messageId);
+
+    await this.ensureSessionOwner(message.sessionId, userId);
 
     return {
       message,
@@ -582,7 +593,8 @@ export class AgentMessageCoordinator {
     };
   }
 
-  async getMessageSnapshot(messageId: string) {
+  async getMessageSnapshot(messageId: string, userId?: string) {
+    await this.ensureMessageOwner(messageId, userId);
     const { message, version } = await this.draftManager.getSnapshot(await this.ensureAssistantMessage(messageId));
 
     return {
@@ -820,12 +832,31 @@ export class AgentMessageCoordinator {
     return message;
   }
 
-  private async ensureRun(runId: string): Promise<AgentRunRecord> {
+  private async ensureMessageOwner(messageId: string, userId?: string): Promise<void> {
+    const message = await this.ensureMessage(messageId);
+    await this.ensureSessionOwner(message.sessionId, userId);
+  }
+
+  private async ensureSessionOwner(sessionId: string, userId?: string): Promise<void> {
+    if (!userId) {
+      return;
+    }
+
+    const session = await this.store.getSession(sessionId, userId);
+
+    if (!session) {
+      throw new AppError("VALIDATION_ERROR", `未找到会话：${sessionId}`, 404);
+    }
+  }
+
+  private async ensureRun(runId: string, scope: AgentOwnerScope = {}): Promise<AgentRunRecord> {
     const run = await this.store.getRun(runId);
 
     if (!run) {
       throw new AppError("VALIDATION_ERROR", `未找到运行：${runId}`, 404);
     }
+
+    await this.ensureSessionOwner(run.sessionId, scope.userId);
 
     return run;
   }

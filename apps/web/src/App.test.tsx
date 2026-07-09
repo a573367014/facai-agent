@@ -325,13 +325,27 @@ function jsonResponse(payload: unknown, ok = true): Response {
   } as Response;
 }
 
-function okResponse(): Response {
-  return {
-    ok: true
-  } as Response;
+function writeTestAuthSession() {
+  localStorage.setItem(
+    "agent.auth.session",
+    JSON.stringify({
+      user: { id: "user_test", githubId: "9911", githubLogin: "octocat" },
+      accessToken: "test-access-token",
+      refreshToken: "test-refresh-token",
+      expiresIn: 900,
+      refreshTokenExpiresIn: 1296000
+    })
+  );
 }
 
-function mockAppFetch(handler?: (url: string, init?: RequestInit) => Response | Promise<Response> | undefined) {
+function mockAppFetch(
+  handler?: (url: string, init?: RequestInit) => Response | Promise<Response> | undefined,
+  options: { authenticated?: boolean } = {}
+) {
+  if (options.authenticated !== false) {
+    writeTestAuthSession();
+  }
+
   globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     const customResponse = handler?.(url, init);
@@ -340,16 +354,18 @@ function mockAppFetch(handler?: (url: string, init?: RequestInit) => Response | 
       return Promise.resolve(customResponse);
     }
 
-    if (url.endsWith("/health")) {
-      return Promise.resolve(okResponse());
-    }
-
     if (url.endsWith("/agents/sessions") && (!init?.method || init.method === "GET")) {
       return Promise.resolve(jsonResponse({ sessions: [] }));
     }
 
     return Promise.reject(new Error(`未 mock 的请求：${url}`));
   });
+}
+
+function fetchWasCalledWith(url: string, matchesInit?: (init?: RequestInit) => boolean) {
+  return vi
+    .mocked(globalThis.fetch)
+    .mock.calls.some(([input, init]) => String(input) === url && (!matchesInit || matchesInit(init)));
 }
 
 afterEach(() => {
@@ -361,6 +377,45 @@ afterEach(() => {
 });
 
 describe("App", () => {
+  it("GitHub 回调页会用 code 换 token 并显示登录用户", async () => {
+    window.history.replaceState(null, "", "/auth/github/callback?code=github-code");
+    mockAppFetch((url) => {
+      if (url.endsWith("/auth/github/login")) {
+        return jsonResponse({
+          user: { id: "user_1", githubId: "9911", githubLogin: "octocat" },
+          accessToken: "access-token",
+          refreshToken: "refresh-token",
+          expiresIn: 900,
+          refreshTokenExpiresIn: 1296000
+        });
+      }
+
+      if (url.endsWith("/agents/sessions") || url.endsWith("/knowledge/documents")) {
+        return jsonResponse(url.endsWith("/knowledge/documents") ? { documents: [] } : { sessions: [] });
+      }
+
+      return undefined;
+    }, { authenticated: false });
+
+    render(<App />);
+
+    await screen.findByText("@octocat");
+    expect(document.querySelector(".sidebar-footer")).toHaveTextContent("@octocat");
+    expect(localStorage.getItem("agent.auth.session")).toContain("access-token");
+    expect(window.location.pathname).toBe("/");
+  });
+
+  it("未登录时提示先登录且不加载受保护数据", async () => {
+    mockAppFetch(undefined, { authenticated: false });
+
+    render(<App />);
+
+    expect(await screen.findByText("请先登录 GitHub")).toBeInTheDocument();
+    expect(
+      vi.mocked(globalThis.fetch).mock.calls.some(([url]) => String(url).includes("/agents/sessions"))
+    ).toBe(false);
+  });
+
   it("消息列使用顶部标题、消息区、底部输入框的三段式布局", () => {
     const styles = readFileSync(stylesPath, "utf8");
 
@@ -702,7 +757,7 @@ describe("App", () => {
     fireEvent.scroll(listElement);
 
     await waitFor(() => expect(screen.getByRole("button", { name: "旧会话" })).toBeInTheDocument());
-    expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/sessions?after=session_new&limit=30");
+    expect(fetchWasCalledWith("http://localhost:4001/agents/sessions?after=session_new&limit=30")).toBe(true);
   });
 
   it("删除当前会话后从列表移除并回到新对话", async () => {
@@ -756,9 +811,8 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByText("删除前回答")).toBeInTheDocument());
     await userEvent.click(screen.getByRole("button", { name: "删除会话：要删除的会话" }));
 
-    expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/sessions/session_delete", {
-      method: "DELETE"
-    });
+    expect(fetchWasCalledWith("http://localhost:4001/agents/sessions/session_delete", (init) => init?.method === "DELETE"))
+      .toBe(true);
     await waitFor(() => expect(screen.queryByText("要删除的会话")).not.toBeInTheDocument());
     expect(screen.queryByText("删除前回答")).not.toBeInTheDocument();
     expect(screen.getByText("有什么我能帮你的吗？")).toBeInTheDocument();
@@ -844,15 +898,18 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getAllByText("重新生成的回答").length).toBeGreaterThan(0));
     expect(screen.getByText("旧回答")).toBeInTheDocument();
-    expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/messages/msg_assistant_old/regenerate", {
-      method: "POST"
-    });
+    expect(
+      fetchWasCalledWith(
+        "http://localhost:4001/agents/messages/msg_assistant_old/regenerate",
+        (init) => init?.method === "POST"
+      )
+    ).toBe(true);
     expect(globalThis.fetch).toHaveBeenCalledWith(
       "http://localhost:4001/agents/runs/run_regen_1/stream",
       expect.objectContaining({
-        headers: {
+        headers: expect.objectContaining({
           accept: "text/event-stream"
-        }
+        })
       })
     );
   });
@@ -943,9 +1000,9 @@ describe("App", () => {
     scrollHeight = 1300;
 
     await waitFor(() => expect(screen.getByText("消息 1")).toBeInTheDocument());
-    expect(globalThis.fetch).toHaveBeenCalledWith(
-      "http://localhost:4001/agents/sessions/session_paged/messages?before=msg_3&limit=30"
-    );
+    expect(
+      fetchWasCalledWith("http://localhost:4001/agents/sessions/session_paged/messages?before=msg_3&limit=30")
+    ).toBe(true);
     expect(screen.queryByText("上滑加载更早消息")).not.toBeInTheDocument();
   });
 
@@ -995,7 +1052,19 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "发送" })).toHaveClass("MuiIconButton-root");
     expect(screen.queryByRole("button", { name: "运行" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "流式运行" })).not.toBeInTheDocument();
-    await waitFor(() => expect(screen.getByText("API 正常")).toHaveClass("MuiChip-label"));
+  });
+
+  it("左下角展示 GitHub 登录状态并移除 API 健康状态", async () => {
+    mockAppFetch();
+
+    const { container } = render(<App />);
+    const sidebarFooter = container.querySelector(".sidebar-footer");
+
+    await waitFor(() => expect(fetchWasCalledWith("http://localhost:4001/agents/sessions")).toBe(true));
+    expect(sidebarFooter).toHaveTextContent("@octocat");
+    expect(sidebarFooter).not.toHaveTextContent("API");
+    expect(container.querySelector(".chat-main-header")).not.toHaveTextContent("@octocat");
+    expect(fetchWasCalledWith("http://localhost:4001/health")).toBe(false);
   });
 
   it("聊天工作台细节保持统一、舒适且没有突兀 outline", () => {
@@ -1425,7 +1494,7 @@ describe("App", () => {
     render(<App />);
 
     await waitFor(() => expect(screen.getByText("URL 会话回答")).toBeInTheDocument());
-    expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/sessions/session_from_url");
+    expect(fetchWasCalledWith("http://localhost:4001/agents/sessions/session_from_url")).toBe(true);
   });
 
   it("刷新恢复已完成会话时从 message.parts 展示生成图片", async () => {
@@ -1690,7 +1759,7 @@ describe("App", () => {
 
     render(<App />);
 
-    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/health", expect.any(Object)));
+    await waitFor(() => expect(fetchWasCalledWith("http://localhost:4001/agents/sessions")).toBe(true));
     expect(vi.mocked(globalThis.fetch).mock.calls.some(([url]) => String(url).includes("/agents/sessions/"))).toBe(false);
     expect(window.location.search).toBe("");
   });
@@ -2359,9 +2428,8 @@ describe("App", () => {
     await userEvent.click(screen.getByRole("button", { name: "停止" }));
 
     await waitFor(() =>
-      expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/runs/msg_1/cancel", {
-        method: "POST"
-      })
+      expect(fetchWasCalledWith("http://localhost:4001/agents/runs/msg_1/cancel", (init) => init?.method === "POST"))
+        .toBe(true)
     );
     expect(screen.getByText("已中断")).toBeInTheDocument();
   });
@@ -2642,9 +2710,8 @@ describe("App", () => {
     await userEvent.type(screen.getByLabelText("发消息"), "第二轮{Enter}");
 
     await waitFor(() =>
-      expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/runs/msg_1/cancel", {
-        method: "POST"
-      })
+      expect(fetchWasCalledWith("http://localhost:4001/agents/runs/msg_1/cancel", (init) => init?.method === "POST"))
+        .toBe(true)
     );
     await waitFor(() => expect(screen.getAllByText("第二轮答案").length).toBeGreaterThan(0));
     expect(screen.getByText("已中断")).toBeInTheDocument();
@@ -2846,22 +2913,15 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getAllByText("恢复").length).toBeGreaterThan(0));
     expect(window.location.search).toBe("?sessionId=session_1");
-    expect(globalThis.fetch).toHaveBeenCalledWith(
-      "http://localhost:4001/agents/runs/msg_1"
-    );
+    expect(fetchWasCalledWith("http://localhost:4001/agents/runs/msg_1")).toBe(true);
   });
 
   it("卸载时取消刷新恢复的事件流订阅", async () => {
     localStorage.setItem("agent.activeRunId", "msg_1");
+    writeTestAuthSession();
     let streamSignal: AbortSignal | undefined;
 
     globalThis.fetch = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
-      if (url.endsWith("/health")) {
-        return Promise.resolve({
-          ok: true
-        } as Response);
-      }
-
       if (url.endsWith("/agents/sessions")) {
         return Promise.resolve(jsonResponse({ sessions: [] }));
       }

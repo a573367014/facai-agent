@@ -5,6 +5,40 @@ import { join } from "node:path";
 import { createJimengVideoTool } from "../../src/tools/jimeng-video.js";
 
 describe("createJimengVideoTool", () => {
+  it("默认视频轮询窗口覆盖六分钟内才完成的任务", async () => {
+    const responses = [
+      { code: 10000, data: { task_id: "task_slow_video" }, message: "Success" },
+      ...Array.from({ length: 71 }, () => ({ code: 10000, data: { status: "running" }, message: "Success" })),
+      {
+        code: 10000,
+        data: {
+          status: "done",
+          video_url: "https://example.com/slow-video.mp4"
+        },
+        message: "Success"
+      }
+    ];
+    const tool = createJimengVideoTool({
+      accessKeyId: "ak-test",
+      secretAccessKey: "sk-test",
+      pollIntervalMs: 0,
+      fetchImpl: async () =>
+        new Response(JSON.stringify(responses.shift()), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        })
+    });
+
+    const output = await tool.execute({ prompt: "生成一段复杂的电影感视频" }, {});
+
+    expect(output).toMatchObject({
+      data: {
+        taskId: "task_slow_video",
+        videoUrls: ["https://example.com/slow-video.mp4"]
+      }
+    });
+  });
+
   it("配置 AK/SK 时用即梦视频 3.0 720P 文生视频接口生成视频", async () => {
     const requests: Array<{ url: string; init: RequestInit; body: Record<string, unknown> }> = [];
     const responses = [

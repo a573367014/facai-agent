@@ -23,6 +23,10 @@ import type { RunningMessageStateStore } from "./agent/running-message-state-sto
 import { RedisRunningMessageStateStore } from "./agent/redis-running-message-state-store.js";
 import { PostgresAgentStore } from "./agent/postgres-agent-store.js";
 import { S3ToolResourceStorage, type ToolResourceStorage } from "./agent/tool-resource-storage.js";
+import { AuthTokenService } from "./auth/auth-token-service.js";
+import { registerAuthGuard } from "./auth/auth-guard.js";
+import { HttpGithubOAuthClient } from "./auth/github-oauth-client.js";
+import { PostgresUserStore } from "./auth/postgres-user-store.js";
 import { createCorsOriginChecker } from "./config/cors.js";
 import { loadEnv } from "./config/env.js";
 import { AppError } from "./errors/app-error.js";
@@ -42,6 +46,7 @@ import { LangChainAgentService } from "./langchain/langchain-agent-service.js";
 import { createRedisRuntime, toBullMqRedisConnectionOptions, type RedisRuntime } from "./redis/runtime.js";
 import { initS3Storage } from "./storage/s3-client.js";
 import { registerAgentRoutes } from "./routes/agent-routes.js";
+import { registerAuthRoutes, type RegisterAuthRoutesOptions } from "./routes/auth-routes.js";
 import { registerHealthRoutes } from "./routes/health-routes.js";
 import { registerKnowledgeRoutes } from "./routes/knowledge-routes.js";
 import { endRequestSpan, getRequestSpan, getRequestTraceparent, startRequestSpan } from "./observability/trace-context.js";
@@ -64,6 +69,9 @@ export interface BuildAppOptions {
   toolResourceStorage?: ToolResourceStorage;
   uploadDirectory?: string;
   skipStaleCleanup?: boolean;
+  skipAgentRuntime?: boolean;
+  skipAuth?: boolean;
+  auth?: RegisterAuthRoutesOptions;
 }
 
 export type AgentRuntimeFastifyInstance = Awaited<ReturnType<typeof buildApp>> & {
@@ -84,29 +92,31 @@ export async function buildApp(options: BuildAppOptions = {}) {
 
   const uploadDirectory = resolve(options.uploadDirectory ?? env.AGENT_UPLOAD_DIR);
   const publicBaseUrl = env.AGENT_PUBLIC_BASE_URL ?? `http://127.0.0.1:${env.PORT}`;
-  await mkdir(uploadDirectory, { recursive: true });
+  if (!options.skipAgentRuntime) {
+    await mkdir(uploadDirectory, { recursive: true });
 
-  // 初始化 S3 兼容对象存储（图片上传用）。MinIO 本地开发时自动创建 bucket。
-  await initS3Storage({
-    endpoint: env.S3_ENDPOINT,
-    region: env.S3_REGION,
-    bucket: env.S3_BUCKET,
-    accessKeyId: env.S3_ACCESS_KEY_ID,
-    secretAccessKey: env.S3_SECRET_ACCESS_KEY,
-    publicBaseUrl: env.S3_PUBLIC_BASE_URL
-  });
+    // 初始化 S3 兼容对象存储（图片上传用）。MinIO 本地开发时自动创建 bucket。
+    await initS3Storage({
+      endpoint: env.S3_ENDPOINT,
+      region: env.S3_REGION,
+      bucket: env.S3_BUCKET,
+      accessKeyId: env.S3_ACCESS_KEY_ID,
+      secretAccessKey: env.S3_SECRET_ACCESS_KEY,
+      publicBaseUrl: env.S3_PUBLIC_BASE_URL
+    });
 
-  await app.register(multipart, {
-    limits: {
-      files: 1,
-      fileSize: 10 * 1024 * 1024
-    }
-  });
+    await app.register(multipart, {
+      limits: {
+        files: 1,
+        fileSize: 10 * 1024 * 1024
+      }
+    });
 
-  await app.register(fastifyStatic, {
-    root: uploadDirectory,
-    prefix: "/uploads/"
-  });
+    await app.register(fastifyStatic, {
+      root: uploadDirectory,
+      prefix: "/uploads/"
+    });
+  }
 
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof AppError) {
@@ -205,8 +215,39 @@ export async function buildApp(options: BuildAppOptions = {}) {
   let knowledgeRetriever: KnowledgeRetriever | undefined;
   let knowledgeStore: PostgresAgentStore | undefined;
   let knowledgeIndexQueue: KnowledgeIndexQueue | undefined;
+  let createdAuthUserStore: PostgresUserStore | undefined;
+  let authTokenService: AuthTokenService | undefined;
 
-  if (!coordinator) {
+  if (!options.skipAuth && (options.auth || !options.skipAgentRuntime)) {
+    createdAuthUserStore = options.auth
+      ? undefined
+      : await PostgresUserStore.create({ connectionString: options.databasePath ?? env.DATABASE_URL });
+    authTokenService =
+      options.auth?.tokenService ??
+      new AuthTokenService({
+        accessSecret: env.JWT_ACCESS_SECRET,
+        refreshSecret: env.JWT_REFRESH_SECRET,
+        accessTokenTtlSeconds: env.AUTH_ACCESS_TOKEN_TTL_SECONDS,
+        refreshTokenTtlSeconds: env.AUTH_REFRESH_TOKEN_TTL_SECONDS
+      });
+    await registerAuthRoutes(app, {
+      userStore: options.auth?.userStore ?? createdAuthUserStore!,
+      githubClient:
+        options.auth?.githubClient ??
+        new HttpGithubOAuthClient({
+          clientId: env.GITHUB_OAUTH_CLIENT_ID,
+          clientSecret: env.GITHUB_OAUTH_CLIENT_SECRET,
+          redirectUri: env.GITHUB_OAUTH_REDIRECT_URI
+        }),
+      tokenService: authTokenService
+    });
+    registerAuthGuard(app, { tokenService: authTokenService });
+    app.addHook("onClose", async () => {
+      await createdAuthUserStore?.close();
+    });
+  }
+
+  if (!coordinator && !options.skipAgentRuntime) {
     const agentStore = await PostgresAgentStore.create({
       connectionString: options.databasePath ?? env.DATABASE_URL,
       ...(env.AGENT_EMBEDDING_DIMENSION ? { vectorDimension: env.AGENT_EMBEDDING_DIMENSION } : {})
@@ -229,15 +270,18 @@ export async function buildApp(options: BuildAppOptions = {}) {
       knowledgeRetriever,
       jimengImage: {
         accessKeyId: env.VOLCENGINE_ACCESS_KEY_ID,
-        secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY
+        secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY,
+        uploadDirectory
       },
       jimengImageEdit: {
         accessKeyId: env.VOLCENGINE_ACCESS_KEY_ID,
-        secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY
+        secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY,
+        uploadDirectory
       },
       jimengVideo: {
         accessKeyId: env.VOLCENGINE_ACCESS_KEY_ID,
-        secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY
+        secretAccessKey: env.VOLCENGINE_SECRET_ACCESS_KEY,
+        uploadDirectory
       }
     });
     const toolExecutor = new ToolExecutor({
@@ -373,7 +417,8 @@ export async function buildApp(options: BuildAppOptions = {}) {
     });
   }
 
-  const staleCleanup = options.skipStaleCleanup ? undefined : await coordinator.cleanupStaleRunningExecutions();
+  const staleCleanup =
+    !coordinator || options.skipStaleCleanup ? undefined : await coordinator.cleanupStaleRunningExecutions();
 
   if (
     staleCleanup &&
@@ -387,7 +432,9 @@ export async function buildApp(options: BuildAppOptions = {}) {
   }
 
   await registerHealthRoutes(app);
-  await registerAgentRoutes(app, coordinator);
+  if (coordinator) {
+    await registerAgentRoutes(app, coordinator);
+  }
   if (knowledgeStore && knowledgeRetriever) {
     await registerKnowledgeRoutes(app, {
       uploadDirectory,

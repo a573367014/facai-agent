@@ -1,4 +1,6 @@
 import { createHash, createHmac } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { isAbsolute, join, normalize } from "node:path";
 import { z } from "zod";
 import { AppError } from "../errors/app-error.js";
 import type { JsonObject, RegisteredTool, ToolExecutionContext } from "./types.js";
@@ -13,8 +15,8 @@ const DEFAULT_FIRST_LAST_FRAME_REQ_KEY = "jimeng_i2v_first_tail_v30";
 const DEFAULT_SEED = -1;
 const DEFAULT_FRAMES = 121;
 const DEFAULT_ASPECT_RATIO = "16:9";
-const DEFAULT_POLL_INTERVAL_MS = 1500;
-const DEFAULT_MAX_POLL_ATTEMPTS = 80;
+const DEFAULT_POLL_INTERVAL_MS = 5000;
+const DEFAULT_MAX_POLL_ATTEMPTS = 72;
 const DEFAULT_TOOL_TIMEOUT_MS = 600000;
 
 const httpImageUrlSchema = z
@@ -98,6 +100,7 @@ export interface JimengVideoToolOptions {
   pollIntervalMs?: number;
   maxPollAttempts?: number;
   timeoutMs?: number;
+  uploadDirectory?: string;
   now?: () => Date;
   fetchImpl?: typeof fetch;
 }
@@ -140,11 +143,17 @@ function isLocalhost(hostname: string) {
 // 第三方服务（火山引擎）无法访问 localhost 地址的图片。
 // 如果图片 URL 是 localhost，服务端先 fetch 下载再转 base64 提交。
 // 生产环境用公网域名时（R2/CDN），火山引擎可以直接访问，不需要转 base64。
-async function tryReadLocalUploadAsBase64(imageUrl: string) {
+async function tryReadLocalUploadAsBase64(imageUrl: string, uploadDirectory?: string) {
   const parsedUrl = new URL(imageUrl);
 
   if (!isLocalhost(parsedUrl.hostname)) {
     return undefined;
+  }
+
+  const localUploadBase64 = await readLocalUploadFileAsBase64(parsedUrl, uploadDirectory);
+
+  if (localUploadBase64) {
+    return localUploadBase64;
   }
 
   const response = await fetch(imageUrl);
@@ -157,8 +166,26 @@ async function tryReadLocalUploadAsBase64(imageUrl: string) {
   return buffer.toString("base64");
 }
 
-async function toVideoFrameInput(frameUrls: string[]) {
-  const base64Frames = await Promise.all(frameUrls.map((url) => tryReadLocalUploadAsBase64(url)));
+async function readLocalUploadFileAsBase64(parsedUrl: URL, uploadDirectory?: string): Promise<string | undefined> {
+  if (!uploadDirectory || !parsedUrl.pathname.startsWith("/uploads/")) {
+    return undefined;
+  }
+
+  const relativePath = normalize(decodeURIComponent(parsedUrl.pathname.slice("/uploads/".length)));
+
+  if (relativePath === ".." || relativePath.startsWith("..") || isAbsolute(relativePath)) {
+    return undefined;
+  }
+
+  try {
+    return (await readFile(join(uploadDirectory, relativePath))).toString("base64");
+  } catch {
+    return undefined;
+  }
+}
+
+async function toVideoFrameInput(frameUrls: string[], uploadDirectory?: string) {
+  const base64Frames = await Promise.all(frameUrls.map((url) => tryReadLocalUploadAsBase64(url, uploadDirectory)));
 
   if (base64Frames.every(Boolean)) {
     return { binary_data_base64: base64Frames as string[] };
@@ -197,7 +224,7 @@ function selectVideoMode(
   };
 }
 
-async function toSubmitBody(args: VideoArgs, mode: VideoMode) {
+async function toSubmitBody(args: VideoArgs, mode: VideoMode, uploadDirectory?: string) {
   if (mode.type === "text_to_video") {
     return {
       req_key: mode.reqKey,
@@ -214,7 +241,7 @@ async function toSubmitBody(args: VideoArgs, mode: VideoMode) {
   return {
     req_key: mode.reqKey,
     prompt: args.prompt,
-    ...(await toVideoFrameInput(frameUrls)),
+    ...(await toVideoFrameInput(frameUrls, uploadDirectory)),
     seed: args.seed ?? DEFAULT_SEED,
     frames: args.frames ?? DEFAULT_FRAMES
   };
@@ -444,7 +471,11 @@ export function createJimengVideoTool(options: JimengVideoToolOptions): Register
   ): Promise<{ taskId: string; videoUrl: string }> => {
     // 即梦视频生成也是异步任务：提交后只拿 taskId，真正的视频 URL 要轮询获取。
     // 轮询过程使用 context.signal，所以用户取消 run 时这里会尽快停止等待。
-    const submitPayload = await request("CVSync2AsyncSubmitTask", await toSubmitBody(args, mode), context);
+    const submitPayload = await request(
+      "CVSync2AsyncSubmitTask",
+      await toSubmitBody(args, mode, options.uploadDirectory),
+      context
+    );
     ensureSuccessfulResponse(submitPayload, "提交任务");
 
     const taskId = submitPayload.data?.task_id ?? submitPayload.task_id;

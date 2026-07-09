@@ -1,7 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parseTraceId, resolveApiBaseUrl, startAgentRun, uploadAgentImage, uploadKnowledgeDocument } from "./agent-client";
+import {
+  clearAuthSession,
+  getGithubAuthorizeUrl,
+  loginWithGithubCode,
+  parseTraceId,
+  readAuthSession,
+  resolveApiBaseUrl,
+  startAgentRun,
+  uploadAgentImage,
+  uploadKnowledgeDocument,
+  writeAuthSession
+} from "./agent-client";
 
 afterEach(() => {
+  localStorage.clear();
   vi.restoreAllMocks();
 });
 
@@ -147,6 +159,130 @@ describe("resolveApiBaseUrl", () => {
     const result = await startAgentRun([{ type: "text", value: "你好" }], "session_1");
 
     expect(result.traceId).toBeUndefined();
+  });
+
+  it("登录成功后保存用户和 token，并让后续 API 自动带 Authorization", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            user: { id: "user_1", githubId: "9911", githubLogin: "octocat" },
+            accessToken: "access-token",
+            refreshToken: "refresh-token",
+            expiresIn: 900,
+            refreshTokenExpiresIn: 1296000
+          }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            run: { id: "run_1", sessionId: "session_1", status: "running", phase: "answering", userMessageId: "msg_user", createdAt: "2026-06-29T00:00:00.000Z", updatedAt: "2026-06-29T00:00:00.000Z" },
+            session: { id: "session_1", createdAt: "2026-06-29T00:00:00.000Z", updatedAt: "2026-06-29T00:00:00.000Z" },
+            userMessage: { id: "msg_user", sessionId: "session_1", role: "user", status: "completed", parts: [], createdAt: "2026-06-29T00:00:00.000Z", updatedAt: "2026-06-29T00:00:00.000Z" }
+          }),
+          { status: 202, headers: { "content-type": "application/json" } }
+        )
+      );
+
+    await loginWithGithubCode({ code: "github-code", redirectUri: "http://localhost:4000/auth/github/callback" });
+    await startAgentRun("你好");
+
+    expect(readAuthSession()?.user.githubLogin).toBe("octocat");
+    expect(fetchMock.mock.calls[1][1]?.headers).toEqual(
+      expect.objectContaining({
+        authorization: "Bearer access-token",
+        "content-type": "application/json"
+      })
+    );
+  });
+
+  it("accessToken 过期时用 refreshToken 刷新后重试原请求", async () => {
+    writeAuthSession({
+      user: { id: "user_1", githubId: "9911", githubLogin: "octocat" },
+      accessToken: "expired-access",
+      refreshToken: "refresh-token",
+      expiresIn: 900,
+      refreshTokenExpiresIn: 1296000
+    });
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: "AUTHENTICATION_ERROR", message: "expired" } }), {
+          status: 401,
+          headers: { "content-type": "application/json" }
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            accessToken: "fresh-access",
+            refreshToken: "fresh-refresh",
+            expiresIn: 900,
+            refreshTokenExpiresIn: 1296000
+          }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            run: { id: "run_1", sessionId: "session_1", status: "running", phase: "answering", userMessageId: "msg_user", createdAt: "2026-06-29T00:00:00.000Z", updatedAt: "2026-06-29T00:00:00.000Z" },
+            session: { id: "session_1", createdAt: "2026-06-29T00:00:00.000Z", updatedAt: "2026-06-29T00:00:00.000Z" },
+            userMessage: { id: "msg_user", sessionId: "session_1", role: "user", status: "completed", parts: [], createdAt: "2026-06-29T00:00:00.000Z", updatedAt: "2026-06-29T00:00:00.000Z" }
+          }),
+          { status: 202, headers: { "content-type": "application/json" } }
+        )
+      );
+
+    await startAgentRun("你好");
+
+    expect(fetchMock.mock.calls[0][1]?.headers).toEqual(
+      expect.objectContaining({
+        authorization: "Bearer expired-access"
+      })
+    );
+    expect(fetchMock.mock.calls[1]).toEqual([
+      "http://localhost:4001/auth/refresh",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ refreshToken: "refresh-token" })
+      })
+    ]);
+    expect(fetchMock.mock.calls[2][1]?.headers).toEqual(
+      expect.objectContaining({
+        authorization: "Bearer fresh-access"
+      })
+    );
+    expect(readAuthSession()?.refreshToken).toBe("fresh-refresh");
+  });
+
+  it("生成 GitHub OAuth 授权 URL", () => {
+    expect(
+      getGithubAuthorizeUrl({
+        clientId: "client-id",
+        redirectUri: "http://localhost:4000/auth/github/callback",
+        state: "state-1"
+      })
+    ).toBe(
+      "https://github.com/login/oauth/authorize?client_id=client-id&redirect_uri=http%3A%2F%2Flocalhost%3A4000%2Fauth%2Fgithub%2Fcallback&scope=read%3Auser+user%3Aemail&state=state-1"
+    );
+  });
+
+  it("clearAuthSession 清空本地登录态", () => {
+    writeAuthSession({
+      user: { id: "user_1", githubId: "9911", githubLogin: "octocat" },
+      accessToken: "access-token",
+      refreshToken: "refresh-token",
+      expiresIn: 900,
+      refreshTokenExpiresIn: 1296000
+    });
+
+    clearAuthSession();
+
+    expect(readAuthSession()).toBeUndefined();
   });
 });
 

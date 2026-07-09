@@ -818,7 +818,8 @@ describe("PostgresAgentStore", () => {
         eventBus: noopEventBus,
         runQueue: new NoopAgentRunQueue(),
         cancellationStore: new InMemoryAgentCancellationStore(),
-        runLock: new InMemoryAgentRunLock()
+        runLock: new InMemoryAgentRunLock(),
+        skipAuth: true
       });
       const response = await app.inject({
         method: "POST",

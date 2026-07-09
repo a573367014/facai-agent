@@ -44,6 +44,16 @@ afterEach(() => {
 describe("main", () => {
   it("入口初始化时只恢复一次事件流订阅", async () => {
     document.body.innerHTML = '<div id="root"></div>';
+    localStorage.setItem(
+      "agent.auth.session",
+      JSON.stringify({
+        user: { id: "user_test", githubId: "9911", githubLogin: "octocat" },
+        accessToken: "test-access-token",
+        refreshToken: "test-refresh-token",
+        expiresIn: 900,
+        refreshTokenExpiresIn: 1296000
+      })
+    );
     localStorage.setItem("agent.activeRunId", "msg_1");
 
     globalThis.fetch = vi.fn().mockImplementation((url: string) => {

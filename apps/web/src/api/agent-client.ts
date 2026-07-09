@@ -339,7 +339,36 @@ export interface ApiErrorResponse {
   };
 }
 
+export interface AuthUser {
+  id: string;
+  githubId: string;
+  githubLogin: string;
+  name?: string;
+  email?: string;
+  avatarUrl?: string;
+  githubUrl?: string;
+}
+
+export interface AuthSession {
+  user: AuthUser;
+  accessToken: string;
+  refreshToken: string;
+  expiresIn: number;
+  refreshTokenExpiresIn: number;
+}
+
+export interface AuthTokenPair {
+  accessToken: string;
+  refreshToken: string;
+  expiresIn: number;
+  refreshTokenExpiresIn: number;
+}
+
+export type GithubLoginResponse = AuthSession;
+
 const defaultApiPort = "4001";
+const authSessionStorageKey = "agent.auth.session";
+export const authSessionChangedEvent = "agent-auth-session-changed";
 
 export function resolveApiBaseUrl(configuredBaseUrl?: string, pageHref = window.location.href): string {
   const pageUrl = new URL(pageHref);
@@ -377,6 +406,147 @@ function trimTrailingSlash(value: string) {
 }
 
 export const apiBaseUrl = resolveApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
+
+export function readAuthSession(): AuthSession | undefined {
+  try {
+    const value = localStorage.getItem(authSessionStorageKey);
+
+    if (!value) {
+      return undefined;
+    }
+
+    const session = JSON.parse(value) as Partial<AuthSession>;
+
+    if (
+      !session.user ||
+      typeof session.accessToken !== "string" ||
+      typeof session.refreshToken !== "string" ||
+      typeof session.user.id !== "string" ||
+      typeof session.user.githubId !== "string" ||
+      typeof session.user.githubLogin !== "string"
+    ) {
+      return undefined;
+    }
+
+    return session as AuthSession;
+  } catch {
+    return undefined;
+  }
+}
+
+export function writeAuthSession(session: AuthSession): void {
+  localStorage.setItem(authSessionStorageKey, JSON.stringify(session));
+  window.dispatchEvent(new Event(authSessionChangedEvent));
+}
+
+export function clearAuthSession(): void {
+  localStorage.removeItem(authSessionStorageKey);
+  window.dispatchEvent(new Event(authSessionChangedEvent));
+}
+
+export function getGithubAuthorizeUrl(input: { clientId: string; redirectUri: string; state: string }): string {
+  const url = new URL("https://github.com/login/oauth/authorize");
+  url.searchParams.set("client_id", input.clientId);
+  url.searchParams.set("redirect_uri", input.redirectUri);
+  url.searchParams.set("scope", "read:user user:email");
+  url.searchParams.set("state", input.state);
+  return url.toString();
+}
+
+export async function loginWithGithubCode(input: { code: string; redirectUri?: string }): Promise<AuthSession> {
+  const response = await fetch(`${apiBaseUrl}/auth/github/login`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(input)
+  });
+  const payload = (await response.json()) as GithubLoginResponse | ApiErrorResponse;
+
+  if (!response.ok) {
+    const errorPayload = payload as ApiErrorResponse;
+    throw new Error(`${errorPayload.error.code}: ${errorPayload.error.message}`);
+  }
+
+  const session = payload as GithubLoginResponse;
+  writeAuthSession(session);
+  return session;
+}
+
+async function refreshAuthSession(): Promise<AuthSession | undefined> {
+  const currentSession = readAuthSession();
+
+  if (!currentSession) {
+    return undefined;
+  }
+
+  const response = await fetch(`${apiBaseUrl}/auth/refresh`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ refreshToken: currentSession.refreshToken })
+  });
+
+  if (!response.ok) {
+    clearAuthSession();
+    return undefined;
+  }
+
+  const tokenPair = (await response.json()) as AuthTokenPair;
+  const nextSession: AuthSession = {
+    ...currentSession,
+    ...tokenPair
+  };
+  writeAuthSession(nextSession);
+  return nextSession;
+}
+
+async function authenticatedFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const firstResponse = await fetch(input, withAuthHeader(init));
+
+  if (firstResponse.status !== 401 || !readAuthSession()) {
+    return firstResponse;
+  }
+
+  const refreshedSession = await refreshAuthSession();
+
+  if (!refreshedSession) {
+    return firstResponse;
+  }
+
+  return fetch(input, withAuthHeader(init, refreshedSession.accessToken));
+}
+
+function withAuthHeader(init?: RequestInit, accessToken = readAuthSession()?.accessToken): RequestInit | undefined {
+  if (!accessToken) {
+    return init;
+  }
+
+  return {
+    ...init,
+    headers: {
+      ...headersToObject(init?.headers),
+      authorization: `Bearer ${accessToken}`
+    }
+  };
+}
+
+function headersToObject(headers: HeadersInit | undefined): Record<string, string> {
+  if (!headers) {
+    return {};
+  }
+
+  if (headers instanceof Headers) {
+    return Object.fromEntries(headers.entries());
+  }
+
+  if (Array.isArray(headers)) {
+    return Object.fromEntries(headers);
+  }
+
+  return { ...headers };
+}
 
 // W3C traceparent 响应头格式：00-{traceId(32hex)}-{spanId(16hex)}-{traceFlags(2hex)}
 // 解析出中间的 traceId，用于去 Jaeger/SigNoz 搜索完整链路。
@@ -418,7 +588,7 @@ export async function startAgentRun(
   // 新流程统一从 run 开始：一次用户提交会创建 user message + run，
   // assistant/system 消息由后端执行过程中通过 SSE 逐步推给前端。
   const requestPayload = Array.isArray(input) ? { parts: input, sessionId } : { input, sessionId };
-  const response = await fetch(`${apiBaseUrl}/agents/runs`, {
+  const response = await authenticatedFetch(`${apiBaseUrl}/agents/runs`, {
     method: "POST",
     headers: {
       "content-type": "application/json"
@@ -436,12 +606,12 @@ export async function startAgentRun(
   const successPayload = payload as StartAgentRunResponse;
   // traceId 来自响应头 traceparent，后端 OTel 未启用时为 undefined。
   // 这里把它附到响应体上，方便调用方按需取用，不必直接读 header。
-  successPayload.traceId = parseTraceId(response.headers.get("traceparent"));
+  successPayload.traceId = parseTraceId(response.headers?.get("traceparent") ?? null);
   return successPayload;
 }
 
 export async function regenerateAgentMessage(messageId: string): Promise<RegenerateAgentMessageResponse> {
-  const response = await fetch(`${apiBaseUrl}/agents/messages/${messageId}/regenerate`, {
+  const response = await authenticatedFetch(`${apiBaseUrl}/agents/messages/${messageId}/regenerate`, {
     method: "POST"
   });
   const payload = (await response.json()) as RegenerateAgentMessageResponse | ApiErrorResponse;
@@ -452,12 +622,12 @@ export async function regenerateAgentMessage(messageId: string): Promise<Regener
   }
 
   const successPayload = payload as RegenerateAgentMessageResponse;
-  successPayload.traceId = parseTraceId(response.headers.get("traceparent"));
+  successPayload.traceId = parseTraceId(response.headers?.get("traceparent") ?? null);
   return successPayload;
 }
 
 export async function getAgentSession(sessionId: string): Promise<AgentSessionResponse> {
-  const response = await fetch(`${apiBaseUrl}/agents/sessions/${sessionId}`);
+  const response = await authenticatedFetch(`${apiBaseUrl}/agents/sessions/${sessionId}`);
   const payload = (await response.json()) as AgentSessionResponse | ApiErrorResponse;
 
   if (!response.ok) {
@@ -483,7 +653,7 @@ export async function getAgentSessionMessages(
   }
 
   const queryString = query.toString();
-  const response = await fetch(`${apiBaseUrl}/agents/sessions/${sessionId}/messages${queryString ? `?${queryString}` : ""}`);
+  const response = await authenticatedFetch(`${apiBaseUrl}/agents/sessions/${sessionId}/messages${queryString ? `?${queryString}` : ""}`);
   const payload = (await response.json()) as AgentSessionMessagesResponse | ApiErrorResponse;
 
   if (!response.ok) {
@@ -506,7 +676,7 @@ export async function listAgentSessions(options: { after?: string; limit?: numbe
   }
 
   const queryString = query.toString();
-  const response = await fetch(`${apiBaseUrl}/agents/sessions${queryString ? `?${queryString}` : ""}`);
+  const response = await authenticatedFetch(`${apiBaseUrl}/agents/sessions${queryString ? `?${queryString}` : ""}`);
   const payload = (await response.json()) as AgentSessionsResponse | ApiErrorResponse;
 
   if (!response.ok) {
@@ -518,7 +688,7 @@ export async function listAgentSessions(options: { after?: string; limit?: numbe
 }
 
 export async function deleteAgentSession(sessionId: string): Promise<void> {
-  const response = await fetch(`${apiBaseUrl}/agents/sessions/${sessionId}`, {
+  const response = await authenticatedFetch(`${apiBaseUrl}/agents/sessions/${sessionId}`, {
     method: "DELETE"
   });
 
@@ -529,7 +699,7 @@ export async function deleteAgentSession(sessionId: string): Promise<void> {
 }
 
 export async function getAgentMessage(messageId: string): Promise<AgentMessageDetailResponse> {
-  const response = await fetch(`${apiBaseUrl}/agents/messages/${messageId}`);
+  const response = await authenticatedFetch(`${apiBaseUrl}/agents/messages/${messageId}`);
   const payload = (await response.json()) as AgentMessageDetailResponse | ApiErrorResponse;
 
   if (!response.ok) {
@@ -541,7 +711,7 @@ export async function getAgentMessage(messageId: string): Promise<AgentMessageDe
 }
 
 export async function getAgentRun(runId: string): Promise<AgentRunDetailResponse> {
-  const response = await fetch(`${apiBaseUrl}/agents/runs/${runId}`);
+  const response = await authenticatedFetch(`${apiBaseUrl}/agents/runs/${runId}`);
   const payload = (await response.json()) as AgentRunDetailResponse | ApiErrorResponse;
 
   if (!response.ok) {
@@ -553,7 +723,7 @@ export async function getAgentRun(runId: string): Promise<AgentRunDetailResponse
 }
 
 export async function cancelAgentRun(runId: string): Promise<CancelAgentRunResponse> {
-  const response = await fetch(`${apiBaseUrl}/agents/runs/${runId}/cancel`, {
+  const response = await authenticatedFetch(`${apiBaseUrl}/agents/runs/${runId}/cancel`, {
     method: "POST"
   });
   const payload = (await response.json()) as CancelAgentRunResponse | ApiErrorResponse;
@@ -570,7 +740,7 @@ export async function uploadAgentImage(file: File): Promise<MediaPart> {
   const body = new FormData();
   body.append("image", file);
 
-  const response = await fetch(`${apiBaseUrl}/agents/uploads/images`, {
+  const response = await authenticatedFetch(`${apiBaseUrl}/agents/uploads/images`, {
     method: "POST",
     body
   });
@@ -585,7 +755,7 @@ export async function uploadAgentImage(file: File): Promise<MediaPart> {
 }
 
 export async function listKnowledgeDocuments(): Promise<KnowledgeDocumentRecord[]> {
-  const response = await fetch(`${apiBaseUrl}/knowledge/documents`);
+  const response = await authenticatedFetch(`${apiBaseUrl}/knowledge/documents`);
   const payload = (await response.json()) as KnowledgeDocumentsResponse | ApiErrorResponse;
 
   if (!response.ok) {
@@ -600,7 +770,7 @@ export async function uploadKnowledgeDocument(file: File): Promise<KnowledgeDocu
   const body = new FormData();
   body.append("document", file);
 
-  const response = await fetch(`${apiBaseUrl}/knowledge/documents/upload`, {
+  const response = await authenticatedFetch(`${apiBaseUrl}/knowledge/documents/upload`, {
     method: "POST",
     body
   });
@@ -615,7 +785,7 @@ export async function uploadKnowledgeDocument(file: File): Promise<KnowledgeDocu
 }
 
 export async function deleteKnowledgeDocument(documentId: string): Promise<void> {
-  const response = await fetch(`${apiBaseUrl}/knowledge/documents/${documentId}`, {
+  const response = await authenticatedFetch(`${apiBaseUrl}/knowledge/documents/${documentId}`, {
     method: "DELETE"
   });
 
@@ -626,7 +796,7 @@ export async function deleteKnowledgeDocument(documentId: string): Promise<void>
 }
 
 export async function reindexKnowledgeDocument(documentId: string): Promise<KnowledgeDocumentRecord> {
-  const response = await fetch(`${apiBaseUrl}/knowledge/documents/${documentId}/reindex`, {
+  const response = await authenticatedFetch(`${apiBaseUrl}/knowledge/documents/${documentId}/reindex`, {
     method: "POST"
   });
   const payload = (await response.json()) as KnowledgeDocumentResponse | ApiErrorResponse;
@@ -640,7 +810,7 @@ export async function reindexKnowledgeDocument(documentId: string): Promise<Know
 }
 
 export async function searchKnowledge(query: string, limit = 5): Promise<KnowledgeSearchResult[]> {
-  const response = await fetch(`${apiBaseUrl}/knowledge/search`, {
+  const response = await authenticatedFetch(`${apiBaseUrl}/knowledge/search`, {
     method: "POST",
     headers: {
       "content-type": "application/json"
@@ -662,7 +832,7 @@ export async function streamAgentRunEvents(
   onEvent: (event: StoredAgentEvent) => void,
   signal?: AbortSignal
 ): Promise<void> {
-  const response = await fetch(`${apiBaseUrl}/agents/runs/${runId}/stream`, {
+  const response = await authenticatedFetch(`${apiBaseUrl}/agents/runs/${runId}/stream`, {
     signal,
     headers: {
       accept: "text/event-stream"

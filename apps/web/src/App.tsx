@@ -2,9 +2,11 @@ import { Box, Chip, IconButton, Paper, Typography } from "@mui/material";
 import { ChevronsLeft, ChevronsRight } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  apiBaseUrl,
+  authSessionChangedEvent,
   cancelAgentRun,
+  clearAuthSession,
   deleteAgentSession,
+  getGithubAuthorizeUrl,
   getAgentRun,
   getAgentSession,
   getAgentSessionMessages,
@@ -13,6 +15,8 @@ import {
   regenerateAgentMessage,
   deleteKnowledgeDocument,
   reindexKnowledgeDocument,
+  loginWithGithubCode,
+  readAuthSession,
   startAgentRun,
   streamAgentRunEvents,
   uploadAgentImage,
@@ -43,6 +47,8 @@ const runningRunsBySessionKey = "agent.runningRunsBySession";
 const sessionIdQueryKey = "sessionId";
 const defaultMessagePageLimit = 30;
 const defaultSessionPageLimit = 30;
+const githubOAuthClientId = import.meta.env.VITE_GITHUB_OAUTH_CLIENT_ID?.trim() ?? "";
+const configuredGithubRedirectUri = import.meta.env.VITE_GITHUB_OAUTH_REDIRECT_URI?.trim();
 
 type ResourceMap = Record<string, AgentResourceRecord>;
 type RunningRunState = { runId: string };
@@ -92,6 +98,10 @@ function writeRunningRunsBySession(runningRuns: RunningRunsBySession) {
 
 function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === "AbortError";
+}
+
+function getGithubRedirectUri() {
+  return configuredGithubRedirectUri || `${window.location.origin}/auth/github/callback`;
 }
 
 function toChatMessageStatus(status: AgentMessageRecord["status"]): ChatMessage["status"] {
@@ -626,7 +636,8 @@ export default function App() {
   const [isKnowledgeUploading, setIsKnowledgeUploading] = useState(false);
   const [knowledgeError, setKnowledgeError] = useState<string | null>(null);
   const [events, setEvents] = useState<AgentStreamEvent[]>([]);
-  const [health, setHealth] = useState("检查中");
+  const [authSession, setAuthSession] = useState(() => readAuthSession());
+  const [authError, setAuthError] = useState<string | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | undefined>(() => readSessionIdFromUrl());
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<AgentSessionRecord[]>([]);
@@ -643,6 +654,12 @@ export default function App() {
   // React state 在闭包里可能是旧值，ref.current 可以避免旧流把事件写进新的会话。
 
   const loadKnowledgeDocuments = useCallback(async () => {
+    if (!authSession) {
+      setKnowledgeDocuments([]);
+      setKnowledgeError(null);
+      return;
+    }
+
     setIsKnowledgeLoading(true);
     setKnowledgeError(null);
 
@@ -653,10 +670,15 @@ export default function App() {
     } finally {
       setIsKnowledgeLoading(false);
     }
-  }, []);
+  }, [authSession]);
 
   const handleUploadKnowledgeDocument = useCallback(
     async (file: File) => {
+      if (!authSession) {
+        setKnowledgeError("请先登录 GitHub");
+        return;
+      }
+
       setIsKnowledgeUploading(true);
       setKnowledgeError(null);
 
@@ -669,11 +691,16 @@ export default function App() {
         setIsKnowledgeUploading(false);
       }
     },
-    [loadKnowledgeDocuments]
+    [authSession, loadKnowledgeDocuments]
   );
 
   const handleDeleteKnowledgeDocument = useCallback(
     async (documentId: string) => {
+      if (!authSession) {
+        setKnowledgeError("请先登录 GitHub");
+        return;
+      }
+
       setKnowledgeError(null);
 
       try {
@@ -683,11 +710,16 @@ export default function App() {
         setKnowledgeError(deleteError instanceof Error ? deleteError.message : "知识库删除失败");
       }
     },
-    [loadKnowledgeDocuments]
+    [authSession, loadKnowledgeDocuments]
   );
 
   const handleReindexKnowledgeDocument = useCallback(
     async (documentId: string) => {
+      if (!authSession) {
+        setKnowledgeError("请先登录 GitHub");
+        return;
+      }
+
       setKnowledgeError(null);
 
       try {
@@ -697,32 +729,78 @@ export default function App() {
         setKnowledgeError(reindexError instanceof Error ? reindexError.message : "知识库重新索引失败");
       }
     },
-    [loadKnowledgeDocuments]
+    [authSession, loadKnowledgeDocuments]
   );
 
   useEffect(() => {
-    const controller = new AbortController();
+    const syncAuthSession = () => {
+      setAuthSession(readAuthSession());
+    };
 
-    fetch(`${apiBaseUrl}/health`, {
-      signal: controller.signal
-    })
-      .then((response) => setHealth(response.ok ? "正常" : "异常"))
-      .catch((healthError) => {
-        if (!isAbortError(healthError)) {
-          setHealth("异常");
-        }
-      });
-
+    window.addEventListener(authSessionChangedEvent, syncAuthSession);
+    window.addEventListener("storage", syncAuthSession);
     return () => {
-      controller.abort();
+      window.removeEventListener(authSessionChangedEvent, syncAuthSession);
+      window.removeEventListener("storage", syncAuthSession);
     };
   }, []);
 
   useEffect(() => {
-    void loadKnowledgeDocuments();
-  }, [loadKnowledgeDocuments]);
+    const url = new URL(window.location.href);
+
+    if (url.pathname !== "/auth/github/callback") {
+      return;
+    }
+
+    const code = url.searchParams.get("code");
+
+    if (!code) {
+      setAuthError("GitHub 登录回调缺少 code");
+      return;
+    }
+
+    let cancelled = false;
+    setAuthError(null);
+
+    loginWithGithubCode({
+      code,
+      redirectUri: getGithubRedirectUri()
+    })
+      .then((session) => {
+        if (cancelled) {
+          return;
+        }
+
+        setAuthSession(session);
+        window.history.replaceState(null, "", "/");
+      })
+      .catch((loginError) => {
+        if (!cancelled) {
+          setAuthError(loginError instanceof Error ? loginError.message : "GitHub 登录失败");
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
+    if (!authSession) {
+      setKnowledgeDocuments([]);
+      return;
+    }
+
+    void loadKnowledgeDocuments();
+  }, [authSession, loadKnowledgeDocuments]);
+
+  useEffect(() => {
+    if (!authSession) {
+      setSessions([]);
+      setSessionPageInfo(createDefaultSessionPageInfo());
+      return;
+    }
+
     let cancelled = false;
 
     listAgentSessions()
@@ -742,9 +820,13 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [authSession]);
 
   useEffect(() => {
+    if (!authSession) {
+      return;
+    }
+
     const sessionId = readSessionIdFromUrl();
 
     if (!sessionId) {
@@ -778,9 +860,13 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [authSession]);
 
   useEffect(() => {
+    if (!authSession) {
+      return;
+    }
+
     const storedActiveRunId = localStorage.getItem(activeRunIdKey);
 
     if (!storedActiveRunId) {
@@ -855,7 +941,7 @@ export default function App() {
       cancelled = true;
       controller.abort();
     };
-  }, []);
+  }, [authSession]);
 
   function clearActiveRun() {
     activeRunIdRef.current = null;
@@ -1222,6 +1308,11 @@ export default function App() {
   }
 
   async function handleSubmitMessage() {
+    if (!authSession) {
+      setError("请先登录 GitHub");
+      return;
+    }
+
     const submittedParts = stripRuntimeFields(composerParts).filter(
       (part) => part.type === "media" || (part.type === "text" && part.value.trim())
     );
@@ -1272,6 +1363,11 @@ export default function App() {
   }
 
   async function handleRegenerateMessage(messageId: string) {
+    if (!authSession) {
+      setError("请先登录 GitHub");
+      return;
+    }
+
     if (activeRunId) {
       // 重新生成本质上也是启动一个新的 run，所以同样先释放旧 run。
       await cancelActiveRun({ refreshAfterCancel: false, settleStreaming: false });
@@ -1356,6 +1452,11 @@ export default function App() {
   }
 
   async function handleSelectSession(sessionId: string) {
+    if (!authSession) {
+      setError("请先登录 GitHub");
+      return;
+    }
+
     if (sessionId === activeSessionId) {
       return;
     }
@@ -1388,6 +1489,10 @@ export default function App() {
   }
 
   async function handleLoadMoreSessions() {
+    if (!authSession) {
+      return;
+    }
+
     const after = sessionPageInfo.nextCursor;
 
     if (!after || !sessionPageInfo.hasMore || isLoadingMoreSessions) {
@@ -1414,6 +1519,11 @@ export default function App() {
   }
 
   async function handleDeleteSession(sessionId: string) {
+    if (!authSession) {
+      setError("请先登录 GitHub");
+      return;
+    }
+
     setDeletingSessionIds((currentIds) => new Set(currentIds).add(sessionId));
     setError(null);
     forgetRunningRunForSession(sessionId);
@@ -1443,6 +1553,11 @@ export default function App() {
   }
 
   async function handleLoadOlderMessages() {
+    if (!authSession) {
+      setError("请先登录 GitHub");
+      return;
+    }
+
     const sessionId = activeSessionId ?? readSessionIdFromUrl();
     const before = messagePageInfo.nextCursor;
 
@@ -1470,6 +1585,7 @@ export default function App() {
   }
 
   const historyItems = buildHistoryItems(sessions);
+  const displayError = authError ?? error ?? (!authSession ? "请先登录 GitHub" : null);
   const workspaceClassName = [
     "workspace",
     isSessionSidebarCollapsed ? "sidebar-collapsed" : null,
@@ -1478,21 +1594,45 @@ export default function App() {
     .filter(Boolean)
     .join(" ");
 
+  function handleGithubLogin() {
+    if (!githubOAuthClientId) {
+      setAuthError("缺少 VITE_GITHUB_OAUTH_CLIENT_ID 配置");
+      return;
+    }
+
+    window.location.href = getGithubAuthorizeUrl({
+      clientId: githubOAuthClientId,
+      redirectUri: getGithubRedirectUri(),
+      state: crypto.randomUUID()
+    });
+  }
+
+  function handleLogout() {
+    clearAuthSession();
+    setAuthSession(undefined);
+    resetToNewSession();
+    setSessions([]);
+    setKnowledgeDocuments([]);
+  }
+
   return (
     <Box component="main" className="app-shell fullscreen-shell">
       <Box className={workspaceClassName}>
         <SessionSidebar
           activeSessionId={activeSessionId}
-          health={health}
           historyItems={historyItems}
           isCollapsed={isSessionSidebarCollapsed}
           hasMoreSessions={sessionPageInfo.hasMore}
           isLoadingMoreSessions={isLoadingMoreSessions}
           deletingSessionIds={deletingSessionIds}
+          githubLogin={authSession?.user.githubLogin}
+          isGithubLoginConfigured={Boolean(githubOAuthClientId)}
           onNewSession={handleNewSession}
           onSelectSession={handleSelectSession}
           onLoadMoreSessions={handleLoadMoreSessions}
           onDeleteSession={handleDeleteSession}
+          onGithubLogin={handleGithubLogin}
+          onLogout={handleLogout}
         />
 
         <Box component="section" className="chat-main response-column">
@@ -1538,7 +1678,7 @@ export default function App() {
             messages={messages}
             resourcesById={resourcesById}
             isActive={isStreaming}
-            error={error}
+            error={displayError}
             hasMoreMessages={messagePageInfo.hasMore}
             isLoadingOlderMessages={isLoadingOlderMessages}
             onLoadOlderMessages={handleLoadOlderMessages}

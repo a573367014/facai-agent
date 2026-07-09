@@ -15,6 +15,9 @@ import { AgentSummaryService } from "../../src/agent/agent-summary-service.js";
 import { InMemoryRunningMessageStateStore } from "../../src/agent/running-message-state-store.js";
 import { PostgresAgentStore } from "../../src/agent/postgres-agent-store.js";
 import { buildApp } from "../../src/app.js";
+import { AuthTokenService } from "../../src/auth/auth-token-service.js";
+import type { GithubOAuthClient } from "../../src/auth/github-oauth-client.js";
+import { InMemoryUserStore } from "../../src/auth/user-store.js";
 import { LangChainAgentService } from "../../src/langchain/langchain-agent-service.js";
 import type { LlmProvider } from "../../src/providers/types.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
@@ -52,6 +55,12 @@ class CapturingAgentRunQueue implements AgentRunQueue {
   }
 }
 
+class UnusedGithubOAuthClient implements GithubOAuthClient {
+  async getUserProfile(): Promise<never> {
+    throw new Error("GitHub OAuth client should not be used by route authorization tests");
+  }
+}
+
 type TestFastifyApp = FastifyInstance & {
   agentCoordinator?: AgentMessageCoordinator;
   testRunQueue: CapturingAgentRunQueue;
@@ -66,11 +75,68 @@ async function buildTestApp(options: Parameters<typeof buildApp>[0]) {
     runQueue: testRunQueue,
     cancellationStore: options.cancellationStore ?? new InMemoryAgentCancellationStore(),
     runLock: options.runLock ?? new InMemoryAgentRunLock(),
-    databasePath: TEST_DATABASE_URL
+    databasePath: TEST_DATABASE_URL,
+    skipAuth: true
   }) as TestFastifyApp;
   app.testRunQueue = testRunQueue;
   apps.push(app);
   return app;
+}
+
+function createAuthTokenService() {
+  return new AuthTokenService({
+    accessSecret: "access-secret",
+    refreshSecret: "refresh-secret",
+    accessTokenTtlSeconds: 900,
+    refreshTokenTtlSeconds: 15 * 24 * 60 * 60
+  });
+}
+
+function createAuthHeaders(tokenService: AuthTokenService, userId: string, githubLogin: string) {
+  const token = tokenService.issueTokenPair({
+    userId,
+    githubId: `${userId}_github`,
+    githubLogin
+  }).accessToken;
+
+  return {
+    authorization: `Bearer ${token}`
+  };
+}
+
+async function buildAuthenticatedAgentTestApp() {
+  const testRunQueue = new CapturingAgentRunQueue();
+  const coordinator = new AgentMessageCoordinator(
+    createTestAgentService(),
+    resetStore,
+    new AgentContextBuilder(),
+    undefined,
+    new InMemoryRunningMessageStateStore(),
+    undefined,
+    {
+      eventBus: noopEventBus,
+      runQueue: testRunQueue,
+      cancellationStore: new InMemoryAgentCancellationStore(),
+      runLock: new InMemoryAgentRunLock()
+    }
+  );
+  const tokenService = createAuthTokenService();
+  const app = (await buildApp({
+    coordinator,
+    skipAgentRuntime: true,
+    auth: {
+      userStore: new InMemoryUserStore(),
+      githubClient: new UnusedGithubOAuthClient(),
+      tokenService
+    }
+  })) as TestFastifyApp;
+  app.testRunQueue = testRunQueue;
+  apps.push(app);
+
+  return {
+    app,
+    headersFor: (userId: string, githubLogin: string) => createAuthHeaders(tokenService, userId, githubLogin)
+  };
 }
 
 class FailingRunningMessageStateStore extends InMemoryRunningMessageStateStore {
@@ -189,6 +255,67 @@ function parseSseEvents(body: string) {
 }
 
 describe("agent routes", () => {
+  it("按登录用户隔离会话、run 和消息快照", async () => {
+    const { app, headersFor } = await buildAuthenticatedAgentTestApp();
+    const aliceHeaders = headersFor("user_alice", "alice");
+    const bobHeaders = headersFor("user_bob", "bob");
+
+    const createSessionResponse = await app.inject({
+      method: "POST",
+      url: "/agents/sessions",
+      headers: aliceHeaders,
+      payload: { title: "Alice 的会话" }
+    });
+    const { session } = createSessionResponse.json() as { session: { id: string } };
+
+    const aliceListResponse = await app.inject({ method: "GET", url: "/agents/sessions", headers: aliceHeaders });
+    const bobListResponse = await app.inject({ method: "GET", url: "/agents/sessions", headers: bobHeaders });
+
+    expect(createSessionResponse.statusCode).toBe(201);
+    expect((aliceListResponse.json() as { sessions: Array<{ id: string }> }).sessions.map((item) => item.id)).toEqual([
+      session.id
+    ]);
+    expect((bobListResponse.json() as { sessions: Array<{ id: string }> }).sessions).toEqual([]);
+
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/agents/sessions/${session.id}`,
+          headers: bobHeaders
+        })
+      ).statusCode
+    ).toBe(404);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/agents/sessions/${session.id}/runs`,
+          headers: bobHeaders,
+          payload: { input: "尝试写入别人会话" }
+        })
+      ).statusCode
+    ).toBe(404);
+
+    const runResponse = await app.inject({
+      method: "POST",
+      url: `/agents/sessions/${session.id}/runs`,
+      headers: aliceHeaders,
+      payload: { input: "你好" }
+    });
+    const { run } = runResponse.json() as { run: { id: string; assistantMessageId: string } };
+
+    expect(runResponse.statusCode).toBe(202);
+    expect((await app.inject({ method: "GET", url: `/agents/runs/${run.id}`, headers: aliceHeaders })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: `/agents/runs/${run.id}`, headers: bobHeaders })).statusCode).toBe(404);
+    expect(
+      (await app.inject({ method: "GET", url: `/agents/messages/${run.assistantMessageId}`, headers: bobHeaders })).statusCode
+    ).toBe(404);
+    expect(
+      (await app.inject({ method: "POST", url: `/agents/runs/${run.id}/cancel`, headers: bobHeaders })).statusCode
+    ).toBe(404);
+  });
+
   it("执行 run 不再写入本地 JSONL 日志", async () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-event-log-"));
     tempDirs.push(dir);
@@ -650,7 +777,8 @@ describe("agent routes", () => {
       eventBus: noopEventBus,
       runQueue: new CapturingAgentRunQueue(),
       cancellationStore: new InMemoryAgentCancellationStore(),
-      runLock: new InMemoryAgentRunLock()
+      runLock: new InMemoryAgentRunLock(),
+      skipAuth: true
     });
     apps.push(app);
     const response = await app.inject({
@@ -742,7 +870,7 @@ describe("agent routes", () => {
         triggerCharacterCount: 0
       })
     );
-    const app = await buildApp({ coordinator });
+    const app = await buildApp({ coordinator, skipAuth: true });
     apps.push(app);
 
     try {
@@ -861,7 +989,7 @@ describe("agent routes", () => {
       store,
       new AgentContextBuilder({ maxHistoryMessages: 10 })
     );
-    const app = await buildApp({ coordinator });
+    const app = await buildApp({ coordinator, skipAuth: true });
     apps.push(app);
 
     const response = await app.inject({

@@ -19,6 +19,10 @@
 - `AGENT_WORKER_CONCURRENCY`：Worker 同时执行 run 的数量，默认 `2`。
 - `DATABASE_URL`：PostgreSQL 连接串，默认 `postgres://postgres:postgres@localhost:5432/agent`。需要安装 pgvector 扩展。
 - `AGENT_UPLOAD_DIR`：用户上传和工具资源转储目录，默认 `./data/uploads`。
+- `GITHUB_OAUTH_CLIENT_ID`、`GITHUB_OAUTH_CLIENT_SECRET`、`GITHUB_OAUTH_REDIRECT_URI`：GitHub OAuth 登录配置。兼容旧的 `GITHUB_CLIENT_ID`、`GITHUB_CLIENT_SECRET`、`GITHUB_REDIRECT_URI` 命名。
+- `VITE_GITHUB_OAUTH_CLIENT_ID`、`VITE_GITHUB_OAUTH_REDIRECT_URI`：前端跳转 GitHub OAuth 授权页使用；client id 是公开值，client secret 只放后端环境变量。
+- `JWT_ACCESS_SECRET`、`JWT_REFRESH_SECRET`：JWT 签名密钥；生产环境必须使用不同的长随机字符串。
+- `AUTH_ACCESS_TOKEN_TTL_SECONDS`、`AUTH_REFRESH_TOKEN_TTL_SECONDS`：JWT 过期时间，access token 默认 15 分钟，refresh token 默认 15 天（`1296000` 秒）。
 - `TAVILY_API_KEY`：配置后启用 `web_search` 工具。
 - `VOLCENGINE_ACCESS_KEY_ID`、`VOLCENGINE_SECRET_ACCESS_KEY`：同时配置后启用图片 / 视频生成工具。
 - `AGENT_ALLOWED_TOOLS`：允许暴露和执行的工具名，逗号分隔；留空表示允许全部已注册工具。

@@ -149,7 +149,6 @@ button:not(:disabled):hover {
   color: var(--eye-muted);
 }
 
-.status,
 .generation-badge,
 .count-pill,
 .iteration-pill {
@@ -167,7 +166,6 @@ button:not(:disabled):hover {
   white-space: nowrap;
 }
 
-.status.ok,
 .generation-badge.done,
 .generation-badge.answering {
   border-color: #b8d2a6;
@@ -540,6 +538,42 @@ button:not(:disabled):hover {
   padding-top: 12px;
 }
 
+.sidebar-auth-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.sidebar-auth-chip.sidebar-auth-chip {
+  max-width: 100%;
+  justify-content: flex-start;
+}
+
+.sidebar-auth-chip .MuiChip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sidebar-auth-logout.sidebar-auth-logout.MuiIconButton-root {
+  width: 34px;
+  height: 34px;
+  border: 1px solid #deded9;
+  border-radius: 8px;
+  background: #fffdfa;
+  color: #777770;
+}
+
+.sidebar-auth-logout.sidebar-auth-logout.MuiIconButton-root:hover {
+  border-color: #c9d8bd;
+  background: #edf3e8;
+  color: var(--eye-primary-strong);
+}
+
+.sidebar-github-login-button.sidebar-github-login-button.MuiButton-root {
+  justify-content: flex-start;
+}
+
 .chat-main {
   background: #f7f7f5;
 }
@@ -591,6 +625,27 @@ button:not(:disabled):hover {
 
 .chat-header-side .generation-badge {
   flex: 0 0 auto;
+}
+
+.auth-chip.auth-chip {
+  max-width: 160px;
+  border-color: #d2d2cc;
+  background: #fffdfa;
+  color: #4d4d47;
+  font-weight: 700;
+}
+
+.github-login-button.github-login-button {
+  min-height: 38px;
+  border-color: #d2d2cc;
+  border-radius: 8px;
+  color: #2f3028;
+  text-transform: none;
+}
+
+.github-login-button.github-login-button:hover {
+  border-color: #c9d8bd;
+  background: #edf3e8;
 }
 
 .panel {

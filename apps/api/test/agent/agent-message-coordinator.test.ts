@@ -38,6 +38,9 @@ async function waitForRun(coordinator: AgentMessageCoordinator, runId: string) {
     const { run } = await coordinator.getRun(runId);
 
     if (run.status !== "running") {
+      const execution = (coordinator as unknown as { runningRunExecutions?: Map<string, Promise<void>> })
+        .runningRunExecutions?.get(runId);
+      await execution;
       return run;
     }
 
