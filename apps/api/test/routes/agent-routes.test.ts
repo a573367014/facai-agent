@@ -374,7 +374,7 @@ describe("agent routes", () => {
 
     expect(uploadResponse.statusCode).toBe(201);
     expect(payload.file).toMatchObject({
-      type: "media",
+      type: "resource",
       mime: "image/png",
       name: "hello.png",
       size: 8
@@ -1066,7 +1066,7 @@ describe("agent routes", () => {
     ]);
   });
 
-  it("GET /agents/sessions/:sessionId 返回带 media parts 的消息列表", async () => {
+  it("GET /agents/sessions/:sessionId 返回带 resource parts 的消息列表", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "generate_image",
@@ -1164,12 +1164,12 @@ describe("agent routes", () => {
 
     expect(sessionResponse.statusCode).toBe(200);
     const assistant = payload.messages.find((message) => message.id === created.run.assistantMessageId);
-    const mediaPart = assistant?.parts.find((part) => part.type === "media");
-    const resourceId = mediaPart?.extra?.resource?.id;
+    const resourcePart = assistant?.parts.find((part) => part.type === "resource");
+    const resourceId = resourcePart?.extra?.resource?.id;
 
     expect(resourceId).toMatch(/^res_/);
-    expect(mediaPart).toMatchObject({
-      type: "media",
+    expect(resourcePart).toMatchObject({
+      type: "resource",
       mime: "image/png",
       url: "http://127.0.0.1:4001/uploads/resources/images/local-pig.png",
       extra: {
@@ -1200,7 +1200,7 @@ describe("agent routes", () => {
         status: "completed",
         parts: [
           expect.objectContaining({
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "http://127.0.0.1:4001/uploads/resources/images/local-pig.png",
             extra: expect.objectContaining({

@@ -10,7 +10,7 @@ export const AgentState = Annotation.Root({
     reducer: (_x, y) => y ?? 0,
     default: () => 0
   }),
-  needsMediaSummary: Annotation<boolean>({
+  needsResourceSummary: Annotation<boolean>({
     reducer: (_x, y) => y ?? false,
     default: () => false
   })

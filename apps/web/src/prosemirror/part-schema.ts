@@ -17,7 +17,7 @@ export const partSchema = new Schema({
       parseDOM: [{ tag: "br" }],
       toDOM: () => ["br"]
     },
-    media_part: {
+    resource_part: {
       inline: true,
       group: "inline",
       atom: true,
@@ -32,7 +32,7 @@ export const partSchema = new Schema({
       },
       parseDOM: [
         {
-          tag: "span.pm-part--media",
+          tag: "span.pm-part--resource",
           getAttrs: (dom) => {
             const element = dom as HTMLElement;
 
@@ -49,16 +49,16 @@ export const partSchema = new Schema({
         }
       ],
       toDOM: (node) => {
-        const isVideo = isVideoMime(node.attrs.mime);
-        const mediaLabel = getMediaLabel(node.attrs.mime);
-        const label = node.attrs.name || mediaLabel;
+        const isImage = isImageMime(node.attrs.mime);
+        const resourceLabel = getResourceLabel(node.attrs.mime);
+        const label = node.attrs.name || resourceLabel;
         const attrs: Record<string, string> = {
-          class: "pm-part pm-part--media",
+          class: "pm-part pm-part--resource",
           contenteditable: "false",
           "data-mime": String(node.attrs.mime ?? ""),
           "data-url": String(node.attrs.url ?? ""),
           "data-name": String(node.attrs.name ?? ""),
-          title: isVideo ? "已引用视频" : "点击替换图片"
+          title: isImage ? "点击替换图片" : `已引用${resourceLabel}`
         };
 
         if (node.attrs.size !== null && node.attrs.size !== undefined) {
@@ -77,17 +77,17 @@ export const partSchema = new Schema({
         return [
           "span",
           attrs,
-          node.attrs.url && !isVideo
-            ? ["img", { class: "pm-part-media-thumb", src: node.attrs.url, alt: label, draggable: "false" }]
-            : ["span", { class: "pm-part-media-placeholder" }, mediaLabel],
-          ["span", { class: "pm-part-media-name" }, label],
+          node.attrs.url && isImage
+            ? ["img", { class: "pm-part-resource-thumb", src: node.attrs.url, alt: label, draggable: "false" }]
+            : ["span", { class: "pm-part-resource-placeholder" }, resourceLabel],
+          ["span", { class: "pm-part-resource-name" }, label],
           [
             "button",
             {
-              class: "pm-part-media-remove",
+              class: "pm-part-resource-remove",
               type: "button",
-              title: `删除${mediaLabel}`,
-              "aria-label": `删除${mediaLabel} ${label}`,
+              title: `删除${resourceLabel}`,
+              "aria-label": `删除${resourceLabel} ${label}`,
               contenteditable: "false",
               tabindex: "-1"
             },
@@ -116,6 +116,29 @@ function isVideoMime(value: unknown) {
   return typeof value === "string" && value.startsWith("video/");
 }
 
-function getMediaLabel(mime: unknown) {
-  return isVideoMime(mime) ? "视频" : "图片";
+function isImageMime(value: unknown) {
+  return typeof value === "string" && value.startsWith("image/");
+}
+
+function isDocumentMime(value: unknown) {
+  return (
+    typeof value === "string" &&
+    (value.startsWith("text/") ||
+      value === "application/markdown" ||
+      value === "application/pdf" ||
+      value === "application/msword" ||
+      value === "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+  );
+}
+
+function getResourceLabel(mime: unknown) {
+  if (isVideoMime(mime)) {
+    return "视频";
+  }
+
+  if (isDocumentMime(mime)) {
+    return "文档";
+  }
+
+  return "图片";
 }

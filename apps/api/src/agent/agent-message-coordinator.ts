@@ -45,9 +45,9 @@ import type { AgentRunLock } from "./agent-run-lock.js";
 import { toRuntimeDependencyAppError } from "../errors/runtime-dependency-error.js";
 import { AgentRunningDraftManager } from "./agent-running-draft-manager.js";
 import { AgentProcessStepProjector } from "./agent-process-step-projector.js";
-import { AgentMediaOutputProjector } from "./agent-media-output-projector.js";
+import { AgentResourceOutputProjector } from "./agent-resource-output-projector.js";
 import {
-  isMediaOutputToolName,
+  isResourceOutputToolName,
   summarizeToolResult
 } from "./agent-message-projection-utils.js";
 import { AgentRunCleanupService, type StaleRunningCleanupResult } from "./agent-run-cleanup-service.js";
@@ -105,7 +105,7 @@ export class AgentMessageCoordinator {
   private readonly runningRunExecutions = new Map<string, Promise<void>>();
   private readonly draftManager: AgentRunningDraftManager;
   private readonly processStepProjector: AgentProcessStepProjector;
-  private readonly mediaOutputProjector: AgentMediaOutputProjector;
+  private readonly resourceOutputProjector: AgentResourceOutputProjector;
   private readonly cleanupService: AgentRunCleanupService;
   private readonly observability: AgentObservability;
 
@@ -119,13 +119,13 @@ export class AgentMessageCoordinator {
     private readonly options: AgentMessageCoordinatorOptions = {}
   ) {
     // coordinator 保留“主流程编排”：建 run、排队、取消、最终落库。
-    // 运行中草稿、进度步骤、媒体资源、重启清理分别交给小类，避免这个文件重新膨胀。
+    // 运行中草稿、进度步骤、资源、重启清理分别交给小类，避免这个文件重新膨胀。
     this.observability = options.observability ?? getAgentObservability();
     this.draftManager = new AgentRunningDraftManager(this.store, this.runningStateStore);
     this.processStepProjector = new AgentProcessStepProjector(this.store, (messageId, event, runId) => {
       return this.appendEvent(messageId, event, runId);
     });
-    this.mediaOutputProjector = new AgentMediaOutputProjector({
+    this.resourceOutputProjector = new AgentResourceOutputProjector({
       store: this.store,
       resourceStorage: this.resourceStorage,
       draftManager: this.draftManager,
@@ -379,7 +379,7 @@ export class AgentMessageCoordinator {
     });
     const controller = new AbortController();
     const history = await this.buildConversationHistoryBefore(session.id, userMessage.id);
-    const replayToolCalls = await this.getReplayableMediaToolCalls(sourceAssistantMessage);
+    const replayToolCalls = await this.getReplayableResourceToolCalls(sourceAssistantMessage);
 
     this.runningRuns.set(run.id, controller);
     const execution = this.executeRun(
@@ -807,10 +807,10 @@ export class AgentMessageCoordinator {
     return [...sessionMessages.slice(0, assistantIndex)].reverse().find((message) => message.role === "user");
   }
 
-  private async getReplayableMediaToolCalls(assistantMessage: AgentMessageRecord): Promise<ToolCall[]> {
+  private async getReplayableResourceToolCalls(assistantMessage: AgentMessageRecord): Promise<ToolCall[]> {
     return (await this.store
       .getToolCallsBySession(assistantMessage.sessionId))
-      .filter((toolCall) => toolCall.messageId === assistantMessage.id && isMediaOutputToolName(toolCall.toolName))
+      .filter((toolCall) => toolCall.messageId === assistantMessage.id && isResourceOutputToolName(toolCall.toolName))
       .sort((leftToolCall, rightToolCall) => {
         const iterationOrder = leftToolCall.iteration - rightToolCall.iteration;
         return iterationOrder || leftToolCall.startedAt.localeCompare(rightToolCall.startedAt);
@@ -871,11 +871,11 @@ export class AgentMessageCoordinator {
       await this.ensureToolCallRecord(messageId, event, runId, "pending");
     }
 
-    if (event.type === "tool_start" && !(await this.mediaOutputProjector.handleToolStart(messageId, event, runId)) && event.toolCallId) {
+    if (event.type === "tool_start" && !(await this.resourceOutputProjector.handleToolStart(messageId, event, runId)) && event.toolCallId) {
       await this.ensureToolCallRecord(messageId, event, runId, "running");
     }
 
-    if (event.type === "tool_result" && !(await this.mediaOutputProjector.handleToolResult(messageId, event, runId)) && event.toolCallId) {
+    if (event.type === "tool_result" && !(await this.resourceOutputProjector.handleToolResult(messageId, event, runId)) && event.toolCallId) {
       const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
       if (toolCall) {
         await this.store.updateToolCall(toolCall.id, {
@@ -886,7 +886,7 @@ export class AgentMessageCoordinator {
       }
     }
 
-    if (event.type === "tool_error" && !(await this.mediaOutputProjector.handleToolError(messageId, event, runId)) && event.toolCallId) {
+    if (event.type === "tool_error" && !(await this.resourceOutputProjector.handleToolError(messageId, event, runId)) && event.toolCallId) {
       const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
       if (toolCall) {
         await this.store.updateToolCall(toolCall.id, {

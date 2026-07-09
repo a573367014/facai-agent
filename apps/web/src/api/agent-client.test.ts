@@ -34,12 +34,12 @@ describe("resolveApiBaseUrl", () => {
     expect(resolveApiBaseUrl("/api/", "http://10.1.65.46:4000/")).toBe("/api");
   });
 
-  it("uploadAgentImage 使用 FormData 上传图片并返回 media part", async () => {
+  it("uploadAgentImage 使用 FormData 上传图片并返回 resource part", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(
         JSON.stringify({
           file: {
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "http://localhost:4001/uploads/images/a.png",
             name: "a.png",
@@ -51,7 +51,7 @@ describe("resolveApiBaseUrl", () => {
     );
 
     await expect(uploadAgentImage(new File(["abc"], "a.png", { type: "image/png" }))).resolves.toEqual({
-      type: "media",
+      type: "resource",
       mime: "image/png",
       url: "http://localhost:4001/uploads/images/a.png",
       name: "a.png",

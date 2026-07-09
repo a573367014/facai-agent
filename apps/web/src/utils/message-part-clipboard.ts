@@ -43,7 +43,7 @@ function isMessagePart(value: unknown): value is MessagePart {
     return typeof candidate.value === "string";
   }
 
-  if (candidate.type === "media") {
+  if (candidate.type === "resource") {
     return true;
   }
 

@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { AppError } from "../errors/app-error.js";
 import type { AgentErrorDetail, AgentStreamEvent } from "./types.js";
 import type {
@@ -6,22 +7,27 @@ import type {
   AgentToolCallRecord
 } from "./agent-store.js";
 import {
-  upsertGeneratedImageParts,
-  type GeneratedImagePartInput
+  upsertGeneratedResourceParts,
+  type GeneratedResourcePartInput
 } from "./message-parts.js";
 import type { ToolResourceStorage, StoredToolResource, ToolResourceType } from "./tool-resource-storage.js";
 import type { JsonObject } from "../tools/types.js";
 import type { AgentRunningDraftManager } from "./agent-running-draft-manager.js";
 import {
   buildImageMetadata,
+  buildDocumentMetadata,
   buildVideoMetadata,
   compactJsonObject,
+  extractDocumentAssets,
+  extractDocumentRequestSlot,
   extractFailedImageAssets,
   extractImageAssets,
   extractImageRequestSlots,
   extractVideoAssets,
   extractVideoRequestSlot,
-  findGeneratedImagePartIndex,
+  findGeneratedResourcePartIndex,
+  isDocumentOutputToolName,
+  isDocumentToolResultWithId,
   isImageOutputToolName,
   isImageToolResultWithId,
   isRecord,
@@ -45,7 +51,7 @@ type EnsureToolCallRecord = (
   status: AgentToolCallRecord["status"]
 ) => Promise<AgentToolCallRecord | undefined>;
 
-export interface AgentMediaOutputProjectorOptions {
+export interface AgentResourceOutputProjectorOptions {
   store: AgentStore;
   resourceStorage: ToolResourceStorage;
   draftManager: AgentRunningDraftManager;
@@ -53,20 +59,20 @@ export interface AgentMediaOutputProjectorOptions {
   appendEvent: AppendExecutionEvent;
 }
 
-// AgentMediaOutputProjector 专门处理“会产出媒体资源的工具”，目前是图片和视频。
+// AgentResourceOutputProjector 专门处理“会产出资源的工具”，覆盖图片、视频、文档等类型。
 // 它同时维护三层数据：
 // - tool_call：审计工具调用是否成功、耗时、失败原因；
-// - resource：长期保存图片/视频 URL、尺寸、状态；
-// - message part：让前端聊天正文里出现占位图、成功图、失败提示。
-// 这样 coordinator 只关心 run 编排，不需要知道每种媒体结果长什么样。
-export class AgentMediaOutputProjector {
+// - resource：长期保存资源 URL、尺寸、状态；
+// - message part：让前端聊天正文里出现资源占位、成功资源、失败提示。
+// 这样 coordinator 只关心 run 编排，不需要知道每种资源结果长什么样。
+export class AgentResourceOutputProjector {
   private readonly store: AgentStore;
   private readonly resourceStorage: ToolResourceStorage;
   private readonly draftManager: AgentRunningDraftManager;
   private readonly ensureToolCallRecord: EnsureToolCallRecord;
   private readonly appendEvent: AppendExecutionEvent;
 
-  constructor(options: AgentMediaOutputProjectorOptions) {
+  constructor(options: AgentResourceOutputProjectorOptions) {
     this.store = options.store;
     this.resourceStorage = options.resourceStorage;
     this.draftManager = options.draftManager;
@@ -80,13 +86,13 @@ export class AgentMediaOutputProjector {
     runId?: string
   ): Promise<boolean> {
     if (isImageOutputToolName(event.toolName) && event.toolCallId) {
-      // tool_start 时先创建 pending resource + pending media part。
+      // tool_start 时先创建 pending resource + pending resource part。
       // 用户能立刻看到“图片生成中”的占位，后续 tool_result/tool_error 再更新同一个资源和 part。
       const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
       const imageSlots = extractImageRequestSlots(event.arguments);
 
       for (const slot of imageSlots) {
-        const resource = await this.upsertImageResource(messageId, {
+        const resource = await this.upsertResource(messageId, {
           status: "pending",
           toolCallId: event.toolCallId,
           toolCallRowId: toolCall?.id,
@@ -102,7 +108,7 @@ export class AgentMediaOutputProjector {
           })
         }, runId);
 
-        await this.upsertMediaPart(messageId, {
+        await this.upsertResourcePart(messageId, {
           state: "pending",
           resourceId: resource.id,
           toolName: event.toolName,
@@ -127,7 +133,7 @@ export class AgentMediaOutputProjector {
       // 这样前端 MessagePartRenderer 可以统一渲染 pending/succeeded/failed 生命周期。
       const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
       const videoSlot = extractVideoRequestSlot(event.arguments);
-      const resource = await this.upsertImageResource(messageId, {
+      const resource = await this.upsertResource(messageId, {
         type: "video",
         status: "pending",
         toolCallId: event.toolCallId,
@@ -141,7 +147,7 @@ export class AgentMediaOutputProjector {
         })
       }, runId);
 
-      await this.upsertMediaPart(messageId, {
+      await this.upsertResourcePart(messageId, {
         state: "pending",
         resourceId: resource.id,
         toolName: event.toolName,
@@ -153,6 +159,40 @@ export class AgentMediaOutputProjector {
         generation: compactJsonObject({
           prompt: videoSlot.prompt
         })
+      }, runId);
+
+      return true;
+    }
+
+    if (isDocumentOutputToolName(event.toolName) && event.toolCallId) {
+      const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
+      const documentSlot = extractDocumentRequestSlot(event.arguments);
+      const mime = getDocumentMimeFromFormat(documentSlot.format);
+      const resource = await this.upsertResource(messageId, {
+        type: "document",
+        status: "pending",
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: documentSlot.outputIndex,
+        mime,
+        name: documentSlot.fileName ?? documentSlot.title,
+        metadata: buildDocumentMetadata({
+          title: documentSlot.title,
+          fileName: documentSlot.fileName,
+          format: documentSlot.format,
+          outputIndex: documentSlot.outputIndex
+        })
+      }, runId);
+
+      await this.upsertResourcePart(messageId, {
+        state: "pending",
+        resourceId: resource.id,
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: documentSlot.outputIndex,
+        mime,
+        name: documentSlot.fileName ?? documentSlot.title
       }, runId);
 
       return true;
@@ -174,6 +214,11 @@ export class AgentMediaOutputProjector {
       return true;
     }
 
+    if (isDocumentToolResultWithId(event)) {
+      await this.upsertDocumentResultParts(messageId, event, runId);
+      return true;
+    }
+
     return false;
   }
 
@@ -186,7 +231,7 @@ export class AgentMediaOutputProjector {
       // 媒体工具失败也要写成 failed resource/part。
       // 这样用户在正文里能看到失败位置，审计侧也能按 resource/tool_call 追失败原因。
       const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
-      const resource = await this.upsertImageResource(messageId, {
+      const resource = await this.upsertResource(messageId, {
         status: "failed",
         toolCallId: event.toolCallId,
         toolCallRowId: toolCall?.id,
@@ -213,7 +258,7 @@ export class AgentMediaOutputProjector {
         });
       }
 
-      await this.upsertMediaPart(messageId, {
+      await this.upsertResourcePart(messageId, {
         state: "failed",
         resourceId: resource.id,
         toolName: event.toolName,
@@ -233,7 +278,7 @@ export class AgentMediaOutputProjector {
     if (isVideoOutputToolName(event.toolName) && event.toolCallId) {
       // 视频失败路径和图片一致：tool_call 记录审计结果，resource/part 负责前端展示失败位。
       const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
-      const resource = await this.upsertImageResource(messageId, {
+      const resource = await this.upsertResource(messageId, {
         type: "video",
         status: "failed",
         toolCallId: event.toolCallId,
@@ -262,7 +307,7 @@ export class AgentMediaOutputProjector {
         });
       }
 
-      await this.upsertMediaPart(messageId, {
+      await this.upsertResourcePart(messageId, {
         state: "failed",
         resourceId: resource.id,
         toolName: event.toolName,
@@ -270,6 +315,60 @@ export class AgentMediaOutputProjector {
         toolCallRowId: toolCall?.id,
         outputIndex: 0,
         mime: "video/mp4",
+        error: {
+          code: event.error.code,
+          message: event.error.message
+        }
+      }, runId);
+
+      return true;
+    }
+
+    if (isDocumentOutputToolName(event.toolName) && event.toolCallId) {
+      const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
+      const format = toOptionalString(toolCall?.arguments.format);
+      const fileName = toOptionalString(toolCall?.arguments.fileName);
+      const title = toOptionalString(toolCall?.arguments.title);
+      const resource = await this.upsertResource(messageId, {
+        type: "document",
+        status: "failed",
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: 0,
+        mime: getDocumentMimeFromFormat(format),
+        name: fileName ?? title,
+        metadata: buildDocumentMetadata({
+          title,
+          fileName,
+          format,
+          outputIndex: 0,
+          error: {
+            code: event.error.code,
+            message: event.error.message
+          }
+        })
+      }, runId);
+
+      if (toolCall) {
+        await this.store.updateToolCall(toolCall.id, {
+          status: "failed",
+          durationMs: event.durationMs,
+          error: {
+            code: event.error.code,
+            message: event.error.message
+          }
+        });
+      }
+
+      await this.upsertResourcePart(messageId, {
+        state: "failed",
+        resourceId: resource.id,
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: 0,
+        mime: getDocumentMimeFromFormat(format),
+        name: fileName ?? title,
         error: {
           code: event.error.code,
           message: event.error.message
@@ -305,7 +404,7 @@ export class AgentMediaOutputProjector {
     }
 
     for (const asset of failedAssets) {
-      const resource = await this.upsertImageResource(messageId, {
+      const resource = await this.upsertResource(messageId, {
         status: "failed",
         toolCallId: event.toolCallId,
         toolCallRowId: toolCall?.id,
@@ -325,7 +424,7 @@ export class AgentMediaOutputProjector {
         })
       }, runId);
 
-      await this.upsertMediaPart(messageId, {
+      await this.upsertResourcePart(messageId, {
         state: "failed",
         resourceId: resource.id,
         toolName: event.toolName,
@@ -382,7 +481,7 @@ export class AgentMediaOutputProjector {
         continue;
       }
 
-      const resource = await this.upsertImageResource(messageId, {
+      const resource = await this.upsertResource(messageId, {
         status: "succeeded",
         toolCallId: event.toolCallId,
         toolCallRowId: toolCall?.id,
@@ -403,7 +502,7 @@ export class AgentMediaOutputProjector {
         })
       }, runId);
 
-      await this.upsertMediaPart(messageId, {
+      await this.upsertResourcePart(messageId, {
         state: "succeeded",
         resourceId: resource.id,
         toolName: event.toolName,
@@ -472,7 +571,7 @@ export class AgentMediaOutputProjector {
         continue;
       }
 
-      const resource = await this.upsertImageResource(messageId, {
+      const resource = await this.upsertResource(messageId, {
         type: "video",
         status: "succeeded",
         toolCallId: event.toolCallId,
@@ -490,7 +589,7 @@ export class AgentMediaOutputProjector {
         })
       }, runId);
 
-      await this.upsertMediaPart(messageId, {
+      await this.upsertResourcePart(messageId, {
         state: "succeeded",
         resourceId: resource.id,
         toolName: event.toolName,
@@ -502,6 +601,94 @@ export class AgentMediaOutputProjector {
         name: asset.prompt,
         generation: compactJsonObject({
           prompt: asset.prompt,
+          provider: asset.metadata.provider
+        })
+      }, runId);
+    }
+  }
+
+  private async upsertDocumentResultParts(
+    messageId: string,
+    event: Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: string; toolCallId: string },
+    runId?: string
+  ) {
+    const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
+    const assets = extractDocumentAssets(event.result, 0);
+    const requestedTitle = toOptionalString(toolCall?.arguments.title);
+    const requestedFormat = toOptionalString(toolCall?.arguments.format);
+
+    if (toolCall) {
+      await this.store.updateToolCall(toolCall.id, {
+        status: "succeeded",
+        durationMs: event.durationMs,
+        resultSummary: compactJsonObject({
+          outputCount: assets.length,
+          provider: isRecord(event.result) ? event.result.provider : undefined
+        })
+      });
+    }
+
+    for (const asset of assets) {
+      const bytes = Buffer.from(asset.contentBase64, "base64");
+      const metadata = buildDocumentMetadata({
+        title: toOptionalString(asset.metadata.title) ?? requestedTitle,
+        fileName: asset.name,
+        format: toOptionalString(asset.metadata.format) ?? requestedFormat,
+        outputIndex: asset.index,
+        provider: asset.metadata.provider,
+        size: asset.size ?? bytes.length
+      });
+      const storedAsset = await this.storeGeneratedToolResource(messageId, runId, {
+        type: "document",
+        bytes,
+        mime: asset.mime,
+        fileName: asset.name,
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: asset.index,
+        name: asset.name,
+        generation: compactJsonObject({
+          provider: asset.metadata.provider
+        }),
+        metadata
+      });
+
+      if (!storedAsset) {
+        continue;
+      }
+
+      const resourceMetadata = buildDocumentMetadata({
+        title: toOptionalString(asset.metadata.title) ?? requestedTitle,
+        fileName: storedAsset.name,
+        format: toOptionalString(asset.metadata.format) ?? requestedFormat,
+        outputIndex: asset.index,
+        provider: asset.metadata.provider,
+        size: storedAsset.size ?? asset.size ?? bytes.length
+      });
+      const resource = await this.upsertResource(messageId, {
+        type: "document",
+        status: "succeeded",
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: asset.index,
+        mime: storedAsset.mime ?? asset.mime,
+        url: storedAsset.url,
+        name: storedAsset.name,
+        metadata: resourceMetadata
+      }, runId);
+
+      await this.upsertResourcePart(messageId, {
+        state: "succeeded",
+        resourceId: resource.id,
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        toolCallRowId: toolCall?.id,
+        outputIndex: asset.index,
+        mime: storedAsset.mime ?? asset.mime,
+        url: storedAsset.url,
+        name: storedAsset.name,
+        generation: compactJsonObject({
           provider: asset.metadata.provider
         })
       }, runId);
@@ -536,8 +723,8 @@ export class AgentMediaOutputProjector {
       // 资源转储失败不是模型失败，也不是工具调用失败。
       // 已生成的远端资源可能存在，但我们无法稳定保存，所以给用户展示“资源保存失败”的 part。
       const detail = toErrorDetail(error);
-      const mime = input.mime ?? (input.type === "video" ? "video/mp4" : "image/png");
-      const resource = await this.upsertImageResource(messageId, {
+      const mime = input.mime ?? getDefaultMimeForResourceType(input.type);
+      const resource = await this.upsertResource(messageId, {
         type: input.type,
         status: "failed",
         toolCallId: input.toolCallId,
@@ -555,7 +742,7 @@ export class AgentMediaOutputProjector {
         })
       }, runId);
 
-      await this.upsertMediaPart(messageId, {
+      await this.upsertResourcePart(messageId, {
         state: "failed",
         resourceId: resource.id,
         toolName: input.toolName,
@@ -577,7 +764,81 @@ export class AgentMediaOutputProjector {
     }
   }
 
-  private async upsertMediaPart(messageId: string, input: GeneratedImagePartInput, runId?: string) {
+  private async storeGeneratedToolResource(
+    messageId: string,
+    runId: string | undefined,
+    input: {
+      type: ToolResourceType;
+      bytes: Buffer;
+      mime?: string;
+      fileName?: string;
+      toolName: string;
+      toolCallId: string;
+      toolCallRowId?: string;
+      outputIndex: number;
+      name?: string;
+      width?: number;
+      height?: number;
+      generation?: JsonObject;
+      metadata: JsonObject;
+    }
+  ): Promise<StoredToolResource | undefined> {
+    try {
+      if (!this.resourceStorage.storeGeneratedResource) {
+        throw new AppError("TOOL_EXECUTION_ERROR", "当前资源存储不支持生成文件转储", 500);
+      }
+
+      return await this.resourceStorage.storeGeneratedResource({
+        bytes: input.bytes,
+        type: input.type,
+        mime: input.mime,
+        fileName: input.fileName
+      });
+    } catch (error) {
+      const detail = toErrorDetail(error);
+      const mime = input.mime ?? getDefaultMimeForResourceType(input.type);
+      const resource = await this.upsertResource(messageId, {
+        type: input.type,
+        status: "failed",
+        toolCallId: input.toolCallId,
+        toolCallRowId: input.toolCallRowId,
+        outputIndex: input.outputIndex,
+        mime,
+        width: input.width,
+        height: input.height,
+        name: input.name,
+        metadata: compactJsonObject({
+          ...input.metadata,
+          error: {
+            code: detail.code,
+            message: `资源转储失败：${detail.message}`
+          }
+        })
+      }, runId);
+
+      await this.upsertResourcePart(messageId, {
+        state: "failed",
+        resourceId: resource.id,
+        toolName: input.toolName,
+        toolCallId: input.toolCallId,
+        toolCallRowId: input.toolCallRowId,
+        outputIndex: input.outputIndex,
+        mime,
+        name: input.name,
+        width: input.width,
+        height: input.height,
+        generation: input.generation,
+        error: {
+          code: detail.code,
+          message: `资源转储失败：${detail.message}`
+        }
+      }, runId);
+
+      return undefined;
+    }
+  }
+
+  private async upsertResourcePart(messageId: string, input: GeneratedResourcePartInput, runId?: string) {
     const message = await this.store.getMessage(messageId);
 
     if (!message) {
@@ -587,9 +848,9 @@ export class AgentMediaOutputProjector {
     // message part 写入的是运行中草稿层：token 流、图片占位、图片成功态都先改 Redis/内存草稿。
     // run 最终完成时 coordinator 再把草稿 parts 固化回 SQLite message。
     const currentParts = await this.draftManager.getParts(messageId, runId);
-    const existingIndex = findGeneratedImagePartIndex(currentParts, input);
-    const nextParts = upsertGeneratedImageParts(currentParts, input);
-    const partIndex = findGeneratedImagePartIndex(nextParts, input);
+    const existingIndex = findGeneratedResourcePartIndex(currentParts, input);
+    const nextParts = upsertGeneratedResourceParts(currentParts, input);
+    const partIndex = findGeneratedResourcePartIndex(nextParts, input);
     const { parts: updatedParts, version } = await this.draftManager.setParts(messageId, nextParts, runId);
     const part = updatedParts[partIndex] ?? nextParts[partIndex];
 
@@ -608,10 +869,10 @@ export class AgentMediaOutputProjector {
     }, runId);
   }
 
-  private async upsertImageResource(
+  private async upsertResource(
     messageId: string,
     input: {
-      type?: "image" | "video";
+      type?: ToolResourceType;
       status: AgentResourceRecord["status"];
       toolCallId: string;
       toolCallRowId?: string;
@@ -740,6 +1001,34 @@ export class AgentMediaOutputProjector {
           (!sourceImageUrl || toOptionalString(resource.metadata?.sourceImageUrl) === sourceImageUrl)
       );
   }
+}
+
+function getDocumentMimeFromFormat(format?: string): string {
+  if (format === "txt") {
+    return "text/plain";
+  }
+
+  if (format === "markdown") {
+    return "text/markdown";
+  }
+
+  if (format === "docx") {
+    return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  }
+
+  return "application/octet-stream";
+}
+
+function getDefaultMimeForResourceType(type: ToolResourceType): string {
+  if (type === "video") {
+    return "video/mp4";
+  }
+
+  if (type === "document") {
+    return "application/octet-stream";
+  }
+
+  return "image/png";
 }
 
 function toErrorDetail(error: unknown): AgentErrorDetail {

@@ -16,11 +16,11 @@ describe("part prosemirror serialization", () => {
     expect(docToParts(doc)).toEqual([{ type: "text", value: "第一行\n第二行" }]);
   });
 
-  it("round trips media parts", () => {
+  it("round trips resource parts", () => {
     const parts: RuntimePart[] = [
       { type: "text", value: "看" },
       {
-        type: "media",
+        type: "resource",
         mime: "image/png",
         url: "http://localhost:4001/uploads/images/a.png",
         name: "a.png",

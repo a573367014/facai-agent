@@ -31,7 +31,7 @@ export interface AgentSessionSummaryRecord {
 
 export interface PartExtra {
   placeholder?: {
-    type: "text" | "input" | "select" | "image" | "video" | "skill";
+    type: "text" | "input" | "select" | "image" | "video" | "document" | "skill";
     label: string;
     defaultValue?: string;
     options?: Array<{ label: string; value: string; icon?: string }>;
@@ -67,8 +67,8 @@ export interface TextPart {
   extra?: PartExtra;
 }
 
-export interface MediaPart {
-  type: "media";
+export interface ResourcePart {
+  type: "resource";
   mime?: string;
   url?: string;
   name?: string;
@@ -78,7 +78,7 @@ export interface MediaPart {
   extra?: PartExtra;
 }
 
-export type MessagePart = TextPart | MediaPart;
+export type MessagePart = TextPart | ResourcePart;
 
 export interface AgentMessageRecord {
   id: string;
@@ -292,7 +292,7 @@ export interface CancelAgentRunResponse {
 }
 
 export interface UploadAgentImageResponse {
-  file: MediaPart;
+  file: ResourcePart;
 }
 
 export type KnowledgeDocumentStatus = "pending" | "indexing" | "ready" | "failed";
@@ -736,7 +736,7 @@ export async function cancelAgentRun(runId: string): Promise<CancelAgentRunRespo
   return payload as CancelAgentRunResponse;
 }
 
-export async function uploadAgentImage(file: File): Promise<MediaPart> {
+export async function uploadAgentImage(file: File): Promise<ResourcePart> {
   const body = new FormData();
   body.append("image", file);
 

@@ -36,7 +36,7 @@ export interface AgentToolCallObservation {
 }
 
 export interface AgentResourceTransferObservation {
-  resourceType: "image" | "video";
+  resourceType: "image" | "video" | "document";
   mime?: string;
   status: AgentObservationStatus;
   durationMs: number;

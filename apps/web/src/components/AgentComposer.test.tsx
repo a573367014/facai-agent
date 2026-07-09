@@ -70,7 +70,7 @@ describe("AgentComposer", () => {
 
   it("点击上传图片后把图片插入输入 parts", async () => {
     const imagePart = {
-      type: "media" as const,
+      type: "resource" as const,
       mime: "image/png",
       url: "http://localhost:4001/uploads/images/upload.png",
       name: "upload.png"

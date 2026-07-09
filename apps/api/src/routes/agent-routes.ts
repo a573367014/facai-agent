@@ -26,9 +26,9 @@ const textPartSchema = z
     extra: partExtraSchema.optional()
   })
   .passthrough();
-const mediaPartSchema = z
+const resourcePartSchema = z
   .object({
-    type: z.literal("media"),
+    type: z.literal("resource"),
     mime: z.string().min(1).optional(),
     url: z.string().optional(),
     name: z.string().optional(),
@@ -37,7 +37,7 @@ const mediaPartSchema = z
     extra: partExtraSchema.optional()
   })
   .passthrough();
-const messagePartSchema = z.discriminatedUnion("type", [textPartSchema, mediaPartSchema]);
+const messagePartSchema = z.discriminatedUnion("type", [textPartSchema, resourcePartSchema]);
 const messageRequestSchema = z.object({
   input: z.string().trim().min(1).optional(),
   parts: z.array(messagePartSchema).min(1).optional(),
@@ -302,7 +302,7 @@ export async function registerAgentRoutes(
 
     reply.status(201).send({
       file: {
-        type: "media",
+        type: "resource",
         mime: file.mimetype,
         url: getS3ObjectUrl(s3Key),
         name: basename(file.filename),

@@ -38,4 +38,35 @@ describe("S3ToolResourceStorage", () => {
     });
     expect(sentCommands).toHaveLength(1);
   });
+
+  it("把工具生成的文档字节转储到 document 资源目录，并保留用户可读文件名", async () => {
+    const documentBuffer = Buffer.from("# 年度复盘\n\n- 收入增长 20%", "utf8");
+    const sentCommands: unknown[] = [];
+    const storage = new S3ToolResourceStorage({
+      bucket: "agent-uploads",
+      objectUrlFactory: (key) => `http://127.0.0.1:9000/agent-uploads/${key}`,
+      s3Client: {
+        send: async (command) => {
+          sentCommands.push(command);
+          return {};
+        }
+      }
+    });
+
+    const stored = await storage.storeGeneratedResource({
+      bytes: documentBuffer,
+      type: "document",
+      mime: "text/markdown",
+      fileName: "年度复盘.md"
+    });
+
+    expect(stored).toEqual({
+      url: "http://127.0.0.1:9000/agent-uploads/resources/documents/05365cc8412ae37ccf331315d57bb32f.md",
+      mime: "text/markdown",
+      name: "年度复盘.md",
+      size: documentBuffer.length,
+      relativePath: "resources/documents/05365cc8412ae37ccf331315d57bb32f.md"
+    });
+    expect(sentCommands).toHaveLength(1);
+  });
 });

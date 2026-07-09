@@ -1177,7 +1177,7 @@ describe("App", () => {
     const userParts = [
       { type: "text", value: "你能告诉我这是什么吗 " },
       {
-        type: "media",
+        type: "resource",
         mime: "image/png",
         url: "https://example.com/screenshot.png",
         name: "截图2026-06-29.png",
@@ -1526,7 +1526,7 @@ describe("App", () => {
               parts: [
                 { type: "text", value: "图片已生成。" },
                 {
-                  type: "media",
+                  type: "resource",
                   mime: "image/png",
                   url: "https://example.com/dog.png",
                   extra: {
@@ -1594,7 +1594,7 @@ describe("App", () => {
               parts: [
                 { type: "text", value: "图片已生成。" },
                 {
-                  type: "media",
+                  type: "resource",
                   mime: "image/png",
                   url: "https://example.com/quote-dog.png",
                   name: "一只小狗",
@@ -1659,7 +1659,7 @@ describe("App", () => {
             id: "msg_user_quote_new",
             parts: [
               {
-                type: "media",
+                type: "resource",
                 mime: "image/png",
                 url: "https://example.com/quote-dog.png",
                 name: "一只小狗",
@@ -1696,7 +1696,7 @@ describe("App", () => {
         sessionId: "session_quote_image",
         parts: [
           expect.objectContaining({
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "https://example.com/quote-dog.png",
             name: "一只小狗",
@@ -1853,7 +1853,7 @@ describe("App", () => {
             messageId: "msg_1",
             partIndex: 1,
             part: {
-              type: "media",
+              type: "resource",
               mime: "image/png",
               width: 1024,
               height: 1024,
@@ -1887,7 +1887,7 @@ describe("App", () => {
             messageId: "msg_1",
             partIndex: 1,
             part: {
-              type: "media",
+              type: "resource",
               mime: "image/png",
               url: "https://example.com/pig.png",
               width: 1024,
@@ -1949,7 +1949,7 @@ describe("App", () => {
             messageId: "msg_1",
             partIndex: 1,
             part: {
-              type: "media",
+              type: "resource",
               mime: "video/mp4",
               url: "https://example.com/pig-video.mp4",
               width: 1280,

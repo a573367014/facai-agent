@@ -572,7 +572,7 @@ describe("AgentConversation", () => {
         parts: [
           { type: "text", value: "你能告诉我这是什么吗 " },
           {
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "https://example.com/screenshot.png",
             name: "截图2026-06-29.png",
@@ -595,7 +595,7 @@ describe("AgentConversation", () => {
     expect(onReuseUserMessage).toHaveBeenCalledWith(messages[0].parts);
   });
 
-  it("user media part 使用输入框同款 chip 渲染，不进入 assistant 图片画廊", () => {
+  it("user resource part 使用输入框同款 chip 渲染，不进入 assistant 图片画廊", () => {
     const messages: ChatMessage[] = [
       {
         id: "msg_user",
@@ -603,7 +603,7 @@ describe("AgentConversation", () => {
         parts: [
           { type: "text", value: "你能告诉我这是什么吗 " },
           {
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "https://example.com/screenshot.png",
             name: "截图2026-06-29.png",
@@ -616,8 +616,8 @@ describe("AgentConversation", () => {
 
     const { container } = render(<AgentConversation messages={messages} isActive={false} />);
 
-    expect(container.querySelector(".chat-row.user .pm-part--media")).toHaveTextContent("截图2026-06-29.png");
-    expect(container.querySelector(".chat-row.user .message-image-gallery")).toBeNull();
+    expect(container.querySelector(".chat-row.user .pm-part--resource")).toHaveTextContent("截图2026-06-29.png");
+    expect(container.querySelector(".chat-row.user .message-resource-gallery")).toBeNull();
     expect(container.querySelector(".chat-row.user .user-part-surface")).toBeInTheDocument();
   });
 
@@ -696,7 +696,7 @@ describe("AgentConversation", () => {
     expect(container.querySelector("pre code")).toHaveTextContent("const value = 1;");
   });
 
-  it("renders assistant text and media from message parts", () => {
+  it("renders assistant text and resource from message parts", () => {
     const messages: ChatMessage[] = [
       {
         id: "msg_1:assistant",
@@ -704,7 +704,7 @@ describe("AgentConversation", () => {
         parts: [
           { type: "text", value: "**图片已生成。**" },
           {
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "https://example.com/part-image.png",
             width: 1024,
@@ -750,7 +750,7 @@ describe("AgentConversation", () => {
     expect(screen.getByRole("img", { name: "田园小猪" })).toHaveAttribute("src", "https://example.com/part-image.png");
   });
 
-  it("media part 缺少 URL 时不从 resources 兜底展示图片", () => {
+  it("resource part 缺少 URL 时不从 resources 兜底展示图片", () => {
     const messages: ChatMessage[] = [
       {
         id: "msg_1:assistant",
@@ -758,7 +758,7 @@ describe("AgentConversation", () => {
         parts: [
           { type: "text", value: "图片已生成。" },
           {
-            type: "media",
+            type: "resource",
             mime: "image/png",
             extra: {
               lifecycle: { state: "succeeded" },
@@ -797,14 +797,14 @@ describe("AgentConversation", () => {
       />
     );
 
-    const gallery = container.querySelector(".message-image-gallery");
+    const gallery = container.querySelector(".message-resource-gallery");
 
     expect(screen.queryByRole("img", { name: "田园小猪" })).not.toBeInTheDocument();
     expect(gallery).toHaveTextContent("生成失败");
     expect(gallery).not.toHaveTextContent("图片资源缺少地址");
   });
 
-  it("media part 失败卡片不展示具体错误原因", () => {
+  it("resource part 失败卡片不展示具体错误原因", () => {
     const messages: ChatMessage[] = [
       {
         id: "msg_1:assistant",
@@ -812,7 +812,7 @@ describe("AgentConversation", () => {
         parts: [
           { type: "text", value: "如果需要，我可以帮你重新调整提示词。原因：HTTP 429: Request Has Reached API Concurrent Limit" },
           {
-            type: "media",
+            type: "resource",
             mime: "image/png",
             width: 1024,
             height: 1024,
@@ -832,18 +832,18 @@ describe("AgentConversation", () => {
 
     const { container } = render(<AgentConversation messages={messages} isActive={false} />);
     const markdown = container.querySelector(".markdown-body");
-    const gallery = container.querySelector(".message-image-gallery");
+    const gallery = container.querySelector(".message-resource-gallery");
 
     expect(markdown).not.toBeNull();
     expect(within(markdown as HTMLElement).getByText(/HTTP 429: Request Has Reached API Concurrent Limit/)).toBeInTheDocument();
     expect(gallery).not.toBeNull();
-    expect(gallery?.querySelector(".message-image-failed-icon")).not.toBeNull();
+    expect(gallery?.querySelector(".message-resource-failed-icon")).not.toBeNull();
     expect(within(gallery as HTMLElement).getByText("生成失败")).toBeInTheDocument();
     expect(gallery).not.toHaveTextContent("HTTP 429");
     expect(gallery).not.toHaveTextContent("Request Has Reached API Concurrent Limit");
   });
 
-  it("renders assistant video media from message parts", async () => {
+  it("renders assistant video resource from message parts", async () => {
     const messages: ChatMessage[] = [
       {
         id: "msg_1:assistant",
@@ -851,7 +851,7 @@ describe("AgentConversation", () => {
         parts: [
           { type: "text", value: "视频已生成。" },
           {
-            type: "media",
+            type: "resource",
             mime: "video/mp4",
             url: "https://example.com/part-video.mp4",
             extra: {
@@ -890,7 +890,14 @@ describe("AgentConversation", () => {
     );
 
     expect(screen.getByText("视频已生成。")).toBeInTheDocument();
-    expect(screen.getByLabelText("田园小猪视频")).toHaveAttribute("src", "https://example.com/part-video.mp4");
+    const thumbnailVideo = screen.getByLabelText("田园小猪视频") as HTMLVideoElement;
+
+    expect(thumbnailVideo).toHaveAttribute("src", "https://example.com/part-video.mp4");
+    expect(thumbnailVideo.closest(".message-resource-tile")).toHaveClass("video");
+    expect(thumbnailVideo.autoplay).toBe(true);
+    expect(thumbnailVideo.muted).toBe(true);
+    expect(thumbnailVideo.loop).toBe(true);
+    expect(thumbnailVideo.playsInline).toBe(true);
     expect(screen.getByRole("link", { name: "下载视频 1" })).toHaveAttribute("href", "https://example.com/part-video.mp4");
 
     await userEvent.click(screen.getByRole("button", { name: "更多视频操作 1" }));
@@ -900,14 +907,112 @@ describe("AgentConversation", () => {
     expect(screen.getByRole("menuitem", { name: "打开原视频 1" })).toHaveAttribute("href", "https://example.com/part-video.mp4");
   });
 
-  it("按 assistant message parts 原始顺序渲染媒体和后续文本", () => {
+  it("generated video resource opens a large autoplay preview", async () => {
     const messages: ChatMessage[] = [
       {
         id: "msg_1:assistant",
         role: "assistant",
         parts: [
           {
-            type: "media",
+            type: "resource",
+            mime: "video/mp4",
+            url: "https://example.com/part-video.mp4",
+            extra: {
+              lifecycle: { state: "succeeded" },
+              resource: { id: "res_video" },
+              tool: { name: "generate_video", toolCallId: "call_video", toolCallRowId: "tool_call_video", outputIndex: 0 },
+              generation: { prompt: "田园小猪视频", provider: "test" }
+            }
+          }
+        ],
+        status: "completed"
+      }
+    ];
+
+    render(<AgentConversation messages={messages} isActive={false} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "预览视频 1" }));
+
+    const dialog = screen.getByRole("dialog", { name: "视频预览" });
+    const previewVideo = within(dialog).getByLabelText("田园小猪视频预览") as HTMLVideoElement;
+
+    expect(previewVideo).toHaveAttribute("src", "https://example.com/part-video.mp4");
+    expect(previewVideo.controls).toBe(true);
+    expect(previewVideo.autoplay).toBe(true);
+    expect(previewVideo.muted).toBe(true);
+    expect(previewVideo.playsInline).toBe(true);
+  });
+
+  it("renders generated document resource as a file card with preview and download actions", async () => {
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_1:assistant",
+        role: "assistant",
+        parts: [
+          { type: "text", value: "文档已生成。" },
+          {
+            type: "resource",
+            mime: "text/markdown",
+            url: "https://example.com/resources/documents/review.md",
+            name: "年度复盘.md",
+            extra: {
+              lifecycle: { state: "succeeded" },
+              resource: { id: "res_doc" },
+              tool: { name: "generate_document", toolCallId: "call_doc", toolCallRowId: "tool_call_doc", outputIndex: 0 },
+              generation: { provider: "agent_document" }
+            }
+          }
+        ],
+        status: "completed"
+      }
+    ];
+
+    render(
+      <AgentConversation
+        messages={messages}
+        resourcesById={{
+          res_doc: {
+            id: "res_doc",
+            sessionId: "session_1",
+            messageId: "msg_1:assistant",
+            toolCallId: "call_doc",
+            toolCallRowId: "tool_call_doc",
+            type: "document",
+            mime: "text/markdown",
+            status: "succeeded",
+            url: "https://example.com/resources/documents/review.md",
+            name: "年度复盘.md",
+            metadata: { provider: "agent_document" },
+            createdAt: "2026-06-22T00:00:00.000Z",
+            updatedAt: "2026-06-22T00:00:01.000Z"
+          }
+        }}
+        isActive={false}
+      />
+    );
+
+    expect(screen.getByText("文档已生成。")).toBeInTheDocument();
+    expect(screen.getByText("年度复盘.md")).toBeInTheDocument();
+    expect(screen.getByText("Markdown")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "预览文档 1" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "下载文档 1" })).toHaveAttribute(
+      "href",
+      "https://example.com/resources/documents/review.md"
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "预览文档 1" }));
+
+    expect(screen.getByRole("dialog", { name: "资源预览" })).toBeInTheDocument();
+  });
+
+  it("按 assistant message parts 原始顺序渲染资源和后续文本", () => {
+    const messages: ChatMessage[] = [
+      {
+        id: "msg_1:assistant",
+        role: "assistant",
+        parts: [
+          {
+            type: "resource",
             mime: "image/png",
             url: "https://example.com/generated.png",
             extra: {
@@ -924,7 +1029,7 @@ describe("AgentConversation", () => {
     const { container } = render(<AgentConversation messages={messages} isActive={false} />);
     const body = container.querySelector(".chat-answer");
     const children = Array.from(body?.children ?? []);
-    const galleryIndex = children.findIndex((child) => child.classList.contains("message-image-gallery"));
+    const galleryIndex = children.findIndex((child) => child.classList.contains("message-resource-gallery"));
     const markdownIndex = children.findIndex((child) => child.classList.contains("markdown-body"));
 
     expect(galleryIndex).toBeGreaterThanOrEqual(0);
@@ -941,7 +1046,7 @@ describe("AgentConversation", () => {
         parts: [
           { type: "text", value: "我查到了资料，也生成了图片。" },
           {
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "https://example.com/generated.png",
             extra: {
@@ -1026,7 +1131,7 @@ describe("AgentConversation", () => {
     expect(screen.getByRole("menuitem", { name: "引用图片 1" })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: "打开原图 1" })).toHaveAttribute("href", "https://example.com/generated.png");
 
-    const mainAssetArea = container.querySelector(".message-image-gallery");
+    const mainAssetArea = container.querySelector(".message-resource-gallery");
 
     expect(mainAssetArea).not.toBeNull();
     expect(mainAssetArea?.querySelector('img[alt="赛博茶馆"]')).not.toBeNull();
@@ -1040,7 +1145,7 @@ describe("AgentConversation", () => {
         parts: [
           { type: "text", value: "图片已生成。" },
           {
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "https://example.com/generated.png",
             extra: {
@@ -1094,7 +1199,7 @@ describe("AgentConversation", () => {
     const { container } = render(<AgentConversation messages={messages} isActive={false} />);
 
     expect(screen.getByText("图片已经生成。")).toBeInTheDocument();
-    expect(container.querySelector(".message-image-gallery")).toBeNull();
+    expect(container.querySelector(".message-resource-gallery")).toBeNull();
   });
 
   it("正文图片使用左对齐的固定上限画廊，长边铺满且短边自适应", () => {
@@ -1105,7 +1210,7 @@ describe("AgentConversation", () => {
         parts: [
           { type: "text", value: "图片已生成。" },
           {
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "https://example.com/generated.png",
             extra: {
@@ -1134,10 +1239,10 @@ describe("AgentConversation", () => {
     ];
 
     const { container } = render(<AgentConversation messages={messages} isActive={false} />);
-    const gallery = container.querySelector(".message-image-gallery");
-    const tile = container.querySelector(".message-image-tile");
-    const frame = container.querySelector(".message-image-frame");
-    const actions = screen.getByRole("link", { name: "下载图片 1" }).closest(".message-image-actions");
+    const gallery = container.querySelector(".message-resource-gallery");
+    const tile = container.querySelector(".message-resource-tile");
+    const frame = container.querySelector(".message-resource-frame");
+    const actions = screen.getByRole("link", { name: "下载图片 1" }).closest(".message-resource-actions");
 
     expect(gallery).toHaveClass("single");
     expect(tile).not.toBeNull();
@@ -1146,14 +1251,20 @@ describe("AgentConversation", () => {
     expect(frame?.contains(actions)).toBe(true);
 
     const styles = readFileSync(stylesPath, "utf8");
-    expect(styles).toMatch(/\.message-image-gallery\s*{[^}]*justify-content:\s*start;/s);
-    expect(styles).toMatch(/\.message-image-tile\s*{[^}]*max-width:\s*300px;/s);
-    expect(styles).toMatch(/\.message-image-frame\s*{[^}]*max-width:\s*300px;[^}]*max-height:\s*300px;/s);
-    expect(styles).toMatch(/\.message-image-frame img\s*{[^}]*object-fit:\s*contain;/s);
-    expect(styles).toMatch(/\.message-image-actions\s*{[^}]*position:\s*absolute;[^}]*opacity:\s*0;/s);
-    expect(styles).toMatch(/\.message-image-tile:hover\s+\.message-image-actions/s);
-    expect(styles).toMatch(/\.message-image-tile:focus-within\s+\.message-image-actions/s);
+    expect(styles).toMatch(/\.message-resource-gallery\s*{[^}]*justify-content:\s*start;/s);
+    expect(styles).toMatch(/\.message-resource-tile\s*{[^}]*max-width:\s*300px;/s);
+    expect(styles).toMatch(/\.message-resource-frame\s*{[^}]*max-width:\s*300px;[^}]*max-height:\s*300px;/s);
+    expect(styles).toMatch(/\.message-resource-frame img\s*{[^}]*object-fit:\s*contain;/s);
+    expect(styles).toMatch(/\.message-resource-actions\s*{[^}]*position:\s*absolute;[^}]*opacity:\s*0;/s);
+    expect(styles).toMatch(/\.message-resource-tile:hover\s+\.message-resource-actions/s);
+    expect(styles).toMatch(/\.message-resource-tile:focus-within\s+\.message-resource-actions/s);
     expect(screen.getByRole("button", { name: "更多图片操作 1" })).toHaveClass("MuiIconButton-root");
+  });
+
+  it("正文视频操作按钮默认可见，避免点击视频只触发播放", () => {
+    const styles = readFileSync(stylesPath, "utf8");
+
+    expect(styles).toMatch(/\.message-resource-tile\.video\s+\.message-resource-actions\s*{[^}]*opacity:\s*1;[^}]*pointer-events:\s*auto;/s);
   });
 
   it("多张正文图片复用同一套左对齐画廊布局", () => {
@@ -1164,7 +1275,7 @@ describe("AgentConversation", () => {
         parts: [
           { type: "text", value: "图片已生成。" },
           {
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "https://example.com/landscape.png",
             width: 1024,
@@ -1176,7 +1287,7 @@ describe("AgentConversation", () => {
             }
           },
           {
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "https://example.com/portrait.png",
             width: 768,
@@ -1194,8 +1305,8 @@ describe("AgentConversation", () => {
 
     const { container } = render(<AgentConversation messages={messages} isActive={false} />);
 
-    expect(container.querySelector(".message-image-gallery")).toHaveClass("multi");
-    expect(container.querySelectorAll(".message-image-tile")).toHaveLength(2);
+    expect(container.querySelector(".message-resource-gallery")).toHaveClass("multi");
+    expect(container.querySelectorAll(".message-resource-tile")).toHaveLength(2);
     expect(screen.getByRole("img", { name: "横图" })).toHaveAttribute("src", "https://example.com/landscape.png");
     expect(screen.getByRole("img", { name: "竖图" })).toHaveAttribute("src", "https://example.com/portrait.png");
   });
@@ -1208,7 +1319,7 @@ describe("AgentConversation", () => {
         parts: [
           { type: "text", value: "图片已生成。" },
           {
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "https://example.com/generated.png",
             extra: {
@@ -1246,8 +1357,8 @@ describe("AgentConversation", () => {
 
   it("图片预览按原图比例展示，不做 1:1 裁切", () => {
     const styles = readFileSync(stylesPath, "utf8");
-    const imageRule = styles.match(/\n\.message-image-frame img\s*{(?<body>[^}]*)}/s)?.groups?.body ?? "";
-    const mainImageRule = styles.match(/\.message-image-frame\s*{(?<body>[^}]*)}/s)?.groups?.body ?? "";
+    const imageRule = styles.match(/\n\.message-resource-frame img\s*{(?<body>[^}]*)}/s)?.groups?.body ?? "";
+    const mainImageRule = styles.match(/\.message-resource-frame\s*{(?<body>[^}]*)}/s)?.groups?.body ?? "";
 
     expect(imageRule).not.toContain("aspect-ratio: 1 / 1");
     expect(mainImageRule).not.toContain("object-fit: cover");
@@ -1255,7 +1366,7 @@ describe("AgentConversation", () => {
     expect(imageRule).toContain("object-fit: contain");
   });
 
-  it("批量生图结果在回答主体展示 media parts", () => {
+  it("批量生图结果在回答主体展示 resource parts", () => {
     const messages: ChatMessage[] = [
       {
         id: "msg_2:assistant",
@@ -1263,7 +1374,7 @@ describe("AgentConversation", () => {
         parts: [
           { type: "text", value: "批量图片处理完成。" },
           {
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "https://example.com/watercolor-pig.png",
             width: 1024,
@@ -1322,15 +1433,15 @@ describe("AgentConversation", () => {
     const { container } = render(<AgentConversation messages={messages} isActive={false} />);
 
     expect(screen.getByText("批量图片处理完成。")).toBeInTheDocument();
-    expect(container.querySelector(".message-image-gallery")).not.toHaveTextContent("水彩风格的小猪");
-    expect(container.querySelector(".message-image-caption")).toBeNull();
+    expect(container.querySelector(".message-resource-gallery")).not.toHaveTextContent("水彩风格的小猪");
+    expect(container.querySelector(".message-resource-caption")).toBeNull();
     expect(screen.getByRole("img", { name: "水彩风格的小猪" })).toHaveAttribute(
       "src",
       "https://example.com/watercolor-pig.png"
     );
   });
 
-  it("图片生成成功后通过 media part 展示图片", () => {
+  it("图片生成成功后通过 resource part 展示图片", () => {
     const messages: ChatMessage[] = [
       {
         id: "msg_3:assistant",
@@ -1338,7 +1449,7 @@ describe("AgentConversation", () => {
         parts: [
           { type: "text", value: "图片已生成。" },
           {
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "https://example.com/fast-pixel-pig.png",
             width: 1328,
@@ -1357,8 +1468,8 @@ describe("AgentConversation", () => {
 
     const { container } = render(<AgentConversation messages={messages} isActive={false} />);
 
-    expect(container.querySelector(".message-image-gallery")).not.toHaveTextContent("像素小猪");
-    expect(container.querySelector(".message-image-caption")).toBeNull();
+    expect(container.querySelector(".message-resource-gallery")).not.toHaveTextContent("像素小猪");
+    expect(container.querySelector(".message-resource-caption")).toBeNull();
     expect(screen.getByRole("img", { name: "像素小猪" })).toHaveAttribute(
       "src",
       "https://example.com/fast-pixel-pig.png"
@@ -1373,7 +1484,7 @@ describe("AgentConversation", () => {
         parts: [
           { type: "text", value: "我正在为你生成图片" },
           {
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "",
             width: 1328,
@@ -1405,13 +1516,13 @@ describe("AgentConversation", () => {
     expect(screen.getByText("正在生成图片")).toBeInTheDocument();
     expect(screen.getByText("1328 x 1328")).toBeInTheDocument();
 
-    const mainAssetArea = container.querySelector(".message-image-gallery");
+    const mainAssetArea = container.querySelector(".message-resource-gallery");
     const toolEventArea = container.querySelector(".tool-events");
 
     expect(mainAssetArea).not.toBeNull();
     expect(mainAssetArea?.textContent).toContain("正在生成图片");
     expect(mainAssetArea).not.toHaveTextContent("粉色小猪");
-    expect(container.querySelector(".message-image-caption")).toBeNull();
+    expect(container.querySelector(".message-resource-caption")).toBeNull();
     expect(container.textContent).not.toContain("Seedream");
     expect(toolEventArea).toBeNull();
   });

@@ -1,5 +1,5 @@
 import type { AgentStreamEvent } from "./types.js";
-import type { GeneratedImagePartInput, MessagePart } from "./message-parts.js";
+import type { GeneratedResourcePartInput, MessagePart } from "./message-parts.js";
 import type { AgentProcessStepRecord, AgentStore } from "./agent-store.js";
 import type { JsonObject } from "../tools/types.js";
 
@@ -8,6 +8,7 @@ import type { JsonObject } from "../tools/types.js";
 // 好处是业务类可以专注编排，解析图片/视频结果、补 metadata 这些细节集中在这里测试和维护。
 const IMAGE_OUTPUT_TOOL_NAMES = new Set(["generate_image", "edit_image"]);
 const VIDEO_OUTPUT_TOOL_NAMES = new Set(["generate_video"]);
+const DOCUMENT_OUTPUT_TOOL_NAMES = new Set(["generate_document"]);
 
 export interface ExtractedImageResult {
   url: string;
@@ -51,6 +52,22 @@ export interface ExtractedVideoResult {
   metadata: JsonObject;
 }
 
+export interface DocumentRequestSlot {
+  outputIndex: number;
+  title?: string;
+  fileName?: string;
+  format?: string;
+}
+
+export interface ExtractedDocumentResult {
+  name: string;
+  mime: string;
+  contentBase64: string;
+  size?: number;
+  index: number;
+  metadata: JsonObject;
+}
+
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -81,10 +98,11 @@ export function summarizeToolResult(result: unknown): JsonObject {
 
   const imageUrls = toStringArray(result.imageUrls);
   const videoUrls = toStringArray(result.videoUrls);
+  const documents = Array.isArray(result.documents) ? result.documents : undefined;
   const items = Array.isArray(result.items) ? result.items : undefined;
 
   return compactJsonObject({
-    outputCount: imageUrls.length || videoUrls.length || items?.length,
+    outputCount: imageUrls.length || videoUrls.length || documents?.length || items?.length,
     provider: result.provider,
     resultType: result.type
   });
@@ -98,8 +116,12 @@ export function isVideoOutputToolName(toolName: string): boolean {
   return VIDEO_OUTPUT_TOOL_NAMES.has(toolName);
 }
 
-export function isMediaOutputToolName(toolName: string): boolean {
-  return isImageOutputToolName(toolName) || isVideoOutputToolName(toolName);
+export function isDocumentOutputToolName(toolName: string): boolean {
+  return DOCUMENT_OUTPUT_TOOL_NAMES.has(toolName);
+}
+
+export function isResourceOutputToolName(toolName: string): boolean {
+  return isImageOutputToolName(toolName) || isVideoOutputToolName(toolName) || isDocumentOutputToolName(toolName);
 }
 
 export function isImageToolResultWithId(
@@ -112,6 +134,12 @@ export function isVideoToolResultWithId(
   event: AgentStreamEvent
 ): event is Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: string; toolCallId: string } {
   return event.type === "tool_result" && isVideoOutputToolName(event.toolName) && typeof event.toolCallId === "string";
+}
+
+export function isDocumentToolResultWithId(
+  event: AgentStreamEvent
+): event is Extract<AgentStreamEvent, { type: "tool_result" }> & { toolName: string; toolCallId: string } {
+  return event.type === "tool_result" && isDocumentOutputToolName(event.toolName) && typeof event.toolCallId === "string";
 }
 
 export function getProcessStepCompletionPatch(
@@ -178,6 +206,15 @@ export function extractVideoRequestSlot(argumentsJson: JsonObject): VideoRequest
   };
 }
 
+export function extractDocumentRequestSlot(argumentsJson: JsonObject): DocumentRequestSlot {
+  return {
+    outputIndex: 0,
+    title: toOptionalString(argumentsJson.title),
+    fileName: toOptionalString(argumentsJson.fileName),
+    format: toOptionalString(argumentsJson.format)
+  };
+}
+
 export function buildImageMetadata(input: {
   prompt?: string;
   width?: number;
@@ -221,12 +258,32 @@ export function buildVideoMetadata(input: {
   });
 }
 
-export function findGeneratedImagePartIndex(parts: MessagePart[], input: GeneratedImagePartInput) {
+export function buildDocumentMetadata(input: {
+  title?: string;
+  fileName?: string;
+  format?: string;
+  outputIndex: number;
+  provider?: unknown;
+  size?: number;
+  error?: unknown;
+}): JsonObject {
+  return compactJsonObject({
+    title: input.title,
+    fileName: input.fileName,
+    format: input.format,
+    outputIndex: input.outputIndex,
+    provider: input.provider,
+    size: input.size,
+    error: input.error
+  });
+}
+
+export function findGeneratedResourcePartIndex(parts: MessagePart[], input: GeneratedResourcePartInput) {
   // 优先用 resourceId 命中，因为它最稳定；还没有 resourceId 时退回 toolCallId + outputIndex。
   // 这保证 pending 占位、成功结果、失败结果会更新同一个 message part，而不是越插越多。
   return parts.findIndex(
     (part) =>
-      part.type === "media" &&
+      part.type === "resource" &&
       (part.extra?.resource?.id === input.resourceId ||
         (part.extra?.tool?.toolCallId === input.toolCallId && part.extra.tool.outputIndex === input.outputIndex))
   );
@@ -364,5 +421,44 @@ export function extractVideoAssets(result: unknown, startIndex: number): Extract
         taskId: result.taskId
       })
     };
+  });
+}
+
+export function extractDocumentAssets(result: unknown, startIndex: number): ExtractedDocumentResult[] {
+  if (!isRecord(result)) {
+    return [];
+  }
+
+  const documents = Array.isArray(result.documents) ? result.documents.filter(isRecord) : [];
+  let nextIndex = startIndex;
+
+  return documents.flatMap((document) => {
+    const contentBase64 = toOptionalString(document.contentBase64);
+
+    if (!contentBase64) {
+      return [];
+    }
+
+    const index = toOptionalNumber(document.index) ?? nextIndex;
+    nextIndex = Math.max(nextIndex + 1, index + 1);
+    const name = toOptionalString(document.name) ?? `document-${index + 1}`;
+    const mime = toOptionalString(document.mime) ?? "application/octet-stream";
+    const size = toOptionalNumber(document.size);
+
+    return [
+      {
+        name,
+        mime,
+        contentBase64,
+        size,
+        index,
+        metadata: compactJsonObject({
+          provider: result.provider,
+          size,
+          format: result.format,
+          title: result.title
+        })
+      }
+    ];
   });
 }

@@ -1,6 +1,6 @@
 import type { JsonObject } from "../tools/types.js";
 
-export type PlaceholderType = "text" | "input" | "select" | "image" | "video" | "skill";
+export type PlaceholderType = "text" | "input" | "select" | "image" | "video" | "document" | "skill";
 export type LifecycleState = "pending" | "succeeded" | "failed";
 
 export interface PlaceholderOption {
@@ -50,7 +50,7 @@ export interface PartExtra {
 }
 
 interface PartBase {
-  type: "text" | "media";
+  type: "text" | "resource";
   extra?: PartExtra;
 }
 
@@ -59,8 +59,8 @@ export interface TextPart extends PartBase {
   value: string;
 }
 
-export interface MediaPart extends PartBase {
-  type: "media";
+export interface ResourcePart extends PartBase {
+  type: "resource";
   mime?: string;
   url?: string;
   name?: string;
@@ -68,7 +68,7 @@ export interface MediaPart extends PartBase {
   height?: number;
 }
 
-export type MessagePart = TextPart | MediaPart;
+export type MessagePart = TextPart | ResourcePart;
 
 export function createTextPart(value: string): TextPart {
   return { type: "text", value };
@@ -85,8 +85,8 @@ export function stripRuntimePartFields(parts: Array<MessagePart & Record<string,
 
 export function partsToLlmText(parts: MessagePart[]): string {
   // MessagePart 是给产品展示用的结构化消息；LLM 只需要一段可读文本。
-  // pending 的媒体不参与投影，避免模型把“正在生成中”的资源当作已经可用。
-  return projectParts(parts, { includePendingMedia: false }).join("\n");
+  // pending 的资源不参与投影，避免模型把“正在生成中”的资源当作已经可用。
+  return projectParts(parts, { includePendingResource: false }).join("\n");
 }
 
 export function appendTextDelta(parts: MessagePart[], partIndex: number, delta: string): MessagePart[] {
@@ -110,7 +110,7 @@ export function ensureAppendableTextPart(parts: MessagePart[]): { parts: Message
   return { parts: [...parts, createTextPart("")], partIndex: parts.length };
 }
 
-export interface GeneratedImagePartInput {
+export interface GeneratedResourcePartInput {
   state: LifecycleState;
   resourceId: string;
   toolName: string;
@@ -129,24 +129,24 @@ export interface GeneratedImagePartInput {
   generation?: PartExtra["generation"];
 }
 
-export function upsertGeneratedImageParts(parts: MessagePart[], input: GeneratedImagePartInput): MessagePart[] {
+export function upsertGeneratedResourceParts(parts: MessagePart[], input: GeneratedResourcePartInput): MessagePart[] {
   // 生成类工具通常先插入 pending 占位，再用同一个 resource/toolCall/outputIndex 更新成成功或失败。
   // 用 upsert 而不是 append，可以避免流式事件重放或进度更新时重复出现同一张图。
   const existingIndex = parts.findIndex(
     (part) =>
-      part.type === "media" &&
+      part.type === "resource" &&
       ((part.extra?.resource?.id === input.resourceId) ||
         (part.extra?.tool?.toolCallId === input.toolCallId && part.extra.tool.outputIndex === input.outputIndex))
   );
-  const mediaPart: MediaPart = removeUndefinedDeep({
-    type: "media",
+  const resourcePart: ResourcePart = removeUndefinedDeep({
+    type: "resource",
     mime: input.mime,
     url: input.url,
     name: input.name,
     width: input.width,
     height: input.height,
     extra: {
-      placeholder: input.state === "pending" ? getGeneratedMediaPlaceholder(input.mime) : undefined,
+      placeholder: input.state === "pending" ? getGeneratedResourcePlaceholder(input.mime) : undefined,
       lifecycle: {
         state: input.state,
         error: input.error
@@ -160,26 +160,40 @@ export function upsertGeneratedImageParts(parts: MessagePart[], input: Generated
       },
       generation: input.generation
     }
-  }) as MediaPart;
+  }) as ResourcePart;
 
   if (existingIndex === -1) {
-    return [...parts, mediaPart];
+    return [...parts, resourcePart];
   }
 
-  return parts.map((part, index) => (index === existingIndex ? mediaPart : part));
+  return parts.map((part, index) => (index === existingIndex ? resourcePart : part));
 }
 
-function getGeneratedMediaPlaceholder(mime?: string) {
+function getGeneratedResourcePlaceholder(mime?: string) {
   if (mime?.startsWith("video/")) {
     return { type: "video" as const, label: "视频生成中" };
+  }
+
+  if (isDocumentMime(mime)) {
+    return { type: "document" as const, label: "文档生成中" };
   }
 
   return { type: "image" as const, label: "图片生成中" };
 }
 
-function projectParts(parts: MessagePart[], options: { includePendingMedia: boolean }): string[] {
+function isDocumentMime(mime?: string) {
+  return (
+    mime?.startsWith("text/") ||
+    mime === "application/markdown" ||
+    mime === "application/pdf" ||
+    mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+    mime === "application/msword"
+  );
+}
+
+function projectParts(parts: MessagePart[], options: { includePendingResource: boolean }): string[] {
   return parts
-    .map((part) => (part.type === "text" ? projectTextPart(part) : projectMediaPart(part, options)))
+    .map((part) => (part.type === "text" ? projectTextPart(part) : projectResourcePart(part, options)))
     .filter((line) => line.trim().length > 0);
 }
 
@@ -200,12 +214,12 @@ function projectTextPart(part: TextPart): string {
   return part.value;
 }
 
-function projectMediaPart(part: MediaPart, options: { includePendingMedia: boolean }): string {
+function projectResourcePart(part: ResourcePart, options: { includePendingResource: boolean }): string {
   const state = part.extra?.lifecycle?.state;
 
-  // 媒体 part 对 LLM 的价值是“有什么资源、资源是否失败、资源地址是否可访问”。
+  // resource part 对 LLM 的价值是“有什么资源、资源是否失败、资源地址是否可访问”。
   // base64、本地 blob 等前端专用地址不投影，避免上下文暴涨或给模型不可用链接。
-  if (state === "pending" && !options.includePendingMedia) {
+  if (state === "pending" && !options.includePendingResource) {
     return "";
   }
 
@@ -214,17 +228,17 @@ function projectMediaPart(part: MediaPart, options: { includePendingMedia: boole
     return message ? `资源生成失败：${message}` : "资源生成失败。";
   }
 
-  const label = part.name ?? part.extra?.placeholder?.label ?? "媒体资源";
-  const mediaUrl = toProjectableMediaUrl(part.url);
+  const label = part.name ?? part.extra?.placeholder?.label ?? "资源";
+  const resourceUrl = toProjectableResourceUrl(part.url);
 
-  if (mediaUrl) {
-    return `${label}：${mediaUrl}`;
+  if (resourceUrl) {
+    return `${label}：${resourceUrl}`;
   }
 
   return label;
 }
 
-function toProjectableMediaUrl(url?: string): string | undefined {
+function toProjectableResourceUrl(url?: string): string | undefined {
   if (!url) {
     return undefined;
   }

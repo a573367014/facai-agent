@@ -87,5 +87,5 @@ export function AgentComposer(props: AgentComposerProps) {
 }
 
 function hasSubmittableParts(parts: RuntimePart[]) {
-  return parts.some((part) => part.type === "media" || (part.type === "text" && part.value.trim().length > 0));
+  return parts.some((part) => part.type === "resource" || (part.type === "text" && part.value.trim().length > 0));
 }

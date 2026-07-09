@@ -3,9 +3,9 @@ import { describe, expect, it } from "vitest";
 import { partSchema } from "./part-schema";
 import { getSelectedParts, partsToDoc, type RuntimePart } from "./part-serialization";
 
-function mediaPart(name: string): RuntimePart {
+function resourcePart(name: string): RuntimePart {
   return {
-    type: "media",
+    type: "resource",
     mime: "image/png",
     url: `http://localhost:4001/uploads/images/${name}`,
     name,
@@ -24,11 +24,11 @@ function createState(parts: RuntimePart[]) {
   });
 }
 
-function findFirstMediaPosition(state: EditorState) {
+function findFirstResourcePosition(state: EditorState) {
   let found: number | undefined;
 
   state.doc.descendants((node, pos) => {
-    if (typeof found !== "number" && node.type.name === "media_part") {
+    if (typeof found !== "number" && node.type.name === "resource_part") {
       found = pos;
       return false;
     }
@@ -37,22 +37,22 @@ function findFirstMediaPosition(state: EditorState) {
   });
 
   if (typeof found !== "number") {
-    throw new Error("未找到 media_part");
+    throw new Error("未找到 resource_part");
   }
 
   return found;
 }
 
 describe("part selection serialization", () => {
-  it("extracts selected text and media parts without flattening media to plain text", () => {
-    const state = createState([{ type: "text", value: "看这个" }, mediaPart("a.png"), { type: "text", value: "然后继续" }]);
-    const mediaPosition = findFirstMediaPosition(state);
-    const selection = TextSelection.create(state.doc, 2, mediaPosition + 3);
+  it("extracts selected text and resource parts without flattening resource to plain text", () => {
+    const state = createState([{ type: "text", value: "看这个" }, resourcePart("a.png"), { type: "text", value: "然后继续" }]);
+    const resourcePosition = findFirstResourcePosition(state);
+    const selection = TextSelection.create(state.doc, 2, resourcePosition + 3);
     const selectedState = state.apply(state.tr.setSelection(selection));
 
     expect(getSelectedParts(selectedState.doc, selectedState.selection)).toEqual([
       { type: "text", value: "这个" },
-      mediaPart("a.png"),
+      resourcePart("a.png"),
       { type: "text", value: "然后" }
     ]);
   });

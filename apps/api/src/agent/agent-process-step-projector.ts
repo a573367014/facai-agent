@@ -291,6 +291,12 @@ function getToolProcessLabels(toolName: string) {
         succeeded: "视频已生成",
         failed: "视频生成失败"
       };
+    case "generate_document":
+      return {
+        running: "正在生成文档",
+        succeeded: "文档已生成",
+        failed: "文档生成失败"
+      };
     case "web_search":
       return {
         running: "正在查找资料",

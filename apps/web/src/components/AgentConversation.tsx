@@ -9,7 +9,7 @@ import {
   type WheelEvent
 } from "react";
 import type { AgentProcessStepRecord, AgentResourceRecord, AgentState, AgentStreamEvent, MessagePart } from "../api/agent-client";
-import type { ToolImageActionPayload } from "./ToolResultPreview";
+import type { ToolResourceActionPayload } from "./ToolResultPreview";
 import { MessagePartRenderer } from "./MessagePartRenderer";
 import type { UserPartSurfaceHandle } from "./UserPartSurface";
 
@@ -36,7 +36,7 @@ interface AgentConversationProps {
   error?: string | null;
   hasMoreMessages?: boolean;
   isLoadingOlderMessages?: boolean;
-  onImageAction?: (payload: ToolImageActionPayload) => void;
+  onResourceAction?: (payload: ToolResourceActionPayload) => void;
   onLoadOlderMessages?: () => void;
   onEditUserMessage?: (text: string) => void;
   onReuseUserMessage?: (parts: MessagePart[]) => void;
@@ -204,7 +204,7 @@ function getTextContent(parts: MessagePart[]) {
 }
 
 function hasReusableUserParts(parts: MessagePart[]) {
-  return parts.some((part) => part.type === "media" || (part.type === "text" && part.value.trim().length > 0));
+  return parts.some((part) => part.type === "resource" || (part.type === "text" && part.value.trim().length > 0));
 }
 
 function copyText(value: string) {
@@ -274,7 +274,7 @@ export function AgentConversation({
   error,
   hasMoreMessages = false,
   isLoadingOlderMessages = false,
-  onImageAction,
+  onResourceAction,
   onLoadOlderMessages,
   onEditUserMessage,
   onReuseUserMessage,
@@ -564,7 +564,7 @@ export function AgentConversation({
                             parts={message.parts}
                             resourcesById={resourcesById}
                             showCursor={showCursor}
-                            onImageAction={onImageAction}
+                            onResourceAction={onResourceAction}
                             userPartSurfaceRef={message.role === "user" ? setUserPartSurfaceRef(message.id) : undefined}
                           />
                         ) : message.role === "assistant" && message.status === "running" ? (

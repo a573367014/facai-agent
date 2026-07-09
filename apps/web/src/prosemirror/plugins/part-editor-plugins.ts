@@ -10,7 +10,7 @@ export interface InlineBoundaryCaretPluginOptions {
   beforeNodeNames?: string[];
 }
 
-export interface AtomicMediaDeletePluginOptions {
+export interface AtomicResourceDeletePluginOptions {
   nodeNames?: string[];
 }
 
@@ -48,7 +48,7 @@ function isTargetAtomNode(node: ProseMirrorNode | null, nodeNames?: string[]): n
 
 function needsBoundaryCaret(nodeBefore: ProseMirrorNode | null, nodeAfter: ProseMirrorNode | null, nodeNames?: string[]) {
   // inline atom 后面紧跟非文本节点时，浏览器光标有时没有明显落点。
-  // 插入一个不可见分隔元素，可以让用户知道光标在媒体后面。
+  // 插入一个不可见分隔元素，可以让用户知道光标在资源后面。
   return isTargetAtomNode(nodeBefore, nodeNames) && Boolean(nodeAfter && !nodeAfter.isText);
 }
 
@@ -123,11 +123,11 @@ export function createDropSelectionPlugin() {
   });
 }
 
-export function createAtomicMediaDeletePlugin(options: AtomicMediaDeletePluginOptions = {}) {
+export function createAtomicResourceDeletePlugin(options: AtomicResourceDeletePluginOptions = {}) {
   return new Plugin({
     props: {
       handleKeyDown(view, event) {
-        // media_part 是 atom 节点，删除时应该整体删掉。
+        // resource_part 是 atom 节点，删除时应该整体删掉。
         // 否则 Backspace/Delete 可能只移动光标，看起来像按键失效。
         if (event.key !== "Backspace" && event.key !== "Delete") {
           return false;
@@ -180,7 +180,7 @@ export function createInlineAtomArrowNavigationPlugin(options: InlineAtomArrowNa
 
 export function createInlineAtomSelectionHighlightPlugin(options: InlineAtomSelectionHighlightPluginOptions = {}) {
   const className = options.className ?? "is-range-selected";
-  const domSelector = options.domSelector ?? ".pm-part--media";
+  const domSelector = options.domSelector ?? ".pm-part--resource";
 
   return new Plugin({
     props: {
@@ -213,7 +213,7 @@ export function createInlineAtomSelectionHighlightPlugin(options: InlineAtomSele
       const ownerDocument = view.dom.ownerDocument;
       const refreshDomSelectionState = () => {
         // 浏览器原生 DOM selection 和 ProseMirror state selection 不总是同步到 class。
-        // 每次 selectionchange 主动刷新媒体节点高亮，让拖选/键盘选择的视觉反馈一致。
+        // 每次 selectionchange 主动刷新资源节点高亮，让拖选/键盘选择的视觉反馈一致。
         syncInlineAtomDomRangeSelection(view, {
           className,
           domSelector,
@@ -413,7 +413,7 @@ export function createPlainTextPastePlugin() {
           const messageParts = parseMessagePartsFromClipboard(clipboard.getData(AGENT_MESSAGE_PARTS_MIME));
 
           if (messageParts?.length) {
-            // 项目内部复制消息时会带自定义 MIME，粘贴回来可以保留媒体 part/extra 等结构化信息。
+            // 项目内部复制消息时会带自定义 MIME，粘贴回来可以保留资源 part/extra 等结构化信息。
             const slice = createMessagePartsSlice(view, messageParts);
 
             if (!slice.content.size) {
@@ -608,7 +608,7 @@ function createMessagePartsSlice(view: EditorView, parts: MessagePart[]) {
     }
 
     return [
-      view.state.schema.nodes.media_part.create({
+      view.state.schema.nodes.resource_part.create({
         mime: part.mime ?? "",
         url: part.url ?? "",
         name: part.name ?? "",

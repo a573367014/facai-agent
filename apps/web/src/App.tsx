@@ -38,7 +38,7 @@ import { AgentTimeline } from "./components/AgentTimeline";
 import { AgentComposer } from "./components/AgentComposer";
 import { KnowledgeAdminPanel } from "./components/KnowledgeAdminPanel";
 import { SessionSidebar, type SessionHistoryItem } from "./components/SessionSidebar";
-import type { ToolImageActionPayload } from "./components/ToolResultPreview";
+import type { ToolResourceActionPayload } from "./components/ToolResultPreview";
 import { stripRuntimeFields, type RuntimePart } from "./prosemirror/part-serialization";
 import "./styles.css";
 
@@ -400,7 +400,7 @@ function setTextPartValue(parts: MessagePart[] = [], value: string): MessagePart
 }
 
 function applyPartEventToMessage(message: ChatMessage, event: AgentStreamEvent): ChatMessage {
-  // 后端不会每次都重发整条消息：流式文本用 delta，媒体/占位用 created/updated。
+  // 后端不会每次都重发整条消息：流式文本用 delta，resource/占位用 created/updated。
   // 这个函数只负责把“一个 part 事件”折叠到当前 ChatMessage 上。
   if (event.type === "message.part.created") {
     const partIndex = normalizePartIndex(event.partIndex);
@@ -539,23 +539,23 @@ function buildHistoryItems(sessions: AgentSessionRecord[]): SessionHistoryItem[]
   }));
 }
 
-function appendQuotedMediaPart(currentParts: RuntimePart[], quotedMediaPart: RuntimePart): RuntimePart[] {
-  const meaningfulParts = currentParts.filter((part) => part.type === "media" || (part.type === "text" && part.value.trim()));
+function appendQuotedResourcePart(currentParts: RuntimePart[], quotedResourcePart: RuntimePart): RuntimePart[] {
+  const meaningfulParts = currentParts.filter((part) => part.type === "resource" || (part.type === "text" && part.value.trim()));
 
   if (meaningfulParts.length === 0) {
-    return [quotedMediaPart];
+    return [quotedResourcePart];
   }
 
-  return [...currentParts, quotedMediaPart];
+  return [...currentParts, quotedResourcePart];
 }
 
-function createQuotedMediaPart(payload: ToolImageActionPayload): RuntimePart {
+function createQuotedResourcePart(payload: ToolResourceActionPayload): RuntimePart {
   const prompt = payload.prompt.trim();
-  const mime = payload.mime ?? inferMediaMimeFromUrl(payload.url);
-  const mediaLabel = getMediaLabel(mime);
-  const name = prompt || `${mediaLabel} ${payload.index + 1}`;
+  const mime = payload.mime ?? inferResourceMimeFromUrl(payload.url);
+  const resourceLabel = getResourceLabel(mime);
+  const name = prompt || `${resourceLabel} ${payload.index + 1}`;
   const tool =
-    payload.trace.toolName === "media"
+    payload.trace.toolName === "resource"
       ? undefined
       : {
           name: payload.trace.toolName,
@@ -565,7 +565,7 @@ function createQuotedMediaPart(payload: ToolImageActionPayload): RuntimePart {
         };
 
   return {
-    type: "media",
+    type: "resource",
     mime,
     url: payload.url,
     name,
@@ -580,7 +580,7 @@ function createQuotedMediaPart(payload: ToolImageActionPayload): RuntimePart {
   };
 }
 
-function inferMediaMimeFromUrl(url: string) {
+function inferResourceMimeFromUrl(url: string) {
   const pathname = safeUrlPathname(url).toLowerCase();
 
   if (pathname.endsWith(".mp4")) {
@@ -610,7 +610,7 @@ function inferMediaMimeFromUrl(url: string) {
   return "image/png";
 }
 
-function getMediaLabel(mime: string) {
+function getResourceLabel(mime: string) {
   return mime.startsWith("video/") ? "视频" : "图片";
 }
 
@@ -1314,7 +1314,7 @@ export default function App() {
     }
 
     const submittedParts = stripRuntimeFields(composerParts).filter(
-      (part) => part.type === "media" || (part.type === "text" && part.value.trim())
+      (part) => part.type === "resource" || (part.type === "text" && part.value.trim())
     );
 
     if (submittedParts.length === 0) {
@@ -1442,12 +1442,12 @@ export default function App() {
     setComposerFocusToken((currentToken) => currentToken + 1);
   }
 
-  function handleImageAction(payload: ToolImageActionPayload) {
+  function handleResourceAction(payload: ToolResourceActionPayload) {
     if (payload.action !== "quote") {
       return;
     }
 
-    setComposerParts((currentParts) => appendQuotedMediaPart(currentParts, createQuotedMediaPart(payload)));
+    setComposerParts((currentParts) => appendQuotedResourcePart(currentParts, createQuotedResourcePart(payload)));
     setComposerFocusToken((currentToken) => currentToken + 1);
   }
 
@@ -1682,7 +1682,7 @@ export default function App() {
             hasMoreMessages={messagePageInfo.hasMore}
             isLoadingOlderMessages={isLoadingOlderMessages}
             onLoadOlderMessages={handleLoadOlderMessages}
-            onImageAction={handleImageAction}
+            onResourceAction={handleResourceAction}
             onReuseUserMessage={handleReuseUserMessage}
             onRegenerateMessage={handleRegenerateMessage}
             onSuggestionSelect={handleSuggestionSelect}

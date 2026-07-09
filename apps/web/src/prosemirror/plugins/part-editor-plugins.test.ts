@@ -6,7 +6,7 @@ import { partSchema } from "../part-schema";
 import { docToParts, partsToDoc, type RuntimePart } from "../part-serialization";
 import { AGENT_MESSAGE_PARTS_MIME, serializeMessagePartsForClipboard } from "../../utils/message-part-clipboard";
 import {
-  createAtomicMediaDeletePlugin,
+  createAtomicResourceDeletePlugin,
   createClearSelectionOnOutsidePointerPlugin,
   createDropSelectionPlugin,
   createInlineAtomSelectionHighlightPlugin,
@@ -21,7 +21,7 @@ function getPluginDecorations(plugin: ReturnType<typeof createInlineBoundaryCare
   return getDecorations?.(state);
 }
 
-function handlePluginKeyDown(plugin: ReturnType<typeof createAtomicMediaDeletePlugin>, view: EditorView, event: KeyboardEvent) {
+function handlePluginKeyDown(plugin: ReturnType<typeof createAtomicResourceDeletePlugin>, view: EditorView, event: KeyboardEvent) {
   const handleKeyDown = plugin.props.handleKeyDown as unknown as ((view: EditorView, event: KeyboardEvent) => boolean) | undefined;
 
   return handleKeyDown?.(view, event);
@@ -68,9 +68,9 @@ function createPasteEvent(input: { text: string; html?: string; types?: string[]
   return event;
 }
 
-function mediaPart(name: string): RuntimePart {
+function resourcePart(name: string): RuntimePart {
   return {
-    type: "media",
+    type: "resource",
     mime: "image/png",
     url: `http://localhost:4001/uploads/images/${name}`,
     name
@@ -86,11 +86,11 @@ function createState(parts: RuntimePart[], selectionPos?: number) {
   });
 }
 
-function findFirstMediaPosition(state: EditorState) {
+function findFirstResourcePosition(state: EditorState) {
   let found: number | undefined;
 
   state.doc.descendants((node, pos) => {
-    if (typeof found !== "number" && node.type.name === "media_part") {
+    if (typeof found !== "number" && node.type.name === "resource_part") {
       found = pos;
       return false;
     }
@@ -99,7 +99,7 @@ function findFirstMediaPosition(state: EditorState) {
   });
 
   if (typeof found !== "number") {
-    throw new Error("未找到 media_part");
+    throw new Error("未找到 resource_part");
   }
 
   return found;
@@ -107,21 +107,21 @@ function findFirstMediaPosition(state: EditorState) {
 
 describe("part editor plugins", () => {
   it("在两个 inline atom 中间补充边界光标锚点", () => {
-    const plugin = createInlineBoundaryCaretPlugin({ beforeNodeNames: ["media_part"] });
-    const baseState = createState([mediaPart("a.png"), mediaPart("b.png")]);
-    const firstMediaPosition = findFirstMediaPosition(baseState);
-    const state = createState([mediaPart("a.png"), mediaPart("b.png")], firstMediaPosition + 1);
+    const plugin = createInlineBoundaryCaretPlugin({ beforeNodeNames: ["resource_part"] });
+    const baseState = createState([resourcePart("a.png"), resourcePart("b.png")]);
+    const firstResourcePosition = findFirstResourcePosition(baseState);
+    const state = createState([resourcePart("a.png"), resourcePart("b.png")], firstResourcePosition + 1);
 
     const decorations = getPluginDecorations(plugin, state);
 
     expect(decorations?.find()).toHaveLength(1);
   });
 
-  it("media part 后面是文本时不插入额外边界光标锚点", () => {
-    const plugin = createInlineBoundaryCaretPlugin({ beforeNodeNames: ["media_part"] });
-    const baseState = createState([mediaPart("a.png"), { type: "text", value: "继续" }]);
-    const firstMediaPosition = findFirstMediaPosition(baseState);
-    const state = createState([mediaPart("a.png"), { type: "text", value: "继续" }], firstMediaPosition + 1);
+  it("resource part 后面是文本时不插入额外边界光标锚点", () => {
+    const plugin = createInlineBoundaryCaretPlugin({ beforeNodeNames: ["resource_part"] });
+    const baseState = createState([resourcePart("a.png"), { type: "text", value: "继续" }]);
+    const firstResourcePosition = findFirstResourcePosition(baseState);
+    const state = createState([resourcePart("a.png"), { type: "text", value: "继续" }], firstResourcePosition + 1);
 
     const decorations = getPluginDecorations(plugin, state);
 
@@ -130,122 +130,122 @@ describe("part editor plugins", () => {
 
   it("drop 后如果残留 NodeSelection，会把光标收敛到节点后方", () => {
     const plugin = createDropSelectionPlugin();
-    const oldState = createState([{ type: "text", value: "看" }, mediaPart("a.png"), { type: "text", value: "这张" }]);
-    const mediaPosition = findFirstMediaPosition(oldState);
-    const dropTransaction = oldState.tr.setSelection(NodeSelection.create(oldState.doc, mediaPosition)).setMeta("uiEvent", "drop");
+    const oldState = createState([{ type: "text", value: "看" }, resourcePart("a.png"), { type: "text", value: "这张" }]);
+    const resourcePosition = findFirstResourcePosition(oldState);
+    const dropTransaction = oldState.tr.setSelection(NodeSelection.create(oldState.doc, resourcePosition)).setMeta("uiEvent", "drop");
     const newState = oldState.apply(dropTransaction);
 
     const appended = plugin.spec.appendTransaction?.([dropTransaction], oldState, newState);
 
     expect(appended?.selection).toBeInstanceOf(TextSelection);
-    expect(appended?.selection.from).toBe(mediaPosition + 1);
+    expect(appended?.selection.from).toBe(resourcePosition + 1);
   });
 
-  it("Backspace 会删除光标前面的 media part", () => {
-    const plugin = createAtomicMediaDeletePlugin({ nodeNames: ["media_part"] });
-    const state = createState([{ type: "text", value: "看" }, mediaPart("a.png"), { type: "text", value: "这张" }]);
-    const mediaPosition = findFirstMediaPosition(state);
-    const cursorAfterMediaState = state.apply(state.tr.setSelection(TextSelection.create(state.doc, mediaPosition + 1)));
+  it("Backspace 会删除光标前面的 resource part", () => {
+    const plugin = createAtomicResourceDeletePlugin({ nodeNames: ["resource_part"] });
+    const state = createState([{ type: "text", value: "看" }, resourcePart("a.png"), { type: "text", value: "这张" }]);
+    const resourcePosition = findFirstResourcePosition(state);
+    const cursorAfterResourceState = state.apply(state.tr.setSelection(TextSelection.create(state.doc, resourcePosition + 1)));
     let nextState: EditorState | undefined;
 
     const handled = handlePluginKeyDown(
       plugin,
       {
-        state: cursorAfterMediaState,
+        state: cursorAfterResourceState,
         dispatch: (transaction: Transaction) => {
-          nextState = cursorAfterMediaState.apply(transaction);
+          nextState = cursorAfterResourceState.apply(transaction);
         }
       } as unknown as EditorView,
       new KeyboardEvent("keydown", { key: "Backspace" })
     );
 
     expect(handled).toBe(true);
-    expect(docToParts(nextState?.doc ?? cursorAfterMediaState.doc)).toEqual([
+    expect(docToParts(nextState?.doc ?? cursorAfterResourceState.doc)).toEqual([
       { type: "text", value: "看这张" }
     ]);
   });
 
-  it("Delete 会删除光标后面的 media part", () => {
-    const plugin = createAtomicMediaDeletePlugin({ nodeNames: ["media_part"] });
-    const state = createState([{ type: "text", value: "看" }, mediaPart("a.png"), { type: "text", value: "这张" }]);
-    const mediaPosition = findFirstMediaPosition(state);
-    const cursorBeforeMediaState = state.apply(state.tr.setSelection(TextSelection.create(state.doc, mediaPosition)));
+  it("Delete 会删除光标后面的 resource part", () => {
+    const plugin = createAtomicResourceDeletePlugin({ nodeNames: ["resource_part"] });
+    const state = createState([{ type: "text", value: "看" }, resourcePart("a.png"), { type: "text", value: "这张" }]);
+    const resourcePosition = findFirstResourcePosition(state);
+    const cursorBeforeResourceState = state.apply(state.tr.setSelection(TextSelection.create(state.doc, resourcePosition)));
     let nextState: EditorState | undefined;
 
     const handled = handlePluginKeyDown(
       plugin,
       {
-        state: cursorBeforeMediaState,
+        state: cursorBeforeResourceState,
         dispatch: (transaction: Transaction) => {
-          nextState = cursorBeforeMediaState.apply(transaction);
+          nextState = cursorBeforeResourceState.apply(transaction);
         }
       } as unknown as EditorView,
       new KeyboardEvent("keydown", { key: "Delete" })
     );
 
     expect(handled).toBe(true);
-    expect(docToParts(nextState?.doc ?? cursorBeforeMediaState.doc)).toEqual([
+    expect(docToParts(nextState?.doc ?? cursorBeforeResourceState.doc)).toEqual([
       { type: "text", value: "看这张" }
     ]);
   });
 
-  it("ArrowRight 在 media part 前面时跳到 part 后面", () => {
-    const plugin = createInlineAtomArrowNavigationPlugin({ nodeNames: ["media_part"] });
-    const state = createState([{ type: "text", value: "看" }, mediaPart("a.png"), { type: "text", value: "这张" }]);
-    const mediaPosition = findFirstMediaPosition(state);
-    const cursorBeforeMediaState = state.apply(state.tr.setSelection(TextSelection.create(state.doc, mediaPosition)));
+  it("ArrowRight 在 resource part 前面时跳到 part 后面", () => {
+    const plugin = createInlineAtomArrowNavigationPlugin({ nodeNames: ["resource_part"] });
+    const state = createState([{ type: "text", value: "看" }, resourcePart("a.png"), { type: "text", value: "这张" }]);
+    const resourcePosition = findFirstResourcePosition(state);
+    const cursorBeforeResourceState = state.apply(state.tr.setSelection(TextSelection.create(state.doc, resourcePosition)));
     let nextState: EditorState | undefined;
 
     const handled = handleArrowKeyDown(
       plugin,
       {
-        state: cursorBeforeMediaState,
+        state: cursorBeforeResourceState,
         dispatch: (transaction: Transaction) => {
-          nextState = cursorBeforeMediaState.apply(transaction);
+          nextState = cursorBeforeResourceState.apply(transaction);
         }
       } as unknown as EditorView,
       new KeyboardEvent("keydown", { key: "ArrowRight" })
     );
 
     expect(handled).toBe(true);
-    expect(nextState?.selection.from).toBe(mediaPosition + 1);
+    expect(nextState?.selection.from).toBe(resourcePosition + 1);
   });
 
-  it("ArrowLeft 在 media part 后面时跳到 part 前面", () => {
-    const plugin = createInlineAtomArrowNavigationPlugin({ nodeNames: ["media_part"] });
-    const state = createState([{ type: "text", value: "看" }, mediaPart("a.png"), { type: "text", value: "这张" }]);
-    const mediaPosition = findFirstMediaPosition(state);
-    const cursorAfterMediaState = state.apply(state.tr.setSelection(TextSelection.create(state.doc, mediaPosition + 1)));
+  it("ArrowLeft 在 resource part 后面时跳到 part 前面", () => {
+    const plugin = createInlineAtomArrowNavigationPlugin({ nodeNames: ["resource_part"] });
+    const state = createState([{ type: "text", value: "看" }, resourcePart("a.png"), { type: "text", value: "这张" }]);
+    const resourcePosition = findFirstResourcePosition(state);
+    const cursorAfterResourceState = state.apply(state.tr.setSelection(TextSelection.create(state.doc, resourcePosition + 1)));
     let nextState: EditorState | undefined;
 
     const handled = handleArrowKeyDown(
       plugin,
       {
-        state: cursorAfterMediaState,
+        state: cursorAfterResourceState,
         dispatch: (transaction: Transaction) => {
-          nextState = cursorAfterMediaState.apply(transaction);
+          nextState = cursorAfterResourceState.apply(transaction);
         }
       } as unknown as EditorView,
       new KeyboardEvent("keydown", { key: "ArrowLeft" })
     );
 
     expect(handled).toBe(true);
-    expect(nextState?.selection.from).toBe(mediaPosition);
+    expect(nextState?.selection.from).toBe(resourcePosition);
   });
 
-  it("NodeSelection 选中 media part 时方向键会收敛到 part 两侧", () => {
-    const plugin = createInlineAtomArrowNavigationPlugin({ nodeNames: ["media_part"] });
-    const state = createState([{ type: "text", value: "看" }, mediaPart("a.png"), { type: "text", value: "这张" }]);
-    const mediaPosition = findFirstMediaPosition(state);
-    const selectedMediaState = state.apply(state.tr.setSelection(NodeSelection.create(state.doc, mediaPosition)));
+  it("NodeSelection 选中 resource part 时方向键会收敛到 part 两侧", () => {
+    const plugin = createInlineAtomArrowNavigationPlugin({ nodeNames: ["resource_part"] });
+    const state = createState([{ type: "text", value: "看" }, resourcePart("a.png"), { type: "text", value: "这张" }]);
+    const resourcePosition = findFirstResourcePosition(state);
+    const selectedResourceState = state.apply(state.tr.setSelection(NodeSelection.create(state.doc, resourcePosition)));
     let nextState: EditorState | undefined;
 
     const handled = handleArrowKeyDown(
       plugin,
       {
-        state: selectedMediaState,
+        state: selectedResourceState,
         dispatch: (transaction: Transaction) => {
-          nextState = selectedMediaState.apply(transaction);
+          nextState = selectedResourceState.apply(transaction);
         }
       } as unknown as EditorView,
       new KeyboardEvent("keydown", { key: "ArrowRight" })
@@ -253,15 +253,15 @@ describe("part editor plugins", () => {
 
     expect(handled).toBe(true);
     expect(nextState?.selection).toBeInstanceOf(TextSelection);
-    expect(nextState?.selection.from).toBe(mediaPosition + 1);
+    expect(nextState?.selection.from).toBe(resourcePosition + 1);
   });
 
-  it("拖选范围经过 media part 时会给 part 添加选中态 class", () => {
-    const plugin = createInlineAtomSelectionHighlightPlugin({ nodeNames: ["media_part"] });
-    const baseState = createState([{ type: "text", value: "看" }, mediaPart("a.png"), { type: "text", value: "这张" }]);
-    const mediaPosition = findFirstMediaPosition(baseState);
+  it("拖选范围经过 resource part 时会给 part 添加选中态 class", () => {
+    const plugin = createInlineAtomSelectionHighlightPlugin({ nodeNames: ["resource_part"] });
+    const baseState = createState([{ type: "text", value: "看" }, resourcePart("a.png"), { type: "text", value: "这张" }]);
+    const resourcePosition = findFirstResourcePosition(baseState);
     const selectedState = baseState.apply(
-      baseState.tr.setSelection(TextSelection.create(baseState.doc, mediaPosition, mediaPosition + 1))
+      baseState.tr.setSelection(TextSelection.create(baseState.doc, resourcePosition, resourcePosition + 1))
     );
 
     const decorations = getPluginDecorations(plugin, selectedState);
@@ -270,55 +270,55 @@ describe("part editor plugins", () => {
     expect((decorations?.find()[0] as any)?.type.attrs.class).toContain("is-range-selected");
   });
 
-  it("浏览器 DOM 选区经过 media part 时会同步保持 part 选中态", () => {
+  it("浏览器 DOM 选区经过 resource part 时会同步保持 part 选中态", () => {
     const host = document.createElement("div");
     document.body.append(host);
     const view = new EditorView(host, {
       state: EditorState.create({
         schema: partSchema,
-        doc: partsToDoc([{ type: "text", value: "看" }, mediaPart("a.png"), { type: "text", value: "这张" }]),
-        plugins: [createInlineAtomSelectionHighlightPlugin({ nodeNames: ["media_part"] })]
+        doc: partsToDoc([{ type: "text", value: "看" }, resourcePart("a.png"), { type: "text", value: "这张" }]),
+        plugins: [createInlineAtomSelectionHighlightPlugin({ nodeNames: ["resource_part"] })]
       })
     });
     const paragraph = view.dom.querySelector("p");
-    const mediaElement = view.dom.querySelector(".pm-part--media");
+    const resourceElement = view.dom.querySelector(".pm-part--resource");
     const firstTextNode = paragraph?.firstChild;
 
-    expect(mediaElement).toBeInstanceOf(HTMLElement);
+    expect(resourceElement).toBeInstanceOf(HTMLElement);
     expect(firstTextNode).toBeInstanceOf(Text);
 
     const range = document.createRange();
     range.setStart(firstTextNode as Text, 0);
-    range.setEndAfter(mediaElement as HTMLElement);
+    range.setEndAfter(resourceElement as HTMLElement);
     const selection = document.getSelection();
     selection?.removeAllRanges();
     selection?.addRange(range);
 
     document.dispatchEvent(new Event("selectionchange"));
 
-    expect(mediaElement).toHaveClass("is-range-selected");
+    expect(resourceElement).toHaveClass("is-range-selected");
 
     selection?.removeAllRanges();
     document.dispatchEvent(new Event("selectionchange"));
 
-    expect(mediaElement).not.toHaveClass("is-range-selected");
+    expect(resourceElement).not.toHaveClass("is-range-selected");
 
     view.destroy();
     host.remove();
   });
 
-  it("点击编辑器外部会把非空选区收敛到光标，避免 media part 高亮残留", () => {
+  it("点击编辑器外部会把非空选区收敛到光标，避免 resource part 高亮残留", () => {
     const host = document.createElement("div");
     const outside = document.createElement("button");
     document.body.append(host, outside);
-    const doc = partsToDoc([{ type: "text", value: "看" }, mediaPart("a.png"), { type: "text", value: "这张" }]);
+    const doc = partsToDoc([{ type: "text", value: "看" }, resourcePart("a.png"), { type: "text", value: "这张" }]);
     const baseState = EditorState.create({ schema: partSchema, doc });
-    const mediaPosition = findFirstMediaPosition(baseState);
+    const resourcePosition = findFirstResourcePosition(baseState);
     const view = new EditorView(host, {
       state: EditorState.create({
         schema: partSchema,
         doc,
-        selection: TextSelection.create(doc, mediaPosition, mediaPosition + 1),
+        selection: TextSelection.create(doc, resourcePosition, resourcePosition + 1),
         plugins: [createClearSelectionOnOutsidePointerPlugin()]
       })
     });
@@ -328,7 +328,7 @@ describe("part editor plugins", () => {
     fireEvent.click(outside);
 
     expect(view.state.selection.empty).toBe(true);
-    expect(view.state.selection.from).toBe(mediaPosition + 1);
+    expect(view.state.selection.from).toBe(resourcePosition + 1);
 
     view.destroy();
     host.remove();
@@ -337,7 +337,7 @@ describe("part editor plugins", () => {
 
   it("全选后粘贴纯文本时不会保留额外换行", () => {
     const plugin = createPlainTextPastePlugin();
-    const state = createState([{ type: "text", value: "旧" }, mediaPart("a.png"), { type: "text", value: "内容" }]);
+    const state = createState([{ type: "text", value: "旧" }, resourcePart("a.png"), { type: "text", value: "内容" }]);
     const selectedState = state.apply(state.tr.setSelection(new AllSelection(state.doc)));
     let nextState: EditorState | undefined;
     const event = createPasteEvent({ text: "新内容" });
@@ -358,9 +358,9 @@ describe("part editor plugins", () => {
     expect(docToParts(nextState?.doc ?? selectedState.doc)).toEqual([{ type: "text", value: "新内容" }]);
   });
 
-  it("粘贴 agent message parts 剪贴板时会还原 media part，而不是粘成文件名文本", () => {
+  it("粘贴 agent message parts 剪贴板时会还原 resource part，而不是粘成文件名文本", () => {
     const plugin = createPlainTextPastePlugin();
-    const pastedParts = [{ type: "text" as const, value: "看这个 " }, mediaPart("a.png"), { type: "text" as const, value: " 继续" }];
+    const pastedParts = [{ type: "text" as const, value: "看这个 " }, resourcePart("a.png"), { type: "text" as const, value: " 继续" }];
     const state = createState([{ type: "text", value: "" }]);
     let nextState: EditorState | undefined;
     const event = createPasteEvent({

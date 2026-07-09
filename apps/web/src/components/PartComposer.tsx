@@ -8,7 +8,7 @@ import { EditorView } from "prosemirror-view";
 import { docToParts, partsToDoc, stripRuntimeFields, type RuntimePart } from "../prosemirror/part-serialization";
 import { partSchema } from "../prosemirror/part-schema";
 import {
-  createAtomicMediaDeletePlugin,
+  createAtomicResourceDeletePlugin,
   createClearSelectionOnOutsidePointerPlugin,
   createDropSelectionPlugin,
   createImageUploadEntryPlugin,
@@ -186,8 +186,8 @@ function createEditorState(input: {
 }) {
   const doc = partsToDoc(input.parts);
 
-  // 一个消息编辑器里同时混有普通文本和媒体 atom。
-  // 文本走 ProseMirror 默认编辑能力，媒体通过自定义插件处理上传、删除、选择和方向键导航。
+  // 一个消息编辑器里同时混有普通文本和 resource atom。
+  // 文本走 ProseMirror 默认编辑能力，resource 通过自定义插件处理上传、删除、选择和方向键导航。
   return EditorState.create({
     schema: partSchema,
     doc,
@@ -222,7 +222,7 @@ function createEditorState(input: {
         props: {
           handleDOMEvents: {
             mousedown(view, event) {
-              const removeButton = closestMediaRemoveButtonElement(event.target);
+              const removeButton = closestResourceRemoveButtonElement(event.target);
 
               if (removeButton) {
                 event.preventDefault();
@@ -243,15 +243,15 @@ function createEditorState(input: {
               return false;
             },
             click(view, event) {
-              const removeButton = closestMediaRemoveButtonElement(event.target);
+              const removeButton = closestResourceRemoveButtonElement(event.target);
 
               if (removeButton) {
                 event.preventDefault();
-                deleteMediaPartFromRemoveButton(view, removeButton);
+                deleteResourcePartFromRemoveButton(view, removeButton);
                 return true;
               }
 
-              const target = closestMediaPartElement(event.target);
+              const target = closestResourcePartElement(event.target);
 
               if (!(target instanceof HTMLElement)) {
                 if (event.target === view.dom) {
@@ -261,11 +261,11 @@ function createEditorState(input: {
                 return false;
               }
 
-              const replacementRange = findMediaReplacementRange(view, target);
+              const replacementRange = findResourceReplacementRange(view, target);
               input.pendingReplacementRangeRef.current = replacementRange;
-              clearMediaClickSelection(view, replacementRange);
+              clearResourceClickSelection(view, replacementRange);
 
-              if (isVideoMediaElement(target)) {
+              if (!isImageResourceElement(target)) {
                 event.preventDefault();
                 return true;
               }
@@ -277,12 +277,12 @@ function createEditorState(input: {
           }
         }
       }),
-      createInlineBoundaryCaretPlugin({ beforeNodeNames: ["media_part"] }),
-      createInlineAtomSelectionHighlightPlugin({ nodeNames: ["media_part"] }),
+      createInlineBoundaryCaretPlugin({ beforeNodeNames: ["resource_part"] }),
+      createInlineAtomSelectionHighlightPlugin({ nodeNames: ["resource_part"] }),
       createClearSelectionOnOutsidePointerPlugin(),
       createDropSelectionPlugin(),
-      createAtomicMediaDeletePlugin({ nodeNames: ["media_part"] }),
-      createInlineAtomArrowNavigationPlugin({ nodeNames: ["media_part"] }),
+      createAtomicResourceDeletePlugin({ nodeNames: ["resource_part"] }),
+      createInlineAtomArrowNavigationPlugin({ nodeNames: ["resource_part"] }),
       keymap(baseKeymap)
     ]
   });
@@ -302,13 +302,13 @@ async function uploadAndInsertImage(
   }
 
   const part = await onUploadImage(file);
-  if (part.type !== "media") {
+  if (part.type !== "resource") {
     return;
   }
 
-  // 点击已有图片会记录 replacementRange，此时上传完成后替换旧媒体；
+  // 点击已有图片会记录 replacementRange，此时上传完成后替换旧资源；
   // 直接粘贴/拖拽/选择文件则插入到当前光标位置。
-  const node = partSchema.nodes.media_part.create({
+  const node = partSchema.nodes.resource_part.create({
     mime: part.mime ?? "",
     url: part.url ?? "",
     name: part.name ?? "",
@@ -323,42 +323,42 @@ async function uploadAndInsertImage(
   view.focus();
 }
 
-function closestMediaPartElement(target: EventTarget | null): HTMLElement | null {
+function closestResourcePartElement(target: EventTarget | null): HTMLElement | null {
   if (target instanceof Element) {
-    return target.closest(".pm-part--media") as HTMLElement | null;
+    return target.closest(".pm-part--resource") as HTMLElement | null;
   }
 
   if (target instanceof Text) {
-    return target.parentElement?.closest(".pm-part--media") as HTMLElement | null;
+    return target.parentElement?.closest(".pm-part--resource") as HTMLElement | null;
   }
 
   return null;
 }
 
-function isVideoMediaElement(element: HTMLElement) {
-  return element.dataset.mime?.startsWith("video/") ?? false;
+function isImageResourceElement(element: HTMLElement) {
+  return element.dataset.mime?.startsWith("image/") ?? false;
 }
 
-function closestMediaRemoveButtonElement(target: EventTarget | null): HTMLElement | null {
+function closestResourceRemoveButtonElement(target: EventTarget | null): HTMLElement | null {
   if (target instanceof Element) {
-    return target.closest(".pm-part-media-remove") as HTMLElement | null;
+    return target.closest(".pm-part-resource-remove") as HTMLElement | null;
   }
 
   if (target instanceof Text) {
-    return target.parentElement?.closest(".pm-part-media-remove") as HTMLElement | null;
+    return target.parentElement?.closest(".pm-part-resource-remove") as HTMLElement | null;
   }
 
   return null;
 }
 
-function deleteMediaPartFromRemoveButton(view: EditorView, button: HTMLElement) {
-  const mediaElement = button.closest(".pm-part--media");
+function deleteResourcePartFromRemoveButton(view: EditorView, button: HTMLElement) {
+  const resourceElement = button.closest(".pm-part--resource");
 
-  if (!(mediaElement instanceof HTMLElement)) {
+  if (!(resourceElement instanceof HTMLElement)) {
     return;
   }
 
-  const range = findMediaReplacementRange(view, mediaElement);
+  const range = findResourceReplacementRange(view, resourceElement);
 
   if (!range) {
     return;
@@ -379,15 +379,15 @@ function moveSelectionToEndWhenAtDocumentStart(view: EditorView) {
   view.dispatch(view.state.tr.setSelection(TextSelection.atEnd(view.state.doc)));
 }
 
-function findMediaReplacementRange(view: EditorView, element: HTMLElement): ReplacementRange | undefined {
+function findResourceReplacementRange(view: EditorView, element: HTMLElement): ReplacementRange | undefined {
   // ProseMirror 的 posAtDOM 对 atom 节点有时会落在节点前后边界。
-  // 同时检查当前位置和前一位，能稳定找到 media_part 的真实范围。
+  // 同时检查当前位置和前一位，能稳定找到 resource_part 的真实范围。
   const candidatePositions = [view.posAtDOM(element, 0), Math.max(0, view.posAtDOM(element, 0) - 1)];
 
   for (const from of candidatePositions) {
     const node = view.state.doc.nodeAt(from);
 
-    if (node?.type.name === "media_part") {
+    if (node?.type.name === "resource_part") {
       return { from, to: from + node.nodeSize };
     }
   }
@@ -395,7 +395,7 @@ function findMediaReplacementRange(view: EditorView, element: HTMLElement): Repl
   return undefined;
 }
 
-function clearMediaClickSelection(view: EditorView, replacementRange?: ReplacementRange) {
+function clearResourceClickSelection(view: EditorView, replacementRange?: ReplacementRange) {
   if (!replacementRange) {
     return;
   }
@@ -411,7 +411,7 @@ function clearMediaClickSelection(view: EditorView, replacementRange?: Replaceme
     view.state.tr
       .setSelection(selection)
       .setMeta("addToHistory", false)
-      .setMeta("actionType", "media.click.clear-selection")
+      .setMeta("actionType", "resource.click.clear-selection")
   );
 }
 
