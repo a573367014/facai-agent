@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { calculatorTool } from "../../src/tools/calculator.js";
+import { calculatorTool } from "../../src/modules/tools/calculator.js";
 
 describe("calculatorTool", () => {
   it("计算安全算术表达式", async () => {

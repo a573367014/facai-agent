@@ -3,7 +3,7 @@ import {
   InMemoryAgentRunLock,
   RedisAgentRunLock,
   type RedisRunLockClient
-} from "../../src/agent/agent-run-lock.js";
+} from "../../src/modules/agent/agent-run-lock.js";
 
 class FakeRedisRunLockClient implements RedisRunLockClient {
   readonly values = new Map<string, string>();

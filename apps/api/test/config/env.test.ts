@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { loadEnv } from "../../src/config/env.js";
+import { loadEnv } from "../../src/platform/config/env.js";
 
 describe("loadEnv", () => {
   it("解析上下文构建配置", () => {

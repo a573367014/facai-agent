@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createEmbeddingService, OllamaEmbeddingService } from "../../src/knowledge/embedding-service.js";
+import { createEmbeddingService, OllamaEmbeddingService } from "../../src/modules/knowledge/embedding-service.js";
 
 const originalFetch = globalThis.fetch;
 

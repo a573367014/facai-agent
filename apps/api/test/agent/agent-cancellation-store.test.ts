@@ -3,7 +3,7 @@ import {
   InMemoryAgentCancellationStore,
   RedisAgentCancellationStore,
   type RedisCancellationClient
-} from "../../src/agent/agent-cancellation-store.js";
+} from "../../src/modules/agent/agent-cancellation-store.js";
 
 class FakeRedisCancellationClient implements RedisCancellationClient {
   readonly values = new Map<string, string>();

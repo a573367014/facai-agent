@@ -1,0 +1,3 @@
+/* Stable entrypoint: keep legacy rules before the workspace refresh layer. */
+@import "./styles/legacy.css";
+@import "./styles/workspace-refresh.css";

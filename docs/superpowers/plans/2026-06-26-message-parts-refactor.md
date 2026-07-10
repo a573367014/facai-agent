@@ -1,93 +1,93 @@
-# Message Parts Refactor Implementation Plan
+# 消息分段重构实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **面向智能体执行者：** 必须使用子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans，逐项实施本计划。各步骤使用复选框（`- [ ]`）语法跟踪进度。
 
-**Goal:** Replace the current `content + assets` message model with a single `parts` protocol aligned with ai-chat-vue's text/media approach, then use a ProseMirror-based composer for rich user input.
+**目标：** 将当前的 `content + assets` 消息模型替换为单一的 `parts` 协议，使其与 ai-chat-vue 的文本/媒体方案保持一致，然后使用基于 ProseMirror 的编辑器实现富文本用户输入。
 
-**Architecture:** Persist every user and assistant message as `MessagePart[]` in `agent_messages.parts_json`. Stream updates address parts by `messageId + partIndex`; the backend projects parts into LLM-readable text instead of sending raw part JSON to the model. The frontend renders read-only message parts and edits draft parts through a React ProseMirror composer.
+**架构：** 将每条用户消息和助手消息以 `MessagePart[]` 的形式持久化到 `agent_messages.parts_json`。流式更新通过 `messageId + partIndex` 定位分段；后端将分段投影为 LLM 可读文本，而不是向模型发送原始分段 JSON。前端渲染只读消息分段，并通过 React ProseMirror 编辑器编辑草稿分段。
 
-**Tech Stack:** Node.js, Fastify, TypeScript, sql.js, React, MUI, ProseMirror, Vitest, Testing Library.
-
----
-
-## File Structure
-
-- Create `apps/api/src/agent/message-parts.ts`
-  - Defines `MessagePart`, `TextPart`, `MediaPart`, `PartExtra`.
-  - Provides `stripRuntimePartFields`, `createTextPart`, `partsToLlmText`, `appendTextDelta`, `upsertGeneratedImageParts`, and legacy conversion helpers.
-
-- Modify `apps/api/src/agent/types.ts`
-  - Adds part-aware stream events: `message.part.created`, `message.part.delta`, `message.part.updated`.
-  - Adds `parts?: MessagePart[]` to `AgentExecutionInput`.
-
-- Modify `apps/api/src/agent/agent-store.ts`
-  - Replaces the primary message payload field with `parts: MessagePart[]`.
-  - Does not expose `content` on message records; the old SQLite `content` column remains only as a migration source and internal legacy mirror.
-  - Keeps `AgentAssetRecord` types temporarily for reading old rows, but new writes stop using assets.
-
-- Modify `apps/api/src/agent/sqlite-agent-store.ts`
-  - Adds `parts_json TEXT NOT NULL DEFAULT '[]'` to `agent_messages`.
-  - Reads legacy rows by converting `content` into a text part when `parts_json` is empty.
-  - Adds `updateMessageParts(messageId, parts)`.
-
-- Modify `apps/api/src/agent/agent-message-coordinator.ts`
-  - Creates user messages from submitted parts.
-  - Initializes assistant messages with one empty text part.
-  - Converts answer deltas and image tool events into `message.part.*` events and persisted parts.
-  - Stops writing new generated images to `agent_assets`.
-
-- Modify `apps/api/src/agent/context-builder.ts`
-  - Builds context from `message.parts` through `partsToLlmText`.
-
-- Modify `apps/api/src/routes/agent-routes.ts`
-  - Accepts `{ parts }` as the primary request body.
-  - Keeps `{ input }` compatibility by converting it to `[{ type: "text", value: input }]`.
-
-- Modify `apps/web/src/api/agent-client.ts`
-  - Exposes the same `MessagePart` protocol on the frontend.
-  - Changes `startAgentMessage` to send parts.
-  - Keeps `input` helper compatibility only inside call sites until App integration is complete.
-
-- Create `apps/web/src/components/MessagePartRenderer.tsx`
-  - Renders assistant text as Markdown.
-  - Renders user text as plain text.
-  - Renders media pending/succeeded/failed states from `extra.lifecycle`.
-
-- Create `apps/web/src/prosemirror/part-schema.ts`
-  - Defines the minimal ProseMirror schema for paragraph text, hard breaks, media atom nodes, and select atom nodes.
-
-- Create `apps/web/src/prosemirror/part-serialization.ts`
-  - Converts `RuntimePart[] <-> ProseMirror doc`.
-  - Strips `$` runtime fields before submit.
-
-- Create `apps/web/src/components/PartComposer.tsx`
-  - React ProseMirror composer.
-  - Supports text editing, Enter submit, Shift+Enter newline, and runtime part state.
-
-- Modify `apps/web/src/App.tsx`
-  - Replaces `input: string` state with `composerParts: RuntimePart[]`.
-  - Sends `MessagePart[]` to the API.
-  - Applies `message.part.*` events to active assistant message parts.
-
-- Modify `apps/web/src/components/AgentConversation.tsx`
-  - Removes `content/assets` rendering path as primary UI.
-  - Uses `MessagePartRenderer`.
-  - Keeps tool timeline panel as observability only.
-
-- Modify `apps/web/package.json`
-  - Adds ProseMirror dependencies.
+**技术栈：** Node.js、Fastify、TypeScript、sql.js、React、MUI、ProseMirror、Vitest、Testing Library。
 
 ---
 
-### Task 1: Define Backend Message Part Protocol
+## 文件结构
 
-**Files:**
-- Create: `apps/api/src/agent/message-parts.ts`
-- Test: `apps/api/test/agent/message-parts.test.ts`
+- 新建 `apps/api/src/agent/message-parts.ts`
+  - 定义 `MessagePart`、`TextPart`、`MediaPart`、`PartExtra`。
+  - 提供 `stripRuntimePartFields`、`createTextPart`、`partsToLlmText`、`appendTextDelta`、`upsertGeneratedImageParts` 以及旧格式转换辅助函数。
 
-- [ ] **Step 1: Write failing protocol tests**
+- 修改 `apps/api/src/agent/types.ts`
+  - 新增感知分段的流式事件：`message.part.created`、`message.part.delta`、`message.part.updated`。
+  - 为 `AgentExecutionInput` 新增 `parts?: MessagePart[]`。
 
-Create `apps/api/test/agent/message-parts.test.ts`:
+- 修改 `apps/api/src/agent/agent-store.ts`
+  - 将主要消息载荷字段替换为 `parts: MessagePart[]`。
+  - 不在消息记录上公开 `content`；旧的 SQLite `content` 列仅作为迁移来源和内部旧格式镜像保留。
+  - 暂时保留 `AgentAssetRecord` 类型用于读取旧数据行，但新写入不再使用资源。
+
+- 修改 `apps/api/src/agent/sqlite-agent-store.ts`
+  - 为 `agent_messages` 新增 `parts_json TEXT NOT NULL DEFAULT '[]'`。
+  - 当 `parts_json` 为空时，通过将 `content` 转换为文本分段来读取旧数据行。
+  - 新增 `updateMessageParts(messageId, parts)`。
+
+- 修改 `apps/api/src/agent/agent-message-coordinator.ts`
+  - 根据提交的分段创建用户消息。
+  - 使用一个空文本分段初始化助手消息。
+  - 将回答增量和图像工具事件转换为 `message.part.*` 事件及持久化分段。
+  - 停止向 `agent_assets` 写入新生成的图像。
+
+- 修改 `apps/api/src/agent/context-builder.ts`
+  - 通过 `partsToLlmText` 从 `message.parts` 构建上下文。
+
+- 修改 `apps/api/src/routes/agent-routes.ts`
+  - 接受 `{ parts }` 作为主要请求体。
+  - 通过将 `{ input }` 转换为 `[{ type: "text", value: input }]` 保持兼容性。
+
+- 修改 `apps/web/src/api/agent-client.ts`
+  - 在前端公开相同的 `MessagePart` 协议。
+  - 修改 `startAgentMessage` 以发送分段。
+  - 在 App 集成完成前，仅在调用点内部保留 `input` 辅助兼容逻辑。
+
+- 新建 `apps/web/src/components/MessagePartRenderer.tsx`
+  - 将助手文本按 Markdown 格式渲染。
+  - 将用户文本按纯文本渲染。
+  - 根据 `extra.lifecycle` 渲染媒体的等待中、成功和失败状态。
+
+- 新建 `apps/web/src/prosemirror/part-schema.ts`
+  - 为段落文本、硬换行、媒体原子节点和选择型原子节点定义最小 ProseMirror 模式。
+
+- 新建 `apps/web/src/prosemirror/part-serialization.ts`
+  - 在 `RuntimePart[]` 与 ProseMirror 文档之间转换。
+  - 提交前移除 `$` 运行时字段。
+
+- 新建 `apps/web/src/components/PartComposer.tsx`
+  - React ProseMirror 编辑器。
+  - 支持文本编辑、按 Enter 提交、按 Shift+Enter 换行以及运行时分段状态。
+
+- 修改 `apps/web/src/App.tsx`
+  - 使用 `composerParts: RuntimePart[]` 替换 `input: string` 状态。
+  - 向 API 发送 `MessagePart[]`。
+  - 将 `message.part.*` 事件应用到当前助手消息的分段。
+
+- 修改 `apps/web/src/components/AgentConversation.tsx`
+  - 移除作为主要界面的 `content/assets` 渲染路径。
+  - 使用 `MessagePartRenderer`。
+  - 工具时间线面板仅用于可观测性。
+
+- 修改 `apps/web/package.json`
+  - 新增 ProseMirror 依赖。
+
+---
+
+### 任务 1：定义后端消息分段协议
+
+**文件：**
+- 新建：`apps/api/src/agent/message-parts.ts`
+- 测试：`apps/api/test/agent/message-parts.test.ts`
+
+- [ ] **步骤 1：编写失败的协议测试**
+
+新建 `apps/api/test/agent/message-parts.test.ts`：
 
 ```ts
 import { describe, expect, it } from "vitest";
@@ -203,19 +203,19 @@ describe("message parts", () => {
 });
 ```
 
-- [ ] **Step 2: Run the failing tests**
+- [ ] **步骤 2：运行测试并确认失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- apps/api/test/agent/message-parts.test.ts
 ```
 
-Expected: fail because `apps/api/src/agent/message-parts.ts` does not exist.
+预期：测试失败，因为 `apps/api/src/agent/message-parts.ts` 不存在。
 
-- [ ] **Step 3: Implement message part helpers**
+- [ ] **步骤 3：实现消息分段辅助函数**
 
-Create `apps/api/src/agent/message-parts.ts`:
+新建 `apps/api/src/agent/message-parts.ts`：
 
 ```ts
 import type { JsonObject } from "../tools/types.js";
@@ -425,17 +425,17 @@ function removeUndefinedDeep(value: unknown): unknown {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [ ] **步骤 4：运行测试**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- apps/api/test/agent/message-parts.test.ts
 ```
 
-Expected: pass.
+预期：测试通过。
 
-- [ ] **Step 5: Commit**
+- [ ] **步骤 5：提交**
 
 ```bash
 git add apps/api/src/agent/message-parts.ts apps/api/test/agent/message-parts.test.ts
@@ -444,16 +444,16 @@ git commit -m "feat(api): define message parts protocol"
 
 ---
 
-### Task 2: Persist Message Parts In SQLite
+### 任务 2：在 SQLite 中持久化消息分段
 
-**Files:**
-- Modify: `apps/api/src/agent/agent-store.ts`
-- Modify: `apps/api/src/agent/sqlite-agent-store.ts`
-- Test: `apps/api/test/agent/sqlite-agent-store.test.ts`
+**文件：**
+- 修改：`apps/api/src/agent/agent-store.ts`
+- 修改：`apps/api/src/agent/sqlite-agent-store.ts`
+- 测试：`apps/api/test/agent/sqlite-agent-store.test.ts`
 
-- [ ] **Step 1: Add failing store tests**
+- [ ] **步骤 1：新增失败的存储测试**
 
-Append tests to `apps/api/test/agent/sqlite-agent-store.test.ts`:
+向 `apps/api/test/agent/sqlite-agent-store.test.ts` 追加测试：
 
 ```ts
 import type { MessagePart } from "../../src/agent/message-parts.js";
@@ -496,19 +496,19 @@ it("updates message parts without changing status", async () => {
 });
 ```
 
-- [ ] **Step 2: Run tests to verify failure**
+- [ ] **步骤 2：运行测试并确认失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- apps/api/test/agent/sqlite-agent-store.test.ts
 ```
 
-Expected: fail because `parts` and `updateMessageParts` do not exist.
+预期：测试失败，因为 `parts` 和 `updateMessageParts` 不存在。
 
-- [ ] **Step 3: Update store interfaces**
+- [ ] **步骤 3：更新存储接口**
 
-Modify `apps/api/src/agent/agent-store.ts`:
+修改 `apps/api/src/agent/agent-store.ts`：
 
 ```ts
 import type { MessagePart } from "./message-parts.js";
@@ -570,15 +570,15 @@ export interface AgentStore {
 }
 ```
 
-- [ ] **Step 4: Add `parts_json` storage**
+- [ ] **步骤 4：新增 `parts_json` 存储**
 
-Modify `apps/api/src/agent/sqlite-agent-store.ts`:
+修改 `apps/api/src/agent/sqlite-agent-store.ts`：
 
 ```ts
 import { legacyContentToParts, type MessagePart } from "./message-parts.js";
 ```
 
-In `createMessage`, build `parts` for the record and `contentMirror` only for the legacy SQLite column:
+在 `createMessage` 中，为记录构建 `parts`，并仅为旧 SQLite 列构建 `contentMirror`：
 
 ```ts
 const parts = input.parts;
@@ -596,7 +596,7 @@ const message: AgentMessageRecord = {
 };
 ```
 
-Insert `parts_json`:
+插入 `parts_json`：
 
 ```sql
 INSERT INTO agent_messages (
@@ -616,14 +616,14 @@ INSERT INTO agent_messages (
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ```
 
-Update `updateMessage` to keep parts:
+更新 `updateMessage` 以保留分段：
 
 ```ts
 const parts = input.parts ?? existingMessage.parts;
 const contentMirror = partsToLegacyContent(parts);
 ```
 
-Add `updateMessageParts`:
+新增 `updateMessageParts`：
 
 ```ts
 updateMessageParts(messageId: string, parts: MessagePart[]): AgentMessageRecord | undefined {
@@ -631,13 +631,13 @@ updateMessageParts(messageId: string, parts: MessagePart[]): AgentMessageRecord 
 }
 ```
 
-Add column to schema:
+向模式中新增列：
 
 ```sql
 parts_json TEXT NOT NULL DEFAULT '[]',
 ```
 
-Add migration after `initializeSchema()` creates tables:
+在 `initializeSchema()` 创建表之后新增迁移：
 
 ```ts
 private ensureMessagePartsColumn() {
@@ -649,9 +649,9 @@ private ensureMessagePartsColumn() {
 }
 ```
 
-Call `this.ensureMessagePartsColumn()` at the end of `initializeSchema()`.
+在 `initializeSchema()` 末尾调用 `this.ensureMessagePartsColumn()`。
 
-Update `toMessageRecord`:
+更新 `toMessageRecord`：
 
 ```ts
 const legacyContent = requiredString(row.content, "content");
@@ -673,7 +673,7 @@ return {
 };
 ```
 
-Add helper:
+新增辅助函数：
 
 ```ts
 function partsToLegacyContent(parts: MessagePart[]): string {
@@ -684,17 +684,17 @@ function partsToLegacyContent(parts: MessagePart[]): string {
 }
 ```
 
-- [ ] **Step 5: Run store tests**
+- [ ] **步骤 5：运行存储测试**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- apps/api/test/agent/sqlite-agent-store.test.ts
 ```
 
-Expected: pass.
+预期：测试通过。
 
-- [ ] **Step 6: Commit**
+- [ ] **步骤 6：提交**
 
 ```bash
 git add apps/api/src/agent/agent-store.ts apps/api/src/agent/sqlite-agent-store.ts apps/api/test/agent/sqlite-agent-store.test.ts
@@ -703,17 +703,17 @@ git commit -m "feat(api): persist message parts"
 
 ---
 
-### Task 3: Add Part Stream Events And Coordinator Updates
+### 任务 3：新增分段流式事件和协调器更新
 
-**Files:**
-- Modify: `apps/api/src/agent/types.ts`
-- Modify: `apps/api/src/agent/agent-message-coordinator.ts`
-- Test: `apps/api/test/agent/agent-message-coordinator.test.ts`
-- Test: `apps/api/test/routes/agent-routes.test.ts`
+**文件：**
+- 修改：`apps/api/src/agent/types.ts`
+- 修改：`apps/api/src/agent/agent-message-coordinator.ts`
+- 测试：`apps/api/test/agent/agent-message-coordinator.test.ts`
+- 测试：`apps/api/test/routes/agent-routes.test.ts`
 
-- [ ] **Step 1: Add failing coordinator tests**
+- [ ] **步骤 1：新增失败的协调器测试**
 
-Add tests to `apps/api/test/agent/agent-message-coordinator.test.ts`:
+向 `apps/api/test/agent/agent-message-coordinator.test.ts` 新增测试：
 
 ```ts
 it("streams assistant text into the first text part", async () => {
@@ -758,19 +758,19 @@ it("stores generated images as assistant media parts", async () => {
 });
 ```
 
-- [ ] **Step 2: Run coordinator tests to verify failure**
+- [ ] **步骤 2：运行协调器测试并确认失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- apps/api/test/agent/agent-message-coordinator.test.ts
 ```
 
-Expected: fail because the coordinator still writes `content` and `assets`.
+预期：测试失败，因为协调器仍在写入 `content` 和 `assets`。
 
-- [ ] **Step 3: Extend stream event union**
+- [ ] **步骤 3：扩展流式事件联合类型**
 
-Modify `apps/api/src/agent/types.ts`:
+修改 `apps/api/src/agent/types.ts`：
 
 ```ts
 import type { MessagePart } from "./message-parts.js";
@@ -796,15 +796,15 @@ export type AgentStreamEvent =
   | { type: "error"; code: string; message: string };
 ```
 
-Update `AgentExecutionInput`:
+更新 `AgentExecutionInput`：
 
 ```ts
 parts?: MessagePart[];
 ```
 
-- [ ] **Step 4: Update coordinator message creation**
+- [ ] **步骤 4：更新协调器的消息创建逻辑**
 
-Modify `apps/api/src/agent/agent-message-coordinator.ts`:
+修改 `apps/api/src/agent/agent-message-coordinator.ts`：
 
 ```ts
 import {
@@ -815,7 +815,7 @@ import {
 } from "./message-parts.js";
 ```
 
-In `startMessage`:
+在 `startMessage` 中：
 
 ```ts
 const userParts = input.parts?.length ? input.parts : [createTextPart(input.input)];
@@ -835,9 +835,9 @@ const assistantMessage = this.store.createMessage({
 });
 ```
 
-- [ ] **Step 5: Update coordinator event persistence**
+- [ ] **步骤 5：更新协调器的事件持久化逻辑**
 
-Add helper methods to `AgentMessageCoordinator`:
+为 `AgentMessageCoordinator` 新增辅助方法：
 
 ```ts
 private appendEventAndUpdateParts(messageId: string, event: AgentStreamEvent) {
@@ -886,13 +886,13 @@ private appendEventAndUpdateParts(messageId: string, event: AgentStreamEvent) {
 }
 ```
 
-Replace `this.store.appendEvent(messageId, event)` in `executeMessage` with:
+将 `executeMessage` 中的 `this.store.appendEvent(messageId, event)` 替换为：
 
 ```ts
 this.appendEventAndUpdateParts(messageId, event);
 ```
 
-Add `upsertImagePart`:
+新增 `upsertImagePart`：
 
 ```ts
 private upsertImagePart(messageId: string, input: Parameters<typeof upsertGeneratedImageParts>[1]) {
@@ -919,23 +919,23 @@ private upsertImagePart(messageId: string, input: Parameters<typeof upsertGenera
 }
 ```
 
-Add `completeImagePartsFromToolResult` by adapting existing `extractImageAssets` logic to call `upsertImagePart` for each generated URL.
+新增 `completeImagePartsFromToolResult`：调整现有 `extractImageAssets` 逻辑，使其针对每个生成的 URL 调用 `upsertImagePart`。
 
-- [ ] **Step 6: Remove new asset writes**
+- [ ] **步骤 6：移除新的资源写入**
 
-Remove the call to `persistGeneratedAssets` from successful completion. Leave `persistGeneratedAssets`, `extractImageAssets`, and `agent_assets` in place until old compatibility paths are deleted in Task 8.
+从成功完成流程中移除对 `persistGeneratedAssets` 的调用。在任务 8 删除旧兼容路径前，保留 `persistGeneratedAssets`、`extractImageAssets` 和 `agent_assets`。
 
-- [ ] **Step 7: Run tests**
+- [ ] **步骤 7：运行测试**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- apps/api/test/agent/agent-message-coordinator.test.ts apps/api/test/routes/agent-routes.test.ts
 ```
 
-Expected: pass.
+预期：测试通过。
 
-- [ ] **Step 8: Commit**
+- [ ] **步骤 8：提交**
 
 ```bash
 git add apps/api/src/agent/types.ts apps/api/src/agent/agent-message-coordinator.ts apps/api/test/agent/agent-message-coordinator.test.ts apps/api/test/routes/agent-routes.test.ts
@@ -944,17 +944,17 @@ git commit -m "feat(api): stream and persist message parts"
 
 ---
 
-### Task 4: Project Parts Into LLM Context
+### 任务 4：将分段投影到 LLM 上下文
 
-**Files:**
-- Modify: `apps/api/src/agent/context-builder.ts`
-- Modify: `apps/api/src/agent/agent-service.ts`
-- Test: `apps/api/test/agent/context-builder.test.ts`
-- Test: `apps/api/test/agent/agent-service.test.ts`
+**文件：**
+- 修改：`apps/api/src/agent/context-builder.ts`
+- 修改：`apps/api/src/agent/agent-service.ts`
+- 测试：`apps/api/test/agent/context-builder.test.ts`
+- 测试：`apps/api/test/agent/agent-service.test.ts`
 
-- [ ] **Step 1: Add failing context tests**
+- [ ] **步骤 1：新增失败的上下文测试**
 
-Add to `apps/api/test/agent/context-builder.test.ts`:
+向 `apps/api/test/agent/context-builder.test.ts` 新增测试：
 
 ```ts
 it("uses message parts for user and assistant context", () => {
@@ -988,25 +988,25 @@ it("uses message parts for user and assistant context", () => {
 });
 ```
 
-- [ ] **Step 2: Run context tests to verify failure**
+- [ ] **步骤 2：运行上下文测试并确认失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- apps/api/test/agent/context-builder.test.ts
 ```
 
-Expected: fail because context still reads `message.content`.
+预期：测试失败，因为上下文仍在读取 `message.content`。
 
-- [ ] **Step 3: Implement context projection**
+- [ ] **步骤 3：实现上下文投影**
 
-Modify `apps/api/src/agent/context-builder.ts`:
+修改 `apps/api/src/agent/context-builder.ts`：
 
 ```ts
 import { partsToLlmText } from "./message-parts.js";
 ```
 
-Update `countMessageCharacters`:
+更新 `countMessageCharacters`：
 
 ```ts
 function countMessageCharacters(message: AgentMessageRecord): number {
@@ -1015,7 +1015,7 @@ function countMessageCharacters(message: AgentMessageRecord): number {
 }
 ```
 
-Update `toContextMessage`:
+更新 `toContextMessage`：
 
 ```ts
 function toContextMessage(message: AgentMessageRecord): AgentMessage | undefined {
@@ -1045,9 +1045,9 @@ function toContextMessage(message: AgentMessageRecord): AgentMessage | undefined
 }
 ```
 
-- [ ] **Step 4: Pass projected current user input into AgentService**
+- [ ] **步骤 4：将投影后的当前用户输入传入 AgentService**
 
-In `agent-message-coordinator.ts`, pass current input as projected text:
+在 `agent-message-coordinator.ts` 中，将当前输入作为投影文本传入：
 
 ```ts
 const userInputText = partsToLlmText(userParts);
@@ -1062,17 +1062,17 @@ void this.executeMessage(assistantMessage.id, {
 });
 ```
 
-- [ ] **Step 5: Run API tests**
+- [ ] **步骤 5：运行 API 测试**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- apps/api/test/agent/context-builder.test.ts apps/api/test/agent/agent-service.test.ts
 ```
 
-Expected: pass.
+预期：测试通过。
 
-- [ ] **Step 6: Commit**
+- [ ] **步骤 6：提交**
 
 ```bash
 git add apps/api/src/agent/context-builder.ts apps/api/src/agent/agent-message-coordinator.ts apps/api/test/agent/context-builder.test.ts apps/api/test/agent/agent-service.test.ts
@@ -1081,17 +1081,17 @@ git commit -m "feat(api): project message parts into llm context"
 
 ---
 
-### Task 5: Accept Parts In Agent Routes And Client Types
+### 任务 5：在 Agent 路由和客户端类型中接受分段
 
-**Files:**
-- Modify: `apps/api/src/routes/agent-routes.ts`
-- Modify: `apps/web/src/api/agent-client.ts`
-- Test: `apps/api/test/routes/agent-routes.test.ts`
-- Test: `apps/web/src/main.test.tsx`
+**文件：**
+- 修改：`apps/api/src/routes/agent-routes.ts`
+- 修改：`apps/web/src/api/agent-client.ts`
+- 测试：`apps/api/test/routes/agent-routes.test.ts`
+- 测试：`apps/web/src/main.test.tsx`
 
-- [ ] **Step 1: Add failing route test for parts input**
+- [ ] **步骤 1：为分段输入新增失败的路由测试**
 
-Add to `apps/api/test/routes/agent-routes.test.ts`:
+向 `apps/api/test/routes/agent-routes.test.ts` 新增测试：
 
 ```ts
 it("accepts parts as the primary message input", async () => {
@@ -1112,19 +1112,19 @@ it("accepts parts as the primary message input", async () => {
 });
 ```
 
-- [ ] **Step 2: Run route test to verify failure**
+- [ ] **步骤 2：运行路由测试并确认失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- apps/api/test/routes/agent-routes.test.ts
 ```
 
-Expected: fail because route schema requires `input`.
+预期：测试失败，因为路由模式要求提供 `input`。
 
-- [ ] **Step 3: Update route schema**
+- [ ] **步骤 3：更新路由模式**
 
-Modify `apps/api/src/routes/agent-routes.ts`:
+修改 `apps/api/src/routes/agent-routes.ts`：
 
 ```ts
 const textPartSchema = z.object({
@@ -1155,7 +1155,7 @@ const startMessageBodySchema = z.object({
 });
 ```
 
-Route handler:
+路由处理程序：
 
 ```ts
 const parts = parsed.data.parts ?? [{ type: "text" as const, value: parsed.data.input ?? "" }];
@@ -1168,9 +1168,9 @@ const response = coordinator.startMessage({
 });
 ```
 
-- [ ] **Step 4: Update frontend client types**
+- [ ] **步骤 4：更新前端客户端类型**
 
-Modify `apps/web/src/api/agent-client.ts`:
+修改 `apps/web/src/api/agent-client.ts`：
 
 ```ts
 export type MessagePart = TextPart | MediaPart;
@@ -1228,13 +1228,13 @@ export interface PartExtra {
 }
 ```
 
-Update `AgentMessageRecord`:
+更新 `AgentMessageRecord`：
 
 ```ts
 parts: MessagePart[];
 ```
 
-Update `startAgentMessage`:
+更新 `startAgentMessage`：
 
 ```ts
 export async function startAgentMessage(
@@ -1251,18 +1251,18 @@ export async function startAgentMessage(
 }
 ```
 
-- [ ] **Step 5: Run route and web type tests**
+- [ ] **步骤 5：运行路由和 Web 类型测试**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- apps/api/test/routes/agent-routes.test.ts
 npm run typecheck -w @agent/web
 ```
 
-Expected: route tests pass; web typecheck may still fail until App integration in Task 7. Record the errors and continue to Task 6.
+预期：路由测试通过；在任务 7 完成 App 集成前，Web 类型检查可能仍会失败。记录错误并继续执行任务 6。
 
-- [ ] **Step 6: Commit API route changes only**
+- [ ] **步骤 6：仅提交 API 路由改动**
 
 ```bash
 git add apps/api/src/routes/agent-routes.ts apps/api/test/routes/agent-routes.test.ts apps/web/src/api/agent-client.ts
@@ -1271,16 +1271,16 @@ git commit -m "feat(api): accept message parts in agent route"
 
 ---
 
-### Task 6: Render Message Parts In Conversation
+### 任务 6：在对话中渲染消息分段
 
-**Files:**
-- Create: `apps/web/src/components/MessagePartRenderer.tsx`
-- Modify: `apps/web/src/components/AgentConversation.tsx`
-- Test: `apps/web/src/components/AgentConversation.test.tsx`
+**文件：**
+- 新建：`apps/web/src/components/MessagePartRenderer.tsx`
+- 修改：`apps/web/src/components/AgentConversation.tsx`
+- 测试：`apps/web/src/components/AgentConversation.test.tsx`
 
-- [ ] **Step 1: Add failing renderer tests**
+- [ ] **步骤 1：新增失败的渲染器测试**
 
-Add tests in `apps/web/src/components/AgentConversation.test.tsx`:
+在 `apps/web/src/components/AgentConversation.test.tsx` 中新增测试：
 
 ```tsx
 it("renders assistant text parts as markdown", () => {
@@ -1330,19 +1330,19 @@ it("renders media parts in the main message body", () => {
 });
 ```
 
-- [ ] **Step 2: Run test to verify failure**
+- [ ] **步骤 2：运行测试并确认失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/web -- apps/web/src/components/AgentConversation.test.tsx
 ```
 
-Expected: fail because `ChatMessage` still uses `content/assets`.
+预期：测试失败，因为 `ChatMessage` 仍在使用 `content/assets`。
 
-- [ ] **Step 3: Create `MessagePartRenderer`**
+- [ ] **步骤 3：新建 `MessagePartRenderer`**
 
-Create `apps/web/src/components/MessagePartRenderer.tsx`:
+新建 `apps/web/src/components/MessagePartRenderer.tsx`：
 
 ```tsx
 import ReactMarkdown from "react-markdown";
@@ -1411,15 +1411,15 @@ export function MessagePartRenderer({ role, parts, showCursor = false }: Message
 }
 ```
 
-- [ ] **Step 4: Wire renderer into conversation**
+- [ ] **步骤 4：将渲染器接入对话**
 
-Modify `ChatMessage` in `AgentConversation.tsx`:
+修改 `AgentConversation.tsx` 中的 `ChatMessage`：
 
 ```ts
 parts: MessagePart[];
 ```
 
-Replace `MessageContent` usage with:
+将 `MessageContent` 的使用替换为：
 
 ```tsx
 <MessagePartRenderer
@@ -1429,11 +1429,11 @@ Replace `MessageContent` usage with:
 />
 ```
 
-Keep `ToolTraceList` below the message body for observability.
+将 `ToolTraceList` 保留在消息正文下方，用于可观测性。
 
-- [ ] **Step 5: Add CSS**
+- [ ] **步骤 5：新增 CSS**
 
-Modify `apps/web/src/styles.css`:
+修改 `apps/web/src/styles.css`：
 
 ```css
 .message-parts {
@@ -1463,17 +1463,17 @@ Modify `apps/web/src/styles.css`:
 }
 ```
 
-- [ ] **Step 6: Run renderer tests**
+- [ ] **步骤 6：运行渲染器测试**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/web -- apps/web/src/components/AgentConversation.test.tsx
 ```
 
-Expected: pass after updating old test fixtures to use `parts`.
+预期：将旧测试夹具更新为使用 `parts` 后，测试通过。
 
-- [ ] **Step 7: Commit**
+- [ ] **步骤 7：提交**
 
 ```bash
 git add apps/web/src/components/MessagePartRenderer.tsx apps/web/src/components/AgentConversation.tsx apps/web/src/components/AgentConversation.test.tsx apps/web/src/styles.css
@@ -1482,16 +1482,16 @@ git commit -m "feat(web): render message parts"
 
 ---
 
-### Task 7: Integrate Parts In App State And SSE
+### 任务 7：在 App 状态和 SSE 中集成分段
 
-**Files:**
-- Modify: `apps/web/src/App.tsx`
-- Modify: `apps/web/src/main.test.tsx`
-- Modify: `apps/web/src/App.test.tsx`
+**文件：**
+- 修改：`apps/web/src/App.tsx`
+- 修改：`apps/web/src/main.test.tsx`
+- 修改：`apps/web/src/App.test.tsx`
 
-- [ ] **Step 1: Add failing SSE part event test**
+- [ ] **步骤 1：新增失败的 SSE 分段事件测试**
 
-Add to `apps/web/src/App.test.tsx`:
+向 `apps/web/src/App.test.tsx` 新增测试：
 
 ```tsx
 it("applies message part delta events to assistant parts", async () => {
@@ -1536,19 +1536,19 @@ it("applies message part delta events to assistant parts", async () => {
 });
 ```
 
-- [ ] **Step 2: Run App tests to verify failure**
+- [ ] **步骤 2：运行 App 测试并确认失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/web -- apps/web/src/App.test.tsx
 ```
 
-Expected: fail because App still appends `answer_delta` to `content`.
+预期：测试失败，因为 App 仍将 `answer_delta` 追加到 `content`。
 
-- [ ] **Step 3: Convert records to chat messages with parts**
+- [ ] **步骤 3：将记录转换为包含分段的聊天消息**
 
-Modify `createMessageFromRecord` in `App.tsx`:
+修改 `App.tsx` 中的 `createMessageFromRecord`：
 
 ```ts
 function createMessageFromRecord(message: AgentMessageRecord): ChatMessage {
@@ -1565,9 +1565,9 @@ function createMessageFromRecord(message: AgentMessageRecord): ChatMessage {
 }
 ```
 
-- [ ] **Step 4: Apply part stream events**
+- [ ] **步骤 4：应用分段流式事件**
 
-Add helper in `App.tsx`:
+在 `App.tsx` 中新增辅助函数：
 
 ```ts
 function applyPartEventToMessage(message: ChatMessage, event: AgentStreamEvent): ChatMessage {
@@ -1601,7 +1601,7 @@ function applyPartEventToMessage(message: ChatMessage, event: AgentStreamEvent):
 }
 ```
 
-In `applyStoredEvent`, apply part events before old answer delta fallback:
+在 `applyStoredEvent` 中，先应用分段事件，再执行旧回答增量的回退逻辑：
 
 ```ts
 if (event.type.startsWith("message.part.")) {
@@ -1612,26 +1612,26 @@ if (event.type.startsWith("message.part.")) {
 }
 ```
 
-- [ ] **Step 5: Update submit flow to send parts**
+- [ ] **步骤 5：更新提交流程以发送分段**
 
-Temporarily convert the existing string input to parts until Task 8:
+在完成任务 8 前，暂时将现有字符串输入转换为分段：
 
 ```ts
 const submittedParts: MessagePart[] = [{ type: "text", value: submittedInput }];
 return await startAgentMessage(submittedParts, maxIterations, sessionId);
 ```
 
-- [ ] **Step 6: Run App tests**
+- [ ] **步骤 6：运行 App 测试**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/web -- apps/web/src/App.test.tsx apps/web/src/main.test.tsx
 ```
 
-Expected: pass after fixture updates.
+预期：更新夹具后测试通过。
 
-- [ ] **Step 7: Commit**
+- [ ] **步骤 7：提交**
 
 ```bash
 git add apps/web/src/App.tsx apps/web/src/App.test.tsx apps/web/src/main.test.tsx
@@ -1640,19 +1640,19 @@ git commit -m "feat(web): apply message part stream events"
 
 ---
 
-### Task 8: Build ProseMirror PartComposer
+### 任务 8：构建 ProseMirror PartComposer
 
-**Files:**
-- Modify: `apps/web/package.json`
-- Create: `apps/web/src/prosemirror/part-schema.ts`
-- Create: `apps/web/src/prosemirror/part-serialization.ts`
-- Create: `apps/web/src/components/PartComposer.tsx`
-- Test: `apps/web/src/prosemirror/part-serialization.test.ts`
-- Test: `apps/web/src/components/PartComposer.test.tsx`
+**文件：**
+- 修改：`apps/web/package.json`
+- 新建：`apps/web/src/prosemirror/part-schema.ts`
+- 新建：`apps/web/src/prosemirror/part-serialization.ts`
+- 新建：`apps/web/src/components/PartComposer.tsx`
+- 测试：`apps/web/src/prosemirror/part-serialization.test.ts`
+- 测试：`apps/web/src/components/PartComposer.test.tsx`
 
-- [ ] **Step 1: Add ProseMirror dependencies**
+- [ ] **步骤 1：新增 ProseMirror 依赖**
 
-Modify `apps/web/package.json` dependencies:
+修改 `apps/web/package.json` 中的依赖：
 
 ```json
 "prosemirror-commands": "^1.7.1",
@@ -1664,17 +1664,17 @@ Modify `apps/web/package.json` dependencies:
 "prosemirror-view": "^1.40.1"
 ```
 
-Run:
+运行：
 
 ```bash
 npm install
 ```
 
-Expected: lockfile updates.
+预期：锁文件已更新。
 
-- [ ] **Step 2: Add failing serialization tests**
+- [ ] **步骤 2：新增失败的序列化测试**
 
-Create `apps/web/src/prosemirror/part-serialization.test.ts`:
+新建 `apps/web/src/prosemirror/part-serialization.test.ts`：
 
 ```ts
 import { describe, expect, it } from "vitest";
@@ -1696,19 +1696,19 @@ describe("part prosemirror serialization", () => {
 });
 ```
 
-- [ ] **Step 3: Run serialization test to verify failure**
+- [ ] **步骤 3：运行序列化测试并确认失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/web -- apps/web/src/prosemirror/part-serialization.test.ts
 ```
 
-Expected: fail because ProseMirror files do not exist.
+预期：测试失败，因为 ProseMirror 文件不存在。
 
-- [ ] **Step 4: Implement minimal schema**
+- [ ] **步骤 4：实现最小模式**
 
-Create `apps/web/src/prosemirror/part-schema.ts`:
+新建 `apps/web/src/prosemirror/part-schema.ts`：
 
 ```ts
 import { Schema } from "prosemirror-model";
@@ -1767,9 +1767,9 @@ export const partSchema = new Schema({
 });
 ```
 
-- [ ] **Step 5: Implement serialization**
+- [ ] **步骤 5：实现序列化**
 
-Create `apps/web/src/prosemirror/part-serialization.ts`:
+新建 `apps/web/src/prosemirror/part-serialization.ts`：
 
 ```ts
 import type { Node as ProseMirrorNode } from "prosemirror-model";
@@ -1841,19 +1841,19 @@ export function docToParts(doc: ProseMirrorNode): MessagePart[] {
 }
 ```
 
-- [ ] **Step 6: Run serialization tests**
+- [ ] **步骤 6：运行序列化测试**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/web -- apps/web/src/prosemirror/part-serialization.test.ts
 ```
 
-Expected: pass.
+预期：测试通过。
 
-- [ ] **Step 7: Implement PartComposer**
+- [ ] **步骤 7：实现 PartComposer**
 
-Create `apps/web/src/components/PartComposer.tsx`:
+新建 `apps/web/src/components/PartComposer.tsx`：
 
 ```tsx
 import { useEffect, useRef } from "react";
@@ -1938,9 +1938,9 @@ export function PartComposer({ parts, disabled = false, onChange, onSubmit, onCa
 }
 ```
 
-- [ ] **Step 8: Add basic composer test**
+- [ ] **步骤 8：新增基础编辑器测试**
 
-Create `apps/web/src/components/PartComposer.test.tsx`:
+新建 `apps/web/src/components/PartComposer.test.tsx`：
 
 ```tsx
 import { render, screen } from "@testing-library/react";
@@ -1964,17 +1964,17 @@ it("submits on Enter and changes text through ProseMirror", async () => {
 });
 ```
 
-- [ ] **Step 9: Run composer tests**
+- [ ] **步骤 9：运行编辑器测试**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/web -- apps/web/src/prosemirror/part-serialization.test.ts apps/web/src/components/PartComposer.test.tsx
 ```
 
-Expected: pass.
+预期：测试通过。
 
-- [ ] **Step 10: Commit**
+- [ ] **步骤 10：提交**
 
 ```bash
 git add apps/web/package.json package-lock.json apps/web/src/prosemirror apps/web/src/components/PartComposer.tsx apps/web/src/components/PartComposer.test.tsx
@@ -1983,17 +1983,17 @@ git commit -m "feat(web): add prosemirror part composer"
 
 ---
 
-### Task 9: Replace AgentComposer Textarea With PartComposer
+### 任务 9：使用 PartComposer 替换 AgentComposer 文本区域
 
-**Files:**
-- Modify: `apps/web/src/components/AgentComposer.tsx`
-- Modify: `apps/web/src/components/AgentComposer.test.tsx`
-- Modify: `apps/web/src/App.tsx`
-- Modify: `apps/web/src/App.test.tsx`
+**文件：**
+- 修改：`apps/web/src/components/AgentComposer.tsx`
+- 修改：`apps/web/src/components/AgentComposer.test.tsx`
+- 修改：`apps/web/src/App.tsx`
+- 修改：`apps/web/src/App.test.tsx`
 
-- [ ] **Step 1: Add failing composer integration test**
+- [ ] **步骤 1：新增失败的编辑器集成测试**
 
-Update `apps/web/src/components/AgentComposer.test.tsx`:
+更新 `apps/web/src/components/AgentComposer.test.tsx`：
 
 ```tsx
 it("renders a prosemirror composer and submits parts with Enter", async () => {
@@ -2020,19 +2020,19 @@ it("renders a prosemirror composer and submits parts with Enter", async () => {
 });
 ```
 
-- [ ] **Step 2: Run composer integration test to verify failure**
+- [ ] **步骤 2：运行编辑器集成测试并确认失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/web -- apps/web/src/components/AgentComposer.test.tsx
 ```
 
-Expected: fail because `AgentComposer` still expects string input.
+预期：测试失败，因为 `AgentComposer` 仍要求字符串输入。
 
-- [ ] **Step 3: Update AgentComposer props**
+- [ ] **步骤 3：更新 AgentComposer 属性**
 
-Modify `apps/web/src/components/AgentComposer.tsx`:
+修改 `apps/web/src/components/AgentComposer.tsx`：
 
 ```ts
 import type { MessagePart } from "../api/agent-client";
@@ -2050,7 +2050,7 @@ interface AgentComposerProps {
 }
 ```
 
-Render `PartComposer` where the textarea currently lives:
+在当前文本区域的位置渲染 `PartComposer`：
 
 ```tsx
 <PartComposer
@@ -2062,15 +2062,15 @@ Render `PartComposer` where the textarea currently lives:
 />
 ```
 
-- [ ] **Step 4: Update App composer state**
+- [ ] **步骤 4：更新 App 编辑器状态**
 
-Modify `apps/web/src/App.tsx`:
+修改 `apps/web/src/App.tsx`：
 
 ```ts
 const [composerParts, setComposerParts] = useState<RuntimePart[]>([{ type: "text", value: "" }]);
 ```
 
-Submit:
+提交：
 
 ```ts
 const submittedParts = stripRuntimeFields(composerParts).filter(
@@ -2085,7 +2085,7 @@ setComposerParts([{ type: "text", value: "" }]);
 return await startAgentMessage(submittedParts, maxIterations, sessionId);
 ```
 
-Suggestion:
+建议：
 
 ```ts
 function handleSuggestionSelect(suggestion: string) {
@@ -2093,17 +2093,17 @@ function handleSuggestionSelect(suggestion: string) {
 }
 ```
 
-- [ ] **Step 5: Run web tests**
+- [ ] **步骤 5：运行 Web 测试**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/web -- apps/web/src/components/AgentComposer.test.tsx apps/web/src/App.test.tsx
 ```
 
-Expected: pass after fixtures are updated to use `parts`.
+预期：将夹具更新为使用 `parts` 后，测试通过。
 
-- [ ] **Step 6: Commit**
+- [ ] **步骤 6：提交**
 
 ```bash
 git add apps/web/src/components/AgentComposer.tsx apps/web/src/components/AgentComposer.test.tsx apps/web/src/App.tsx apps/web/src/App.test.tsx
@@ -2112,17 +2112,17 @@ git commit -m "feat(web): submit rich message parts"
 
 ---
 
-### Task 10: Remove New UI Dependency On Assets
+### 任务 10：移除新界面对资源的依赖
 
-**Files:**
-- Modify: `apps/web/src/components/AgentConversation.tsx`
-- Modify: `apps/api/src/agent/agent-message-coordinator.ts`
-- Modify: `apps/api/test/agent/agent-message-coordinator.test.ts`
-- Modify: `apps/web/src/components/AgentConversation.test.tsx`
+**文件：**
+- 修改：`apps/web/src/components/AgentConversation.tsx`
+- 修改：`apps/api/src/agent/agent-message-coordinator.ts`
+- 修改：`apps/api/test/agent/agent-message-coordinator.test.ts`
+- 修改：`apps/web/src/components/AgentConversation.test.tsx`
 
-- [ ] **Step 1: Add failing no-assets assertion**
+- [ ] **步骤 1：新增失败的无资源断言**
 
-Add to `apps/api/test/agent/agent-message-coordinator.test.ts`:
+向 `apps/api/test/agent/agent-message-coordinator.test.ts` 新增测试：
 
 ```ts
 it("does not create new asset rows for generated images", async () => {
@@ -2142,32 +2142,32 @@ it("does not create new asset rows for generated images", async () => {
 });
 ```
 
-- [ ] **Step 2: Remove asset-based main rendering**
+- [ ] **步骤 2：移除基于资源的主要渲染逻辑**
 
-In `AgentConversation.tsx`, remove `MessageImageAssets` from the main message body. Keep `ToolTraceList` for timeline/tool observation only.
+在 `AgentConversation.tsx` 中，从主要消息正文移除 `MessageImageAssets`。保留 `ToolTraceList`，仅用于时间线和工具观测。
 
-- [ ] **Step 3: Remove generated asset persistence call and dead helper references**
+- [ ] **步骤 3：移除生成资源的持久化调用和无效辅助函数引用**
 
-In `AgentMessageCoordinator`, remove:
+在 `AgentMessageCoordinator` 中移除：
 
 ```ts
 this.persistGeneratedAssets(...)
 ```
 
-Keep `createAsset` and `agent_assets` table in the store for backward compatibility in this plan. Do not drop old table data.
+在本计划中，为保持向后兼容，请在存储中保留 `createAsset` 和 `agent_assets` 表。不要删除旧表数据。
 
-- [ ] **Step 4: Run focused tests**
+- [ ] **步骤 4：运行针对性测试**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- apps/api/test/agent/agent-message-coordinator.test.ts
 npm run test -w @agent/web -- apps/web/src/components/AgentConversation.test.tsx
 ```
 
-Expected: pass.
+预期：测试通过。
 
-- [ ] **Step 5: Commit**
+- [ ] **步骤 5：提交**
 
 ```bash
 git add apps/api/src/agent/agent-message-coordinator.ts apps/api/test/agent/agent-message-coordinator.test.ts apps/web/src/components/AgentConversation.tsx apps/web/src/components/AgentConversation.test.tsx
@@ -2176,102 +2176,102 @@ git commit -m "refactor: render generated media from message parts"
 
 ---
 
-### Task 11: Final Verification
+### 任务 11：最终验证
 
-**Files:**
-- Modify as needed: test fixtures only.
+**文件：**
+- 按需修改：仅限测试夹具。
 
-- [ ] **Step 1: Run API tests**
+- [ ] **步骤 1：运行 API 测试**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api
 ```
 
-Expected: all API tests pass.
+预期：所有 API 测试均通过。
 
-- [ ] **Step 2: Run web tests**
+- [ ] **步骤 2：运行 Web 测试**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/web
 ```
 
-Expected: all web tests pass.
+预期：所有 Web 测试均通过。
 
-- [ ] **Step 3: Run typecheck**
+- [ ] **步骤 3：运行类型检查**
 
-Run:
+运行：
 
 ```bash
 npm run typecheck
 ```
 
-Expected: TypeScript exits with code 0.
+预期：TypeScript 以状态码 0 退出。
 
-- [ ] **Step 4: Run build**
+- [ ] **步骤 4：运行构建**
 
-Run:
+运行：
 
 ```bash
 npm run build
 ```
 
-Expected: API and web builds complete.
+预期：API 和 Web 构建完成。
 
-- [ ] **Step 5: Manual smoke test**
+- [ ] **步骤 5：手动冒烟测试**
 
-Run:
+运行：
 
 ```bash
 npm run dev
 ```
 
-Open `http://127.0.0.1:4000` and verify:
+打开 `http://127.0.0.1:4000` 并验证：
 
-- New conversation opens with the ProseMirror composer.
-- Typing text and pressing Enter submits the message.
-- Shift+Enter inserts a newline.
-- User message renders from parts.
-- Assistant streaming text updates in place.
-- Image generation creates an inline loading media part.
-- Image completion updates the same media part into a preview.
-- Refreshing the page restores message parts.
-- Right-side timeline still shows events.
+- 新建对话会显示 ProseMirror 编辑器。
+- 输入文本并按 Enter 后会提交消息。
+- 按 Shift+Enter 会插入换行。
+- 用户消息通过分段渲染。
+- 助手的流式文本会原地更新。
+- 生成图像时会创建一个内联的加载中媒体分段。
+- 图像生成完成后，会将同一媒体分段更新为预览。
+- 刷新页面后会恢复消息分段。
+- 右侧时间线仍会显示事件。
 
-- [ ] **Step 6: Commit verification fixture fixes**
+- [ ] **步骤 6：提交验证夹具修复**
 
-If verification required test fixture updates:
+如果验证需要更新测试夹具：
 
 ```bash
 git add apps/api/test apps/web/src
 git commit -m "test: update message parts fixtures"
 ```
 
-If no files changed, skip this commit.
+如果没有文件发生变更，则跳过此次提交。
 
 ---
 
-## Self-Review
+## 自查
 
-- Spec coverage:
-  - `text/media` only: Tasks 1, 2, 6.
-  - No `element`: Task 1 defines only `TextPart | MediaPart`.
-  - No `key`, `uuid`, `thumbnailUrl`, `content`, `ui`, or `format`: Task 1 type definitions exclude them.
-  - Runtime `$` fields stripped: Tasks 1 and 8.
-  - `messageId + partIndex` streaming: Tasks 3 and 7.
-  - LLM projection instead of raw parts: Task 4.
-  - ProseMirror rich input: Tasks 8 and 9.
-  - User message display from parts: Tasks 6 and 9.
-  - Generated images as media parts: Tasks 3 and 10.
+- 规格覆盖：
+  - 仅支持 `text/media`：任务 1、2、6。
+  - 不支持 `element`：任务 1 仅定义 `TextPart | MediaPart`。
+  - 不包含 `key`、`uuid`、`thumbnailUrl`、`content`、`ui` 或 `format`：任务 1 的类型定义排除了这些字段。
+  - 移除运行时 `$` 字段：任务 1 和 8。
+  - 使用 `messageId + partIndex` 进行流式更新：任务 3 和 7。
+  - 使用 LLM 投影而非原始分段：任务 4。
+  - ProseMirror 富文本输入：任务 8 和 9。
+  - 通过分段显示用户消息：任务 6 和 9。
+  - 将生成的图像作为媒体分段：任务 3 和 10。
 
-- Placeholder scan:
-  - No `TBD`, no `TODO`, no unspecified test task.
+- 占位内容扫描：
+  - 没有 `TBD`、`TODO` 或未明确说明的测试任务。
 
-- Type consistency:
-  - Backend and frontend both use `MessagePart = TextPart | MediaPart`.
-  - Text field is always `value`.
-  - Media fields are `mime`, `url`, optional `name`, `width`, `height`.
-  - Part stream events use `message.part.created`, `message.part.delta`, `message.part.updated`.
+- 类型一致性：
+  - 后端和前端都使用 `MessagePart = TextPart | MediaPart`。
+  - 文本字段始终为 `value`。
+  - 媒体字段为 `mime`、`url`，以及可选的 `name`、`width`、`height`。
+  - 分段流式事件使用 `message.part.created`、`message.part.delta`、`message.part.updated`。

@@ -7,7 +7,7 @@ import {
   stripRuntimePartFields,
   upsertGeneratedResourceParts,
   type MessagePart
-} from "../../src/agent/message-parts.js";
+} from "../../src/modules/agent/message-parts.js";
 
 describe("message parts", () => {
   it("strips runtime fields that start with $", () => {

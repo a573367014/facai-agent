@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { LangChainAgentService } from "../../src/langchain/langchain-agent-service.js";
-import { S3ToolResourceStorage } from "../../src/agent/tool-resource-storage.js";
-import { ToolExecutor } from "../../src/tools/executor.js";
-import { ToolRegistry } from "../../src/tools/registry.js";
+import { LangChainAgentService } from "../../src/modules/agent/runtime/langchain-agent-service.js";
+import { S3ToolResourceStorage } from "../../src/modules/agent/tool-resource-storage.js";
+import { ToolExecutor } from "../../src/modules/tools/executor.js";
+import { ToolRegistry } from "../../src/modules/tools/registry.js";
 import { createMockModel } from "../helpers/mock-model.js";
 import type {
   AgentLlmCallObservation,
@@ -11,8 +11,8 @@ import type {
   AgentResourceTransferObservation,
   AgentRunObservation,
   AgentToolCallObservation
-} from "../../src/observability/agent-observability.js";
-import { createAgentObservability } from "../../src/observability/agent-observability.js";
+} from "../../src/platform/observability/agent-observability.js";
+import { createAgentObservability } from "../../src/platform/observability/agent-observability.js";
 
 class RecordingMetricInstrument {
   readonly calls: Array<{ value: number; attributes?: unknown }> = [];

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createJimengVideoTool } from "../../src/tools/jimeng-video.js";
+import { createJimengVideoTool } from "../../src/modules/tools/jimeng-video.js";
 
 describe("createJimengVideoTool", () => {
   it("默认视频轮询窗口覆盖六分钟内才完成的任务", async () => {

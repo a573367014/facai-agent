@@ -1,8 +1,8 @@
 import { dirname } from "node:path";
 import { readFile, rm } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
-import { createDocumentFileTool, DOCX_MIME } from "../../src/tools/document-file.js";
-import type { ToolOutput } from "../../src/tools/types.js";
+import { createDocumentFileTool, DOCX_MIME } from "../../src/modules/tools/document-file.js";
+import type { ToolOutput } from "../../src/modules/tools/types.js";
 
 function asToolOutput(value: unknown): ToolOutput {
   return value as ToolOutput;

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { AuthTokenService } from "../../src/auth/auth-token-service.js";
+import { AuthTokenService } from "../../src/modules/auth/auth-token-service.js";
 
 describe("AuthTokenService", () => {
   it("签发 accessToken 和 15 天 refreshToken，并能无状态验证 payload", () => {

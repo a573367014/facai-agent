@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BullMqAgentRunQueue, type AgentRunQueueClient } from "../../src/agent/agent-run-queue.js";
+import { BullMqAgentRunQueue, type AgentRunQueueClient } from "../../src/modules/agent/agent-run-queue.js";
 
 class FakeAgentRunQueueClient implements AgentRunQueueClient {
   readonly jobs: Array<{ name: string; payload: unknown; options?: Record<string, unknown> }> = [];

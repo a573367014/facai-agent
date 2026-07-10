@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { waitForUploadResponseDelay } from "../../src/uploads/attachment-upload.js";
+import { waitForUploadResponseDelay } from "../../src/platform/storage/attachment-upload.js";
 
 describe("attachment upload helpers", () => {
   it("waits for the configured upload response delay", async () => {

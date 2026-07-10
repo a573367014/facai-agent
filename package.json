@@ -3,32 +3,25 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "workspaces": [
-    "apps/api",
-    "apps/web"
-  ],
+  "packageManager": "pnpm@10.24.0",
   "scripts": {
-    "dev": "node scripts/ensure-redis.mjs && node scripts/ensure-ollama.mjs && node scripts/ensure-observability.mjs && docker compose up -d minio && concurrently -n api,web,worker -c cyan,magenta,yellow \"npm run dev:api\" \"npm run dev:web\" \"npm run dev:worker\"",
-    "dev:api": "npm run dev -w @agent/api",
-    "dev:web": "npm run dev -w @agent/web",
-    "dev:worker": "npm run dev:worker -w @agent/api",
-    "build": "npm run build -w @agent/api && npm run build -w @agent/web",
-    "test": "node --test scripts/*.test.mjs && npm run test -w @agent/api && npm run test -w @agent/web",
-    "typecheck": "npm run typecheck -w @agent/api && npm run typecheck -w @agent/web",
-    "mock:llm": "node scripts/mock-llm-server.mjs",
-    "loadtest": "k6 run scripts/k6-loadtest.js",
-    "loadtest:ingress": "MODE=ingress k6 run scripts/k6-loadtest.js"
+    "dev": "node tools/dev/ensure-redis.mjs && node tools/dev/ensure-ollama.mjs && node tools/dev/ensure-observability.mjs && docker compose up -d minio && concurrently -n api,web,worker -c cyan,magenta,yellow \"pnpm --filter @agent/api dev\" \"pnpm --filter @agent/web dev\" \"pnpm --filter @agent/api dev:worker\"",
+    "dev:api": "pnpm --filter @agent/api dev",
+    "dev:web": "pnpm --filter @agent/web dev",
+    "dev:worker": "pnpm --filter @agent/api dev:worker",
+    "build": "pnpm --filter @agent/api build && pnpm --filter @agent/web build",
+    "test": "pnpm run test:tools && pnpm --filter @agent/api test && pnpm --filter @agent/web test",
+    "test:tools": "node --test tools/*/*.test.mjs",
+    "typecheck": "pnpm --filter @agent/contracts typecheck && pnpm --filter @agent/api typecheck && pnpm --filter @agent/web typecheck",
+    "confluence:ingest": "node tools/confluence-import/ingest-confluence.mjs",
+    "mock:llm": "node tools/loadtest/mock-llm-server.mjs",
+    "loadtest": "k6 run tools/loadtest/k6-loadtest.js",
+    "loadtest:ingress": "MODE=ingress k6 run tools/loadtest/k6-loadtest.js"
   },
   "engines": {
     "node": ">=20"
   },
   "devDependencies": {
     "concurrently": "^9.2.3"
-  },
-  "dependencies": {
-    "@langchain/core": "^1.2.1",
-    "@langchain/langgraph": "^1.4.7",
-    "@langchain/openai": "^1.5.3",
-    "langchain": "^1.5.2"
   }
 }

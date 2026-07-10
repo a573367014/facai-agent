@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { AgentContextBuilder } from "../../src/agent/context-builder.js";
-import type { AgentMessageRecord } from "../../src/agent/agent-store.js";
-import { createTextPart, type MessagePart } from "../../src/agent/message-parts.js";
+import { AgentContextBuilder } from "../../src/modules/agent/context-builder.js";
+import type { AgentMessageRecord } from "../../src/modules/agent/agent-store.js";
+import { createTextPart, type MessagePart } from "../../src/modules/agent/message-parts.js";
 
 function createMessage(
   overrides: Partial<Omit<AgentMessageRecord, "parts">> & { content?: string; parts?: MessagePart[] }

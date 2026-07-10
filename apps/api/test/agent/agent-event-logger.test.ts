@@ -1,7 +1,7 @@
 import { SeverityNumber, type LogRecord } from "@opentelemetry/api-logs";
 import { describe, expect, it } from "vitest";
-import { OtelAgentEventLogger } from "../../src/agent/agent-event-logger.js";
-import type { StoredAgentEvent } from "../../src/agent/agent-store.js";
+import { OtelAgentEventLogger } from "../../src/modules/agent/agent-event-logger.js";
+import type { StoredAgentEvent } from "../../src/modules/agent/agent-store.js";
 
 class RecordingOtelLogger {
   readonly records: LogRecord[] = [];

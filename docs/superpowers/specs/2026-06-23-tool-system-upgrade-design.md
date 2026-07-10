@@ -6,11 +6,11 @@
 
 - LLM 根据用户输入返回 `toolCalls`。
 - `AgentService` 调用 `ToolRegistry.execute(toolName, arguments)`。
-- 工具结果作为 `tool` message 写回上下文。
+- 工具结果作为 `tool` 消息写回上下文。
 - LLM 基于工具结果继续推理，并生成最终回答。
 - 运行过程通过 SSE 事件推送到前端，并可持久化到 SQLite。
 
-这个结构适合 demo 阶段，因为它直接、清晰、容易理解。但随着后续接入文件、网页搜索、数据库查询、RAG、代码执行等真实工具，单纯把工具调用塞在 `ToolRegistry.execute` 里会逐渐暴露问题：
+这个结构适合演示阶段，因为它直接、清晰、容易理解。但随着后续接入文件、网页搜索、数据库查询、RAG、代码执行等真实工具，单纯把工具调用塞在 `ToolRegistry.execute` 里会逐渐暴露问题：
 
 - 参数校验不够统一，工具内部容易收到非法参数。
 - 工具执行缺少统一超时，某个工具可能长期挂起。
@@ -23,7 +23,7 @@
 
 ## 目标
 
-工具系统升级 v1 聚焦 Agent Runtime 的基础能力，不做复杂插件平台。
+工具系统升级 v1 聚焦 Agent 运行时的基础能力，不做复杂插件平台。
 
 本阶段目标：
 
@@ -34,14 +34,14 @@
 - 统一成功和失败返回结构。
 - 记录工具执行耗时。
 - 让前端能更清晰展示工具调用细节。
-- 为后续 run cancel、文件工具、网络工具、RAG 工具打基础。
+- 为后续运行取消、文件工具、网络工具、RAG 工具打基础。
 
 非目标：
 
 - 不做工具市场。
 - 不做远程插件安装。
 - 不做复杂多租户权限系统。
-- 不做用户二次确认工具调用 UI。
+- 不做用户二次确认工具调用界面。
 - 不引入独立任务队列。
 
 ## 推荐架构
@@ -60,23 +60,23 @@ AgentService
       -> 耗时记录
 ```
 
-### ToolRegistry 职责
+### 工具注册表的职责
 
 `ToolRegistry` 只负责静态能力：
 
 - 注册工具。
 - 根据名称查找工具。
 - 给 LLM 提供工具定义。
-- 暴露工具参数 schema。
+- 公开工具参数模式定义。
 
 它不再承担完整运行时治理能力。
 
-### ToolExecutor 职责
+### 工具执行器的职责
 
 `ToolExecutor` 负责每一次具体调用：
 
 - 根据 `toolName` 找到工具。
-- 校验 arguments。
+- 校验参数。
 - 检查工具是否允许执行。
 - 创建超时控制。
 - 调用工具函数。
@@ -102,7 +102,7 @@ export interface ToolDefinition {
 }
 ```
 
-`parameters` 保留为给 LLM 的 JSON schema，确保 OpenAI-compatible tools payload 不需要额外转换。`argumentSchema` 使用 zod，在真正执行前做运行时校验。
+`parameters` 保留为提供给 LLM 的 JSON 模式定义，确保 OpenAI 兼容的工具载荷不需要额外转换。`argumentSchema` 使用 zod，在真正执行前做运行时校验。
 
 ### 执行上下文
 
@@ -119,9 +119,9 @@ export interface ToolExecutionContext {
 
 这些字段暂时不一定全部使用，但提前放进上下文可以支撑后续能力：
 
-- `runId`：把工具调用和 run 关联起来。
+- `runId`：把工具调用和运行关联起来。
 - `sessionId`：后续做权限、审计、会话级资源时使用。
-- `toolCallId`：和 LLM 返回的工具调用 ID 对齐。
+- `toolCallId`：与 LLM 返回的工具调用 ID 对齐。
 - `signal`：支持取消和超时。
 
 ### 执行结果
@@ -147,7 +147,7 @@ export type ToolExecutionResult =
     };
 ```
 
-这样前端、日志、AgentService 都可以用同一种结构理解工具执行结果。
+这样前端、日志和 `AgentService` 都可以用同一种结构理解工具执行结果。
 
 ## 执行流程
 
@@ -173,7 +173,7 @@ export type ToolExecutionResult =
 工具错误分为几类：
 
 - `TOOL_NOT_FOUND`：模型请求了不存在的工具。
-- `TOOL_INVALID_ARGUMENTS`：参数不符合 schema。
+- `TOOL_INVALID_ARGUMENTS`：参数不符合模式定义。
 - `TOOL_TIMEOUT`：工具执行超过限制。
 - `TOOL_PERMISSION_DENIED`：工具不允许在当前上下文执行。
 - `TOOL_EXECUTION_ERROR`：工具内部执行失败。
@@ -192,7 +192,7 @@ export type ToolExecutionResult =
 }
 ```
 
-`recoverable` 用于表达 Agent 是否可以尝试换一种方式继续。例如参数错误通常可恢复，权限错误通常不可恢复。
+`recoverable` 用于表示 Agent 是否可以尝试换一种方式继续。例如参数错误通常可恢复，权限错误通常不可恢复。
 
 ## 超时与取消
 
@@ -201,10 +201,10 @@ v1 先实现工具级超时，例如默认 `AGENT_TOOL_TIMEOUT_MS=10000`。
 实现上可以由 `ToolExecutor` 创建内部 `AbortController`：
 
 - 如果外层传入 `signal`，外层取消时同步取消工具。
-- 如果超时到了，内部 controller abort。
+- 如果达到超时时间，则中止内部控制器。
 - 工具函数可以读取 `context.signal` 来主动中断。
 
-这为后续 `POST /agents/runs/:runId/cancel` 做铺垫。到那一步时，run 取消可以同时中断 LLM 请求和工具请求。
+这为后续 `POST /agents/runs/:runId/cancel` 做铺垫。到那一步时，运行取消可以同时中断 LLM 请求和工具请求。
 
 ## 事件设计
 
@@ -223,7 +223,7 @@ v1 可以在不大改前端模型的情况下补字段：
 - `error.code`
 - `error.recoverable`
 
-这样 timeline 可以展示：
+这样时间线可以展示：
 
 ```text
 调用 calculator
@@ -255,7 +255,7 @@ v1 可以在不大改前端模型的情况下补字段：
 - `apps/api/src/tools/current-time.ts`
   - 改成新的工具定义格式。
 - `apps/api/src/agent/agent-service.ts`
-  - 从直接调用 registry 改成调用 executor。
+  - 从直接调用注册表改成调用执行器。
 - `apps/api/src/agent/types.ts`
   - 扩展工具事件字段。
 - `apps/api/src/app.ts`
@@ -263,7 +263,7 @@ v1 可以在不大改前端模型的情况下补字段：
 - `apps/web/src/components/AgentTimeline.tsx`
   - 展示工具耗时和结构化错误。
 - `apps/api/test/tools/*`
-  - 增加 executor 单测。
+  - 增加执行器单元测试。
 - `apps/api/test/agent/agent-service.test.ts`
   - 调整工具调用相关断言。
 
@@ -277,33 +277,33 @@ v1 可以在不大改前端模型的情况下补字段：
 - 工具抛错返回 `TOOL_EXECUTION_ERROR`。
 - 工具超时返回 `TOOL_TIMEOUT`。
 - `durationMs` 存在且为数字。
-- `AgentService` 能把成功工具结果写回 LLM messages。
+- `AgentService` 能把成功工具结果写回 LLM 消息列表。
 - `AgentService` 能把工具错误转换成事件。
 
 前端重点测试：
 
 - 工具结果仍能正常显示。
-- 工具错误显示 code/message。
-- durationMs 存在时展示耗时。
+- 工具错误显示 `code` 和 `message`。
+- `durationMs` 存在时展示耗时。
 
 ## 实施顺序
 
 建议分 5 步实现：
 
-1. 新增工具类型和 `ToolExecutor`，先不改 AgentService。
-2. 把现有 calculator、current-time 迁移到新工具定义。
+1. 新增工具类型和 `ToolExecutor`，先不改 `AgentService`。
+2. 把现有 `calculator`、`current-time` 迁移到新工具定义。
 3. 改造 `ToolRegistry`，保留旧测试并补新测试。
 4. 改造 `AgentService`，让工具调用走 `ToolExecutor`。
-5. 调整事件和前端 timeline 展示。
+5. 调整事件和前端时间线展示。
 
 这样每一步都可以独立验证，避免一次性改动太大。
 
 ## 后续衔接
 
-工具系统升级 v1 完成后，最自然的下一步是 Run 生命周期升级：
+工具系统升级 v1 完成后，最自然的下一步是运行生命周期升级：
 
-- run cancel 可以复用 `ToolExecutionContext.signal`。
-- tool timeout 和 run cancel 可以共用取消机制。
+- 运行取消可以复用 `ToolExecutionContext.signal`。
+- 工具超时和运行取消可以共用取消机制。
 - 工具调用日志可以继续进入 SQLite 事件流。
 - 前端可以基于结构化工具事件做更好的调试视图。
 

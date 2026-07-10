@@ -1,16 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { InMemoryAgentCancellationStore } from "../../src/agent/agent-cancellation-store.js";
-import type { AgentEventBus } from "../../src/agent/agent-event-bus.js";
-import { InMemoryAgentRunLock } from "../../src/agent/agent-run-lock.js";
-import type { AgentRunJobPayload, AgentRunQueue } from "../../src/agent/agent-run-queue.js";
-import { LangChainAgentService } from "../../src/langchain/langchain-agent-service.js";
-import { PostgresAgentStore } from "../../src/agent/postgres-agent-store.js";
-import { InMemoryRunningMessageStateStore } from "../../src/agent/running-message-state-store.js";
-import { buildApp } from "../../src/app.js";
+import { InMemoryAgentCancellationStore } from "../../src/modules/agent/agent-cancellation-store.js";
+import type { AgentEventBus } from "../../src/modules/agent/agent-event-bus.js";
+import { InMemoryAgentRunLock } from "../../src/modules/agent/agent-run-lock.js";
+import type { AgentRunJobPayload, AgentRunQueue } from "../../src/modules/agent/agent-run-queue.js";
+import { LangChainAgentService } from "../../src/modules/agent/runtime/langchain-agent-service.js";
+import { PostgresAgentStore } from "../../src/platform/postgres/postgres-agent-store.js";
+import { InMemoryRunningMessageStateStore } from "../../src/modules/agent/running-message-state-store.js";
+import { buildApp } from "../../src/bootstrap/app.js";
 import { createMockModel } from "../helpers/mock-model.js";
-import { ToolExecutor } from "../../src/tools/executor.js";
-import { ToolRegistry } from "../../src/tools/registry.js";
-import type { MessagePart } from "../../src/agent/message-parts.js";
+import { ToolExecutor } from "../../src/modules/tools/executor.js";
+import { ToolRegistry } from "../../src/modules/tools/registry.js";
+import type { MessagePart } from "../../src/modules/agent/message-parts.js";
 
 const noopEventBus: AgentEventBus = {
   async publishRunEvent() {},

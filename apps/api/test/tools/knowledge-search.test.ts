@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createKnowledgeSearchTool } from "../../src/tools/knowledge-search.js";
+import { createKnowledgeSearchTool } from "../../src/modules/tools/knowledge-search.js";
 
 describe("knowledge_search tool", () => {
   it("返回结构化检索结果并提供带来源的 LLM 文本", async () => {

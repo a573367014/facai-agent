@@ -1,12 +1,12 @@
-# Fastify React Agent Implementation Plan
+# Fastify React Agent 实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **面向智能体执行者：** 必须使用子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans，逐项实施本计划。各步骤使用复选框（`- [ ]`）语法跟踪进度。
 
-**Goal:** 构建一个 Fastify + React 的 LLM 工具调用型 Agent Demo，后端提供 `/agents/run`，前端提供可用的调试台。
+**目标：** 构建一个 Fastify + React 的 LLM 工具调用型 Agent 演示，后端提供 `/agents/run`，前端提供可用的调试台。
 
-**Architecture:** 根目录使用 npm workspaces 管理 `apps/api` 和 `apps/web`。API 层只负责 HTTP，AgentService 负责 agent loop，Provider Adapter 负责 OpenAI-compatible 请求，Tool Registry 负责工具注册和执行。React Demo 只调用 API，不包含 agent 业务逻辑。
+**架构：** 根目录使用 npm 工作区管理 `apps/api` 和 `apps/web`。API 层只负责 HTTP，AgentService 负责 Agent 循环，提供程序适配器负责兼容 OpenAI 的请求，工具注册表负责工具注册和执行。React 演示只调用 API，不包含 Agent 业务逻辑。
 
-**Tech Stack:** Node.js, npm workspaces, TypeScript, Fastify, @fastify/cors, Vite, React, Vitest, Testing Library, jsdom.
+**技术栈：** Node.js、npm 工作区、TypeScript、Fastify、@fastify/cors、Vite、React、Vitest、Testing Library、jsdom。
 
 ---
 
@@ -14,7 +14,7 @@
 
 需要创建：
 
-- `package.json`：根 workspace 脚本。
+- `package.json`：根工作区脚本。
 - `.gitignore`：忽略依赖、构建产物和环境变量。
 - `.env.example`：列出 API 和 Web 的环境变量。
 - `apps/api/package.json`：API 依赖和脚本。
@@ -25,18 +25,18 @@
 - `apps/api/src/config/env.ts`：解析 API 环境变量。
 - `apps/api/src/agent/types.ts`：Agent 内部类型。
 - `apps/api/src/agent/instructions.ts`：系统提示词。
-- `apps/api/src/agent/agent-service.ts`：Agent loop。
+- `apps/api/src/agent/agent-service.ts`：Agent 循环。
 - `apps/api/src/errors/app-error.ts`：统一应用错误。
-- `apps/api/src/providers/types.ts`：Provider 接口。
-- `apps/api/src/providers/openai-compatible-provider.ts`：OpenAI-compatible Provider。
-- `apps/api/src/tools/registry.ts`：Tool Registry。
+- `apps/api/src/providers/types.ts`：提供程序接口。
+- `apps/api/src/providers/openai-compatible-provider.ts`：兼容 OpenAI 的提供程序。
+- `apps/api/src/tools/registry.ts`：工具注册表。
 - `apps/api/src/tools/calculator.ts`：计算器工具。
 - `apps/api/src/tools/current-time.ts`：当前时间工具。
 - `apps/api/src/tools/index.ts`：默认工具集合。
 - `apps/api/src/routes/health-routes.ts`：健康检查路由。
 - `apps/api/src/routes/agent-routes.ts`：Agent 执行路由。
 - `apps/api/test/tools/calculator.test.ts`：计算器测试。
-- `apps/api/test/tools/registry.test.ts`：Tool Registry 测试。
+- `apps/api/test/tools/registry.test.ts`：工具注册表测试。
 - `apps/api/test/agent/agent-service.test.ts`：AgentService 测试。
 - `apps/api/test/routes/agent-routes.test.ts`：API 路由测试。
 - `apps/web/package.json`：Web 依赖和脚本。
@@ -46,35 +46,35 @@
 - `apps/web/index.html`：React 入口 HTML。
 - `apps/web/src/main.tsx`：React 入口。
 - `apps/web/src/App.tsx`：页面容器。
-- `apps/web/src/styles.css`：Demo 工作台样式。
-- `apps/web/src/api/agent-client.ts`：前端 API client。
+- `apps/web/src/styles.css`：演示工作台样式。
+- `apps/web/src/api/agent-client.ts`：前端 API 客户端。
 - `apps/web/src/components/AgentRunForm.tsx`：任务输入表单。
 - `apps/web/src/components/AgentResultPanel.tsx`：结果面板。
 - `apps/web/src/components/AgentSteps.tsx`：工具步骤展示。
-- `apps/web/src/App.test.tsx`：React Demo 行为测试。
-- `apps/web/src/test/setup.ts`：Testing Library 设置。
+- `apps/web/src/App.test.tsx`：React 演示行为测试。
+- `apps/web/src/test/setup.ts`：Testing Library 配置。
 
-当前目录不是 git 仓库，所以计划中的提交步骤只有在执行 `git init` 后才运行。若不初始化 git，则跳过提交步骤。
+当前目录不是 Git 仓库，所以计划中的提交步骤只有在执行 `git init` 后才运行。若不初始化 Git，则跳过提交步骤。
 
 ---
 
-### Task 1: Workspace 基础工程
+### 任务 1：工作区基础工程
 
-**Files:**
-- Create: `package.json`
-- Create: `.gitignore`
-- Create: `.env.example`
-- Create: `apps/api/package.json`
-- Create: `apps/api/tsconfig.json`
-- Create: `apps/api/vitest.config.ts`
-- Create: `apps/web/package.json`
-- Create: `apps/web/tsconfig.json`
-- Create: `apps/web/tsconfig.node.json`
-- Create: `apps/web/vite.config.ts`
-- Create: `apps/web/index.html`
-- Create: `apps/web/src/test/setup.ts`
+**文件：**
+- 新建：`package.json`
+- 新建：`.gitignore`
+- 新建：`.env.example`
+- 新建：`apps/api/package.json`
+- 新建：`apps/api/tsconfig.json`
+- 新建：`apps/api/vitest.config.ts`
+- 新建：`apps/web/package.json`
+- 新建：`apps/web/tsconfig.json`
+- 新建：`apps/web/tsconfig.node.json`
+- 新建：`apps/web/vite.config.ts`
+- 新建：`apps/web/index.html`
+- 新建：`apps/web/src/test/setup.ts`
 
-- [ ] **Step 1: 写根目录配置**
+- [ ] **步骤 1：编写根目录配置**
 
 `package.json`:
 
@@ -124,7 +124,7 @@ AGENT_MAX_ITERATIONS=4
 VITE_API_BASE_URL=http://localhost:3000
 ```
 
-- [ ] **Step 2: 写 API package 配置**
+- [ ] **步骤 2：编写 API 包配置**
 
 `apps/api/package.json`:
 
@@ -190,7 +190,7 @@ export default defineConfig({
 });
 ```
 
-- [ ] **Step 3: 写 Web package 配置**
+- [ ] **步骤 3：编写 Web 包配置**
 
 `apps/web/package.json`:
 
@@ -310,41 +310,41 @@ export default defineConfig({
 import "@testing-library/jest-dom/vitest";
 ```
 
-- [ ] **Step 4: 安装依赖**
+- [ ] **步骤 4：安装依赖**
 
-Run:
+运行：
 
 ```bash
 npm install
 ```
 
-Expected: 生成 `package-lock.json`，依赖安装成功。
+预期：生成 `package-lock.json`，依赖安装成功。
 
-- [ ] **Step 5: 运行基础检查**
+- [ ] **步骤 5：运行基础检查**
 
-Run:
+运行：
 
 ```bash
 npm run typecheck
 ```
 
-Expected: 因为业务文件尚未创建，API 或 Web 可能提示入口文件缺失；后续任务补齐入口后再要求通过。
+预期：因为业务文件尚未创建，API 或 Web 可能提示入口文件缺失；后续任务补齐入口后再要求通过。
 
 ---
 
-### Task 2: API 工具层
+### 任务 2：API 工具层
 
-**Files:**
-- Create: `apps/api/test/tools/calculator.test.ts`
-- Create: `apps/api/test/tools/registry.test.ts`
-- Create: `apps/api/src/errors/app-error.ts`
-- Create: `apps/api/src/agent/types.ts`
-- Create: `apps/api/src/tools/registry.ts`
-- Create: `apps/api/src/tools/calculator.ts`
-- Create: `apps/api/src/tools/current-time.ts`
-- Create: `apps/api/src/tools/index.ts`
+**文件：**
+- 新建：`apps/api/test/tools/calculator.test.ts`
+- 新建：`apps/api/test/tools/registry.test.ts`
+- 新建：`apps/api/src/errors/app-error.ts`
+- 新建：`apps/api/src/agent/types.ts`
+- 新建：`apps/api/src/tools/registry.ts`
+- 新建：`apps/api/src/tools/calculator.ts`
+- 新建：`apps/api/src/tools/current-time.ts`
+- 新建：`apps/api/src/tools/index.ts`
 
-- [ ] **Step 1: 先写失败测试**
+- [ ] **步骤 1：先写失败测试**
 
 `apps/api/test/tools/calculator.test.ts`:
 
@@ -398,17 +398,17 @@ describe("ToolRegistry", () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [ ] **步骤 2：运行测试确认失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- test/tools/calculator.test.ts test/tools/registry.test.ts
 ```
 
-Expected: FAIL，提示找不到 `calculator.js`、`registry.js` 或 `app-error.js`。
+预期：失败，提示找不到 `calculator.js`、`registry.js` 或 `app-error.js`。
 
-- [ ] **Step 3: 实现错误和类型**
+- [ ] **步骤 3：实现错误和类型**
 
 `apps/api/src/errors/app-error.ts`:
 
@@ -460,7 +460,7 @@ export interface AgentRunResult {
 }
 ```
 
-- [ ] **Step 4: 实现 Tool Registry**
+- [ ] **步骤 4：实现工具注册表**
 
 `apps/api/src/tools/registry.ts`:
 
@@ -504,7 +504,7 @@ export class ToolRegistry {
 }
 ```
 
-- [ ] **Step 5: 实现内置工具**
+- [ ] **步骤 5：实现内置工具**
 
 `apps/api/src/tools/calculator.ts`:
 
@@ -604,29 +604,29 @@ export function createDefaultToolRegistry(): ToolRegistry {
 }
 ```
 
-- [ ] **Step 6: 运行测试确认通过**
+- [ ] **步骤 6：运行测试确认通过**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- test/tools/calculator.test.ts test/tools/registry.test.ts
 ```
 
-Expected: PASS。
+预期：通过。
 
 ---
 
-### Task 3: API Agent Core 和 Provider
+### 任务 3：API Agent 核心和提供程序
 
-**Files:**
-- Create: `apps/api/test/agent/agent-service.test.ts`
-- Create: `apps/api/src/agent/instructions.ts`
-- Create: `apps/api/src/agent/agent-service.ts`
-- Create: `apps/api/src/providers/types.ts`
-- Create: `apps/api/src/providers/openai-compatible-provider.ts`
-- Modify: `apps/api/src/agent/types.ts`
+**文件：**
+- 新建：`apps/api/test/agent/agent-service.test.ts`
+- 新建：`apps/api/src/agent/instructions.ts`
+- 新建：`apps/api/src/agent/agent-service.ts`
+- 新建：`apps/api/src/providers/types.ts`
+- 新建：`apps/api/src/providers/openai-compatible-provider.ts`
+- 修改：`apps/api/src/agent/types.ts`
 
-- [ ] **Step 1: 写 AgentService 失败测试**
+- [ ] **步骤 1：写 AgentService 失败测试**
 
 `apps/api/test/agent/agent-service.test.ts`:
 
@@ -701,17 +701,17 @@ describe("AgentService", () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [ ] **步骤 2：运行测试确认失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- test/agent/agent-service.test.ts
 ```
 
-Expected: FAIL，提示找不到 `agent-service.js` 或 `providers/types.js`。
+预期：失败，提示找不到 `agent-service.js` 或 `providers/types.js`。
 
-- [ ] **Step 3: 扩展 Agent 类型**
+- [ ] **步骤 3：扩展 Agent 类型**
 
 `apps/api/src/agent/types.ts`:
 
@@ -758,7 +758,7 @@ export interface AgentRunResult {
 }
 ```
 
-- [ ] **Step 4: 实现 Provider 接口和 OpenAI-compatible Provider**
+- [ ] **步骤 4：实现提供程序接口和兼容 OpenAI 的提供程序**
 
 `apps/api/src/providers/types.ts`:
 
@@ -882,7 +882,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
 }
 ```
 
-- [ ] **Step 5: 实现 Agent 指令和 AgentService**
+- [ ] **步骤 5：实现 Agent 指令和 AgentService**
 
 `apps/api/src/agent/instructions.ts`:
 
@@ -957,29 +957,29 @@ export class AgentService {
 }
 ```
 
-- [ ] **Step 6: 运行测试确认通过**
+- [ ] **步骤 6：运行测试确认通过**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- test/agent/agent-service.test.ts
 ```
 
-Expected: PASS。
+预期：通过。
 
 ---
 
-### Task 4: API 路由和服务启动
+### 任务 4：API 路由和服务启动
 
-**Files:**
-- Create: `apps/api/test/routes/agent-routes.test.ts`
-- Create: `apps/api/src/config/env.ts`
-- Create: `apps/api/src/routes/health-routes.ts`
-- Create: `apps/api/src/routes/agent-routes.ts`
-- Create: `apps/api/src/app.ts`
-- Create: `apps/api/src/server.ts`
+**文件：**
+- 新建：`apps/api/test/routes/agent-routes.test.ts`
+- 新建：`apps/api/src/config/env.ts`
+- 新建：`apps/api/src/routes/health-routes.ts`
+- 新建：`apps/api/src/routes/agent-routes.ts`
+- 新建：`apps/api/src/app.ts`
+- 新建：`apps/api/src/server.ts`
 
-- [ ] **Step 1: 写路由失败测试**
+- [ ] **步骤 1：写路由失败测试**
 
 `apps/api/test/routes/agent-routes.test.ts`:
 
@@ -1035,17 +1035,17 @@ describe("agent routes", () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [ ] **步骤 2：运行测试确认失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- test/routes/agent-routes.test.ts
 ```
 
-Expected: FAIL，提示找不到 `app.js`。
+预期：失败，提示找不到 `app.js`。
 
-- [ ] **Step 3: 实现配置和路由**
+- [ ] **步骤 3：实现配置和路由**
 
 `apps/api/src/config/env.ts`:
 
@@ -1104,7 +1104,7 @@ export async function registerAgentRoutes(app: FastifyInstance, agentService: Ag
 }
 ```
 
-- [ ] **Step 4: 实现 app 和 server**
+- [ ] **步骤 4：实现应用和服务器**
 
 `apps/api/src/app.ts`:
 
@@ -1182,31 +1182,31 @@ await app.listen({
 });
 ```
 
-- [ ] **Step 5: 运行路由测试确认通过**
+- [ ] **步骤 5：运行路由测试确认通过**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- test/routes/agent-routes.test.ts
 ```
 
-Expected: PASS。
+预期：通过。
 
 ---
 
-### Task 5: React Demo
+### 任务 5：React 演示
 
-**Files:**
-- Create: `apps/web/src/App.test.tsx`
-- Create: `apps/web/src/api/agent-client.ts`
-- Create: `apps/web/src/components/AgentRunForm.tsx`
-- Create: `apps/web/src/components/AgentResultPanel.tsx`
-- Create: `apps/web/src/components/AgentSteps.tsx`
-- Create: `apps/web/src/App.tsx`
-- Create: `apps/web/src/main.tsx`
-- Create: `apps/web/src/styles.css`
+**文件：**
+- 新建：`apps/web/src/App.test.tsx`
+- 新建：`apps/web/src/api/agent-client.ts`
+- 新建：`apps/web/src/components/AgentRunForm.tsx`
+- 新建：`apps/web/src/components/AgentResultPanel.tsx`
+- 新建：`apps/web/src/components/AgentSteps.tsx`
+- 新建：`apps/web/src/App.tsx`
+- 新建：`apps/web/src/main.tsx`
+- 新建：`apps/web/src/styles.css`
 
-- [ ] **Step 1: 写前端失败测试**
+- [ ] **步骤 1：写前端失败测试**
 
 `apps/web/src/App.test.tsx`:
 
@@ -1253,17 +1253,17 @@ describe("App", () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [ ] **步骤 2：运行测试确认失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/web -- src/App.test.tsx
 ```
 
-Expected: FAIL，提示找不到 `App` 或相关组件。
+预期：失败，提示找不到 `App` 或相关组件。
 
-- [ ] **Step 3: 实现前端 API client**
+- [ ] **步骤 3：实现前端 API 客户端**
 
 `apps/web/src/api/agent-client.ts`:
 
@@ -1309,7 +1309,7 @@ export async function runAgent(input: string, maxIterations: number): Promise<Ag
 }
 ```
 
-- [ ] **Step 4: 实现 React 组件**
+- [ ] **步骤 4：实现 React 组件**
 
 `apps/web/src/components/AgentRunForm.tsx`:
 
@@ -1439,7 +1439,7 @@ export function AgentResultPanel({ result, error }: AgentResultPanelProps) {
 }
 ```
 
-- [ ] **Step 5: 实现 App 和样式**
+- [ ] **步骤 5：实现 App 和样式**
 
 `apps/web/src/App.tsx`:
 
@@ -1747,24 +1747,24 @@ pre {
 }
 ```
 
-- [ ] **Step 6: 运行前端测试确认通过**
+- [ ] **步骤 6：运行前端测试确认通过**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/web -- src/App.test.tsx
 ```
 
-Expected: PASS。
+预期：通过。
 
 ---
 
-### Task 6: 全量验证和本地运行
+### 任务 6：全量验证和本地运行
 
-**Files:**
-- Modify: `README.md`
+**文件：**
+- 修改：`README.md`
 
-- [ ] **Step 1: 写 README**
+- [ ] **步骤 1：写 README**
 
 `README.md`:
 
@@ -1819,45 +1819,45 @@ npm run build
 ```
 ```
 
-- [ ] **Step 2: 运行全部测试**
+- [ ] **步骤 2：运行全部测试**
 
-Run:
+运行：
 
 ```bash
 npm run test
 ```
 
-Expected: API 和 Web 测试全部 PASS。
+预期：API 和 Web 测试全部通过。
 
-- [ ] **Step 3: 运行类型检查**
+- [ ] **步骤 3：运行类型检查**
 
-Run:
+运行：
 
 ```bash
 npm run typecheck
 ```
 
-Expected: API 和 Web 类型检查全部 PASS。
+预期：API 和 Web 类型检查全部通过。
 
-- [ ] **Step 4: 运行构建**
+- [ ] **步骤 4：运行构建**
 
-Run:
+运行：
 
 ```bash
 npm run build
 ```
 
-Expected: API 输出 `apps/api/dist`，Web 输出 `apps/web/dist`。
+预期：API 输出 `apps/api/dist`，Web 输出 `apps/web/dist`。
 
-- [ ] **Step 5: 启动开发服务器**
+- [ ] **步骤 5：启动开发服务器**
 
-Run:
+运行：
 
 ```bash
 npm run dev:api
 ```
 
-Expected: API 监听 `http://localhost:3000`。
+预期：API 监听 `http://localhost:3000`。
 
 另开终端运行：
 
@@ -1865,23 +1865,23 @@ Expected: API 监听 `http://localhost:3000`。
 npm run dev:web
 ```
 
-Expected: Web 监听 `http://localhost:5173`。
+预期：Web 监听 `http://localhost:5173`。
 
-- [ ] **Step 6: 如果已经初始化 git，则提交**
+- [ ] **步骤 6：如果已经初始化 Git，则提交**
 
-Run:
+运行：
 
 ```bash
 git add .
 git commit -m "feat: add fastify react agent demo"
 ```
 
-Expected: 生成实现提交。当前目录未初始化 git 时跳过此步骤。
+预期：生成实现提交。当前目录未初始化 Git 时跳过此步骤。
 
 ---
 
 ## 自查
 
-- Spec 覆盖：API、Agent Core、Provider、Tool Registry、React Demo、配置、错误处理、测试策略都对应了任务。
+- 规格覆盖：API、Agent 核心、提供程序、工具注册表、React 演示、配置、错误处理、测试策略都对应了任务。
 - 类型一致：`AgentRunResponse`、`AgentStep`、`ToolCall`、`LlmProvider` 在计划中命名一致。
-- 范围控制：第一版只做同步 Agent 和本地 Demo，不做持久化、队列、流式和多 Agent。
+- 范围控制：第一版只做同步 Agent 和本地演示，不做持久化、队列、流式和多 Agent。
