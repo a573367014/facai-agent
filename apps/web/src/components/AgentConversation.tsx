@@ -1,5 +1,21 @@
 import { Accordion, AccordionDetails, AccordionSummary, Alert, Box, Chip, CircularProgress, IconButton, Paper, Tooltip, Typography, type TooltipProps } from "@mui/material";
-import { CheckCircle2, ChevronDown, CircleAlert, CircleStop, Clock3, Copy, Loader2, Pencil, RefreshCw, XCircle } from "lucide-react";
+import {
+  CheckCircle2,
+  ChevronDown,
+  CircleAlert,
+  CircleStop,
+  Clock3,
+  Code2,
+  Copy,
+  FileText,
+  Image as ImageIcon,
+  Loader2,
+  Pencil,
+  RefreshCw,
+  Search,
+  XCircle,
+  type LucideIcon
+} from "lucide-react";
 import {
   useEffect,
   useLayoutEffect,
@@ -63,12 +79,43 @@ const stateText: Record<AgentState, string> = {
   failed: "失败"
 };
 
-const emptySuggestions = [
-  "现在上海时间是多少？",
-  "数据库设计中需要注意哪些问题？",
-  "帮我生成一张温馨田园小猪图片",
-  "JavaScript 的哪些新特性可以提升前端开发效率？",
-  "解释一下这个 Agent 项目的工具调用流程"
+interface EmptySuggestion {
+  category: string;
+  title: string;
+  description: string;
+  prompt: string;
+  icon: LucideIcon;
+}
+
+const emptySuggestions: EmptySuggestion[] = [
+  {
+    category: "查资料",
+    title: "搜索并整理关键信息",
+    description: "快速汇总来源、重点与结论",
+    prompt: "帮我搜索并整理一项主题的关键信息",
+    icon: Search
+  },
+  {
+    category: "分析文档",
+    title: "上传文件并提炼结论",
+    description: "总结要点、差异与行动建议",
+    prompt: "帮我分析文档并提炼关键结论",
+    icon: FileText
+  },
+  {
+    category: "生成图片",
+    title: "描述想要的画面",
+    description: "把创意转化为可用的视觉素材",
+    prompt: "帮我生成一张温馨田园小猪图片",
+    icon: ImageIcon
+  },
+  {
+    category: "解释代码",
+    title: "分析实现与潜在问题",
+    description: "梳理逻辑、定位风险并给出建议",
+    prompt: "解释一下这个 Agent 项目的工具调用流程",
+    icon: Code2
+  }
 ];
 
 const LOAD_OLDER_SCROLL_THRESHOLD = 120;
@@ -494,18 +541,34 @@ export function AgentConversation({
           ) : null}
           {messages.length === 0 ? (
             <Box className="empty-state chat-empty">
-              <Typography component="h2">有什么我能帮你的吗？</Typography>
-              <p>输入一个任务，Agent 会按需调用工具并把过程展示在右侧。</p>
-              <Box className="empty-suggestions">
-                {emptySuggestions.map((suggestion) => (
-                  <Chip
-                    className="empty-suggestion-chip"
-                    key={suggestion}
-                    label={suggestion}
-                    clickable={Boolean(onSuggestionSelect)}
-                    onClick={onSuggestionSelect ? () => onSuggestionSelect(suggestion) : undefined}
-                  />
-                ))}
+              <Box component="header" className="chat-empty-header">
+                <Typography component="h2">今天想完成什么？</Typography>
+                <Typography component="p">从一个想法开始，我可以帮你查资料、读文档、生成图片或解释代码。</Typography>
+              </Box>
+              <Box className="empty-suggestions" role="group" aria-label="建议任务">
+                {emptySuggestions.map((suggestion) => {
+                  const SuggestionIcon = suggestion.icon;
+
+                  return (
+                    <button
+                      aria-label={`${suggestion.category}：${suggestion.title}`}
+                      className="empty-suggestion-card"
+                      disabled={!onSuggestionSelect}
+                      key={suggestion.category}
+                      onClick={() => onSuggestionSelect?.(suggestion.prompt)}
+                      type="button"
+                    >
+                      <span className="empty-suggestion-icon" aria-hidden="true">
+                        <SuggestionIcon size={20} />
+                      </span>
+                      <span className="empty-suggestion-content">
+                        <span className="empty-suggestion-category">{suggestion.category}</span>
+                        <span className="empty-suggestion-title">{suggestion.title}</span>
+                        <span className="empty-suggestion-description">{suggestion.description}</span>
+                      </span>
+                    </button>
+                  );
+                })}
               </Box>
             </Box>
           ) : (

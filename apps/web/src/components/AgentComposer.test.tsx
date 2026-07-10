@@ -100,7 +100,8 @@ describe("AgentComposer", () => {
       onUploadImage: vi.fn().mockResolvedValue(imagePart)
     });
 
-    await userEvent.click(screen.getByRole("button", { name: "上传图片" }));
+    await userEvent.click(screen.getByRole("button", { name: "添加附件" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: "上传图片" }));
     await userEvent.upload(screen.getByLabelText("选择图片"), new File(["image"], "upload.png", { type: "image/png" }));
 
     await waitFor(() => {
@@ -124,7 +125,8 @@ describe("AgentComposer", () => {
       onUploadDocument: vi.fn().mockResolvedValue(documentPart)
     });
 
-    await userEvent.click(screen.getByRole("button", { name: "上传文档" }));
+    await userEvent.click(screen.getByRole("button", { name: "添加附件" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: "上传文档" }));
     await userEvent.upload(screen.getByLabelText("选择文档"), new File(["# report"], "report.md", { type: "text/markdown" }));
 
     await waitFor(() => {
@@ -143,7 +145,8 @@ describe("AgentComposer", () => {
       onUploadError
     });
 
-    await userEvent.click(screen.getByRole("button", { name: "上传文档" }));
+    await userEvent.click(screen.getByRole("button", { name: "添加附件" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: "上传文档" }));
     await userEvent.upload(screen.getByLabelText("选择文档"), new File(["large"], "large.md", { type: "text/markdown" }));
 
     await waitFor(() => {
@@ -152,5 +155,46 @@ describe("AgentComposer", () => {
     await waitFor(() => {
       expect(onUploadError).toHaveBeenCalledWith("VALIDATION_ERROR: 附件不能超过 20MB");
     });
+  });
+
+  it("把上传入口合并为可访问的附件菜单", async () => {
+    renderForm({
+      onUploadImage: vi.fn(),
+      onUploadDocument: vi.fn()
+    });
+
+    const attachmentButton = screen.getByRole("button", { name: "添加附件" });
+    expect(attachmentButton).toHaveAttribute("aria-haspopup", "menu");
+    expect(attachmentButton).not.toHaveAttribute("aria-expanded");
+
+    attachmentButton.focus();
+    await userEvent.keyboard("{Enter}");
+
+    expect(attachmentButton).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("menu", { name: "选择附件类型" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "上传图片" })).toBeEnabled();
+    expect(screen.getByRole("menuitem", { name: "上传文档" })).toBeEnabled();
+  });
+
+  it("保留可用附件类型并禁用缺失的上传能力", async () => {
+    renderForm({ onUploadDocument: vi.fn() });
+
+    await userEvent.click(screen.getByRole("button", { name: "添加附件" }));
+
+    expect(screen.getByRole("menuitem", { name: "上传图片" })).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByRole("menuitem", { name: "上传文档" })).toBeEnabled();
+  });
+
+  it("无上传能力时禁用附件入口并展示键盘提示", () => {
+    const { container } = render(<AgentComposer
+      parts={[{ type: "text", value: "" }]}
+      isStreaming={false}
+      onPartsChange={vi.fn()}
+      onSubmit={vi.fn()}
+      onCancel={vi.fn()}
+    />);
+
+    expect(screen.getByRole("button", { name: "添加附件" })).toBeDisabled();
+    expect(container.querySelector(".composer-shortcut-hint")).toHaveTextContent("Enter发送·Shift + Enter换行");
   });
 });

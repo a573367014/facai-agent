@@ -43,8 +43,8 @@ describe("KnowledgeAdminPanel", () => {
     const props = renderPanel();
 
     expect(screen.getByText("员工手册.txt")).toBeInTheDocument();
-    expect(screen.getByText("ready")).toBeInTheDocument();
-    expect(screen.getByText("2 chunks")).toBeInTheDocument();
+    expect(screen.getByText("可使用")).toBeInTheDocument();
+    expect(screen.getByText("2 个片段")).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "刷新知识库" }));
     expect(props.onRefresh).toHaveBeenCalledTimes(1);

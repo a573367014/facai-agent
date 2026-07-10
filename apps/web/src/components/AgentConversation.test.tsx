@@ -408,9 +408,10 @@ describe("AgentConversation", () => {
 
     render(<AgentConversation messages={[]} isActive={false} onSuggestionSelect={onSuggestionSelect} />);
 
-    await userEvent.click(screen.getByRole("button", { name: "现在上海时间是多少？" }));
+    expect(screen.getAllByRole("button")).toHaveLength(4);
+    await userEvent.click(screen.getByRole("button", { name: "查资料：搜索并整理关键信息" }));
 
-    expect(onSuggestionSelect).toHaveBeenCalledWith("现在上海时间是多少？");
+    expect(onSuggestionSelect).toHaveBeenCalledWith("帮我搜索并整理一项主题的关键信息");
   });
 
   it("把 system 消息渲染成居中的轻量状态条，而不是普通气泡", () => {
