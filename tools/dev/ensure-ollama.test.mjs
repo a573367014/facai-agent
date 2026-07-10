@@ -39,7 +39,10 @@ describe("ensure-ollama", () => {
 
   it("wires Ollama preparation into the root dev script", () => {
     const packageJson = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
+    const startDevScript = readFileSync(new URL("./start-dev.mjs", import.meta.url), "utf8");
 
-    assert.match(packageJson.scripts.dev, /node tools\/dev\/ensure-redis\.mjs && node tools\/dev\/ensure-ollama\.mjs &&/);
+    assert.equal(packageJson.scripts.dev, "node tools/dev/start-dev.mjs");
+    assert.match(startDevScript, /ensure-ollama\.mjs/);
+    assert.match(startDevScript, /docker.*compose.*redis.*postgres.*minio/);
   });
 });

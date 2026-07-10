@@ -207,8 +207,7 @@ async function createAgentRuntimeContainer(
       }
     });
   const agentStore = await PostgresAgentStore.create({
-    connectionString: options.databasePath ?? env.DATABASE_URL,
-    ...(env.AGENT_EMBEDDING_DIMENSION ? { vectorDimension: env.AGENT_EMBEDDING_DIMENSION } : {})
+    connectionString: options.databasePath ?? env.DATABASE_URL
   });
   let redisRuntime: RedisRuntime | undefined;
   let runQueueClient: CloseableQueue | undefined;

@@ -5,6 +5,7 @@
 ## 当前文档
 
 - [仓库地图](architecture/repository-map.md)：目录职责、依赖方向，以及“某类代码应该去哪里找”。
+- [数据库迁移指南](guides/database-migrations.md)：创建、执行、验证和回滚 PostgreSQL 版本化迁移。
 - [共享契约说明](../packages/contracts/README.md)：Web/API DTO 的边界与放置规则。
 - [界面改版方案](2026-07-10-ui-redesign-proposal.md)：工作台改版判断、实现范围和验收标准。
 - [界面验收截图](assets/ui-audit/README.md)：改版前后桌面端、窄屏和移动端的视觉证据。

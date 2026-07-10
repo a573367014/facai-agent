@@ -30,7 +30,6 @@ const envSchema = z.object({
   OPENAI_BASE_URL: z.string().url().default("https://api.openai.com/v1"),
   OPENAI_MODEL: z.string().optional(),
   EMBEDDING_PROVIDER: z.enum(["openai-compatible", "ollama"]).default("openai-compatible"),
-  AGENT_EMBEDDING_DIMENSION: z.coerce.number().int().positive().optional(),
   OPENAI_EMBEDDING_API_KEY: optionalEnvString,
   OPENAI_EMBEDDING_BASE_URL: optionalEnvUrl,
   OPENAI_EMBEDDING_MODEL: z.string().min(1).default("text-embedding-3-small"),

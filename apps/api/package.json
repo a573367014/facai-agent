@@ -9,6 +9,9 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/entrypoints/server.js",
     "worker": "node dist/entrypoints/worker.js",
+    "db:migrate": "node scripts/run-migrations.mjs up",
+    "db:rollback": "node scripts/run-migrations.mjs down",
+    "db:migration:create": "node-pg-migrate create --migrations-dir migrations --migration-file-language js --migration-filename-format utc",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit"

@@ -16,12 +16,3 @@
  * NULL，是为了让历史会话仍能被统一查询，同时后续可按需迁移到真实用户。
  */
 export const DEFAULT_SESSION_USER_ID = "user_system";
-
-/**
- * 默认向量维度。
- *
- * 对应大多数主流 Embedding 模型（如 BGE-M3 等）的输出维度。建表时若未显式传入
- * vectorDimension，则按此维度创建 embedding 列。一旦切换模型导致维度变化，
- * 必须通过 migrateVectorDimension 显式迁移列类型，否则写入会因维度不匹配而报错。
- */
-export const DEFAULT_VECTOR_DIMENSION = 1024;

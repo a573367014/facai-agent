@@ -21,9 +21,9 @@
 - `EMBEDDING_PROVIDER`：嵌入向量提供方，默认 `openai-compatible`；本地知识库推荐设为 `ollama`。
 - `OLLAMA_BASE_URL`、`OLLAMA_EMBEDDING_MODEL`：`EMBEDDING_PROVIDER=ollama` 时使用，默认分别是 `http://localhost:11434` 和 `embeddinggemma`。
 - `OPENAI_EMBEDDING_API_KEY`、`OPENAI_EMBEDDING_BASE_URL`、`OPENAI_EMBEDDING_MODEL`：`EMBEDDING_PROVIDER=openai-compatible` 时使用；未配置前两项时会复用聊天模型的密钥和基础地址。
-- `REDIS_URL`：Redis 连接地址，默认 `redis://localhost:6379`。产品化运行时固定依赖 Redis，不再提供切换底层实现的开发态开关。
+- `REDIS_URL`：Redis 连接地址，默认 `redis://localhost:6379`。本地 `pnpm run dev` 使用 Docker Compose 中的 Redis 容器；API/Worker 在宿主机运行时通过宿主机映射端口连接它。产品化运行时固定依赖 Redis，不再提供切换底层实现的开发态开关。
 - `AGENT_WORKER_CONCURRENCY`：工作进程同时执行运行任务的数量，默认 `2`。
-- `DATABASE_URL`：PostgreSQL 连接串，默认 `postgres://postgres:postgres@localhost:5432/agent`。需要安装 pgvector 扩展。
+- `DATABASE_URL`：PostgreSQL 连接串，默认 `postgres://postgres:postgres@localhost:5432/agent`。数据库结构由 `node-pg-migrate` 管理，启动前运行 `pnpm db:migrate`；本地容器使用带 pgvector 的 PostgreSQL 镜像。
 - `AGENT_UPLOAD_DIR`：用户上传和工具资源转储目录，默认 `../../var/uploads`（即仓库根目录 `var/uploads`）。
 - `GITHUB_OAUTH_CLIENT_ID`、`GITHUB_OAUTH_CLIENT_SECRET`、`GITHUB_OAUTH_REDIRECT_URI`：GitHub OAuth 登录配置。兼容旧的 `GITHUB_CLIENT_ID`、`GITHUB_CLIENT_SECRET`、`GITHUB_REDIRECT_URI` 命名。
 - `VITE_GITHUB_OAUTH_CLIENT_ID`、`VITE_GITHUB_OAUTH_REDIRECT_URI`：前端跳转 GitHub OAuth 授权页时使用；客户端标识是公开值，客户端密钥只放在后端环境变量中。
@@ -51,7 +51,7 @@ pnpm install
 pnpm run dev
 ```
 
-根目录 `pnpm run dev` 会先检查本机运行时依赖：本机 Redis 未启动时会自动启动；当 `EMBEDDING_PROVIDER=ollama` 时，也会自动检查 Ollama、启动本机服务，并在缺少模型时拉取 `OLLAMA_EMBEDDING_MODEL`。
+根目录 `pnpm run dev` 会先检查本机运行时依赖；当 `EMBEDDING_PROVIDER=ollama` 时，也会自动检查 Ollama、启动本机服务，并在缺少模型时拉取 `OLLAMA_EMBEDDING_MODEL`。随后会启动 Redis / PostgreSQL / MinIO 容器，等待依赖健康并执行全部待运行数据库迁移，最后再启动 API、Web 和工作进程。Redis 使用 `redis-data` volume 持久化，并开启 AOF。
 
 也可以按需单独启动：
 
@@ -59,7 +59,20 @@ pnpm run dev
 pnpm run dev:api
 pnpm run dev:web
 pnpm run dev:worker
+pnpm run dev:infra
 ```
+
+其中 `pnpm run dev:infra` 只准备 Ollama、Redis、PostgreSQL、MinIO、Grafana/Loki/Tempo 并执行数据库迁移，不启动 API、Web 和 Worker，适合排查基础设施问题。
+
+数据库结构变更使用下面三个命令：
+
+```bash
+pnpm db:migrate
+pnpm db:migration:create add-example-column
+pnpm db:rollback
+```
+
+迁移文件和完整操作规则见[数据库迁移指南](docs/guides/database-migrations.md)。
 
 访问：
 
@@ -201,9 +214,9 @@ PostgreSQL 仍然是最终可信的数据源：会话、消息、运行任务、
 - [x] 增加 `agent_tool_calls`，支持按工具调用做审计和聚合查询。
 - [x] 增加 `agent_resources`，作为资源索引、审计和聚合表；`message.parts` 保留渲染快照，例如 `url`、`mime`、`name`、`extra.resourceId`。
 - [x] 移除事件表，智能体过程事件不再进入业务库，观测事件统一通过 OTel 日志写入 Loki。
-- [x] 设计 PostgreSQL 数据库结构初始化方案：进程启动时运行 `initializeSchema`，使用 `CREATE TABLE / EXTENSION / INDEX IF NOT EXISTS` 幂等建表，并由 `migrateVectorDimension` 处理向量列维度变更。
+- [x] 将 PostgreSQL 结构从 Store 启动时自愈建表收口为显式迁移；Store 只检查依赖表是否存在，不在运行期执行 DDL。
 - [x] 增加数据库连接池、事务边界和索引设计（`pg.Pool` 连接池、`BEGIN/COMMIT/ROLLBACK` 事务、`CREATE INDEX` 索引）。
-- [ ] 引入版本化迁移工具（如 `node-pg-migrate` 或 `drizzle-kit`），支持破坏性变更（删列、改类型、重命名）、数据回填、回滚和迁移历史审计；当前自愈式建表只能追加表和索引，无法处理破坏性变更。
+- [x] 引入 `node-pg-migrate` 和 `pgmigrations` 迁移账本，支持按版本执行结构变更、数据回填、回滚和迁移历史审计；现有数据库已纳入基线迁移。
 - [x] 增加用户字段，为后续多用户隔离做准备；当前不引入租户维度。
 
 为什么做它：本地开发存储适合起步，但产品化需要连接池、迁移、索引、事务和数据隔离。当前已落地 PostgreSQL + pgvector，并通过 `AgentStore` 接口保留可替换数据库实现的能力。

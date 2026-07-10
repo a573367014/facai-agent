@@ -23,6 +23,11 @@ import { ToolExecutor } from "../../src/modules/tools/executor.js";
 import { ToolRegistry } from "../../src/modules/tools/registry.js";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? "postgres://postgres:postgres@localhost:5432/agent_test";
+const TEST_VECTOR_DIMENSION = 768;
+
+function unitEmbedding(axis: number): number[] {
+  return Array.from({ length: TEST_VECTOR_DIMENSION }, (_, index) => (index === axis ? 1 : 0));
+}
 
 const apps: FastifyInstance[] = [];
 const uploadDirs: string[] = [];
@@ -44,7 +49,7 @@ class FakeEmbeddingService implements EmbeddingService {
   readonly model = "test-embedding";
 
   async embedTexts(texts: string[]): Promise<number[][]> {
-    return texts.map((text) => (text.includes("请假") ? [1, 0] : [0, 1]));
+    return texts.map((text) => unitEmbedding(text.includes("请假") ? 0 : 1));
   }
 }
 

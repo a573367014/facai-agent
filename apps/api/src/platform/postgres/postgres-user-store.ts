@@ -3,7 +3,7 @@
  *
  * 【职责边界】
  * 本文件是 platform 基础设施层的一部分，实现 auth 模块定义的 UserStore 契约。
- * 它负责所有与 PostgreSQL 数据库的交互：建表、upsert、查询、连接池管理。
+ * 它负责用户数据的 PostgreSQL 读写和连接池管理；数据库 DDL 由版本化迁移统一负责。
  *
  * 这里体现了六边形架构（端口与适配器）的思想：
  * - user-store.ts 中的 UserStore 是"端口"（Port），定义了需要什么
@@ -18,6 +18,7 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import type { Pool, QueryResultRow } from "pg";
 import type { GithubUserInput, UserRecord, UserStore } from "../../modules/auth/user-store.js";
+import { assertPostgresSchemaReady } from "./schema-readiness.js";
 
 /** SQL 参数值允许的类型。pg 驱动只接受这些原始类型，不支持直接传对象/数组 */
 type SqlValue = string | number | boolean | null;
@@ -66,21 +67,20 @@ function optionalString(value: unknown): string | undefined {
 export class PostgresUserStore implements UserStore {
   /**
    * 构造函数设为 private，强制通过静态工厂方法 create() 创建实例。
-   * 因为初始化需要先建表（异步操作），不能在构造函数中完成。
+   * 保留静态异步工厂，以便返回实例前完成数据库可用性检查。
    */
   private constructor(private readonly pool: Pool) {}
 
   /**
-   * 异步工厂方法：创建连接池 → 初始化表结构 → 返回可用实例。
+   * 异步工厂方法：创建连接池 → 检查迁移结果 → 返回可用实例。
    *
    * 【为什么用 async create 而非 constructor】
-   * 建表是异步操作，而 constructor 不能是 async。用静态工厂方法把
-   * "创建对象"和"异步初始化"合并为一步，保证调用方拿到的实例一定已就绪。
-   * initializeSchema 用 CREATE TABLE IF NOT EXISTS，保证幂等可重复执行。
+   * Store 不再执行 CREATE TABLE。部署或开发启动必须先运行 `pnpm db:migrate`；
+   * 这里仅用一个无数据查询尽早发现漏跑迁移，避免等到首个登录请求才报错。
    */
   static async create(options: PostgresUserStoreOptions): Promise<PostgresUserStore> {
     const store = new PostgresUserStore(new pg.Pool({ connectionString: options.connectionString }));
-    await store.initializeSchema();
+    await store.assertTableAvailable();
     return store;
   }
 
@@ -168,40 +168,13 @@ export class PostgresUserStore implements UserStore {
     await this.pool.end();
   }
 
-  /**
-   * 初始化表结构和索引。
-   * 全部使用 IF NOT EXISTS，保证幂等——多次执行不会报错。
-   *
-   * 【索引设计】
-   * - github_id UNIQUE：天然唯一，既是业务约束也是 upsert 的冲突检测依据
-   * - github_login：可能按用户名查询/搜索，加普通索引加速
-   * - updated_at：可能按更新时间排序/筛选活跃用户，加索引支持
-   * - seq SERIAL：自增整数序列，为未来可能的全量分页或顺序遍历预留
-   */
-  private async initializeSchema(): Promise<void> {
-    await this.execute(
-      `CREATE TABLE IF NOT EXISTS users (
-         id TEXT PRIMARY KEY,
-         github_id TEXT NOT NULL UNIQUE,
-         github_login TEXT NOT NULL,
-         name TEXT,
-         email TEXT,
-         avatar_url TEXT,
-         github_url TEXT,
-         created_at TEXT NOT NULL,
-         updated_at TEXT NOT NULL,
-         last_login_at TEXT NOT NULL,
-         seq SERIAL
-       )`
-    );
-    await this.execute(
-      `CREATE INDEX IF NOT EXISTS idx_users_github_login
-       ON users (github_login)`
-    );
-    await this.execute(
-      `CREATE INDEX IF NOT EXISTS idx_users_updated_at
-       ON users (updated_at)`
-    );
+  private async assertTableAvailable(): Promise<void> {
+    try {
+      await assertPostgresSchemaReady(this.pool, "users");
+    } catch (error) {
+      await this.pool.end();
+      throw error;
+    }
   }
 
   /** 执行查询并返回第一行（用于 upsert/单条查询场景） */

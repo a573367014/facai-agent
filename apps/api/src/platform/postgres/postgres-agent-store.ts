@@ -55,7 +55,7 @@ import type {
   UpdateAgentToolCallInput,
   UpsertAgentSessionSummaryInput
 } from "../../modules/agent/agent-store.js";
-import { DEFAULT_SESSION_USER_ID, DEFAULT_VECTOR_DIMENSION } from "./constants.js";
+import { DEFAULT_SESSION_USER_ID } from "./constants.js";
 import {
   mapAgentMessageRow,
   mapAgentProcessStepRow,
@@ -69,7 +69,7 @@ import {
   optionalNumber,
   requiredString
 } from "./record-mappers.js";
-import { initializePostgresAgentStoreSchema } from "./schema.js";
+import { assertPostgresSchemaReady } from "./schema-readiness.js";
 
 /**
  * SQL 参数的合法值类型。pg 驱动只接受这些原始类型；复杂结构（对象/数组）
@@ -79,7 +79,6 @@ type SqlValue = string | number | boolean | null;
 
 interface PostgresAgentStoreOptions {
   connectionString: string;
-  vectorDimension?: number;
 }
 
 /**
@@ -177,25 +176,24 @@ export class PostgresAgentStore implements AgentStore {
    */
   private readonly runSubscribers = new Map<string, Set<AgentEventListener>>();
 
-  private constructor(
-    private readonly pool: Pool,
-    private readonly vectorDimension: number
-  ) {}
+  private constructor(private readonly pool: Pool) {}
 
   /**
-   * 工厂方法：创建连接池 + 自举 schema + 返回 store 实例。
+   * 工厂方法：创建连接池并返回 store 实例。
    *
-   * 为什么用静态工厂而非构造函数：构造函数不能是 async，而 schema 初始化必须等待
-   * 数据库往返完成。通过工厂把"异步就绪"前置，保证返回的 store 一定处于可用状态。
-   * schema 初始化内部是幂等的（见 schema.ts），因此重复调用 create 也安全。
+   * 数据库结构由 node-pg-migrate 在进程启动前统一迁移，Store 不再执行 DDL。
+   * 这样 API、Worker 和测试面对的是同一个有版本号的 schema，结构变更也不会
+   * 随着 Store 实例化而在运行期悄悄发生。
    */
   static async create(options: PostgresAgentStoreOptions): Promise<PostgresAgentStore> {
     const pool = new pg.Pool({ connectionString: options.connectionString });
-    const vectorDimension = options.vectorDimension ?? DEFAULT_VECTOR_DIMENSION;
-    const store = new PostgresAgentStore(pool, vectorDimension);
-
-    await initializePostgresAgentStoreSchema(pool, options.vectorDimension);
-    return store;
+    try {
+      await assertPostgresSchemaReady(pool, "agent_sessions");
+      return new PostgresAgentStore(pool);
+    } catch (error) {
+      await pool.end();
+      throw error;
+    }
   }
 
   async createSession(title?: string, userId = DEFAULT_SESSION_USER_ID): Promise<AgentSessionRecord> {
@@ -1897,7 +1895,7 @@ export class PostgresAgentStore implements AgentStore {
    * 处于 pending/indexing 的半成品文档的切片。JOIN 同时带出 document_name 供展示。
    *
    * 排序 tie-breaker：距离相同时按 chunk_index 升序，保证结果稳定。
-   * 依赖 HNSW 索引（见 schema.ts）提供近似最近邻加速，否则退化为全表扫描。
+   * 依赖基线 migration 创建的 HNSW 索引提供近似最近邻加速，否则退化为全表扫描。
    */
   async searchKnowledgeChunks(input: SearchKnowledgeChunksInput): Promise<KnowledgeChunkSearchResult[]> {
     const normalizedLimit = normalizeLimit(input.limit ?? 10);

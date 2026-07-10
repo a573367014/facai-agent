@@ -321,13 +321,21 @@ function renderDocumentFrame(
 
   return (
     <div className="message-document-card">
-      <div className="message-document-icon" aria-hidden="true">
-        <FileText size={22} />
-      </div>
-      <div className="message-document-main">
-        <strong>{displayName}</strong>
-        <span>{getDocumentFormatLabel(item)}</span>
-      </div>
+      <ButtonBase
+        type="button"
+        className="message-document-main"
+        aria-label={`预览文档 ${index + 1}`}
+        title="预览"
+        onClick={() => openPreview(index)}
+      >
+        <div className="message-document-icon" aria-hidden="true">
+          <FileText size={22} />
+        </div>
+        <div className="message-document-info">
+          <strong>{displayName}</strong>
+          <span>{getDocumentFormatLabel(item)}</span>
+        </div>
+      </ButtonBase>
       <div className="message-document-actions">
         <IconButton
           type="button"
