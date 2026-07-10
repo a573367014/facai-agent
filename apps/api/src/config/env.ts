@@ -46,6 +46,14 @@ const envSchema = z.object({
   AGENT_PUBLIC_BASE_URL: z.string().url().optional(),
   AGENT_TOOL_RESOURCE_MAX_BYTES: z.coerce.number().int().positive().default(200 * 1024 * 1024),
   AGENT_TOOL_RESOURCE_DOWNLOAD_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
+  AGENT_UPLOAD_RESPONSE_DELAY_MS: z.coerce.number().int().min(0).max(10_000).default(0),
+  GITHUB_OAUTH_CLIENT_ID: optionalEnvString,
+  GITHUB_OAUTH_CLIENT_SECRET: optionalEnvString,
+  GITHUB_OAUTH_REDIRECT_URI: optionalEnvUrl,
+  JWT_ACCESS_SECRET: envStringWithDefault("dev-access-token-secret-change-me"),
+  JWT_REFRESH_SECRET: envStringWithDefault("dev-refresh-token-secret-change-me"),
+  AUTH_ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(15 * 60),
+  AUTH_REFRESH_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(15 * 24 * 60 * 60),
   REDIS_URL: z.string().url().default("redis://localhost:6379"),
   AGENT_RUNNING_STATE_TTL_SECONDS: z.coerce.number().int().min(60).max(86_400).default(7200),
   AGENT_RUNNING_STATE_REDIS_KEY_PREFIX: z.string().min(1).default("agent"),
@@ -78,5 +86,15 @@ const envSchema = z.object({
 export type Env = z.infer<typeof envSchema>;
 
 export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
-  return envSchema.parse(source);
+  return envSchema.parse(withAuthEnvAliases(source));
+}
+
+function withAuthEnvAliases(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return {
+    ...source,
+    GITHUB_OAUTH_CLIENT_ID: source.GITHUB_OAUTH_CLIENT_ID ?? source.GITHUB_CLIENT_ID,
+    GITHUB_OAUTH_CLIENT_SECRET: source.GITHUB_OAUTH_CLIENT_SECRET ?? source.GITHUB_CLIENT_SECRET,
+    GITHUB_OAUTH_REDIRECT_URI: source.GITHUB_OAUTH_REDIRECT_URI ?? source.GITHUB_REDIRECT_URI,
+    AUTH_ACCESS_TOKEN_TTL_SECONDS: source.AUTH_ACCESS_TOKEN_TTL_SECONDS ?? source.JWT_ACCESS_TTL_SECONDS
+  };
 }

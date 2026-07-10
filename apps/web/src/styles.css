@@ -3,34 +3,39 @@
 }
 
 :root {
-  --eye-page: #fff2c6;
-  --eye-page-deep: #f7e6aa;
-  --eye-surface: #fff8df;
-  --eye-surface-raised: #fffbed;
-  --eye-surface-muted: #f9edbd;
-  --eye-border: #eadfaf;
-  --eye-border-strong: #d8c986;
-  --eye-text: #2f3028;
-  --eye-heading: #24251f;
-  --eye-muted: #7b765d;
-  --eye-muted-soft: #9c936d;
-  --eye-primary: #247a73;
-  --eye-primary-strong: #17645f;
-  --eye-primary-soft: #e7f1d9;
-  --eye-warning: #8a6414;
-  --eye-warning-soft: #fff2c6;
-  --eye-danger: #8f3428;
-  --eye-danger-soft: #fff0df;
-  --eye-code-bg: #f6eab8;
-  --eye-code-dark: #332d23;
-  --eye-code-dark-text: #fff7d6;
-  --eye-shadow: 0 1px 2px rgb(84 70 24 / 0.08);
-  --eye-scrollbar-thumb: rgb(47 48 40 / 0.18);
-  --eye-scrollbar-thumb-hover: rgb(36 122 115 / 0.42);
+  --eye-page: #f7f8fa;
+  --eye-page-deep: #f2f4f7;
+  --eye-surface: #ffffff;
+  --eye-surface-raised: #ffffff;
+  --eye-surface-muted: #f9fafb;
+  --eye-border: #eaecf0;
+  --eye-border-strong: #d0d5dd;
+  --eye-text: #344054;
+  --eye-heading: #101828;
+  --eye-muted: #667085;
+  --eye-muted-soft: #667085;
+  --eye-primary: #0f766e;
+  --eye-primary-strong: #115e59;
+  --eye-primary-soft: #f0fdfa;
+  --eye-user-bubble: #dff1ed;
+  --eye-user-bubble-border: #8fc8bf;
+  --eye-user-bubble-text: #173f3a;
+  --eye-warning: #b45309;
+  --eye-warning-soft: #fffbeb;
+  --eye-danger: #b91c1c;
+  --eye-danger-soft: #fef2f2;
+  --eye-code-bg: #f2f4f7;
+  --eye-code-dark: #182230;
+  --eye-code-dark-text: #f8fafc;
+  --eye-shadow: 0 1px 2px rgb(16 24 40 / 0.04);
+  --eye-shadow-floating: 0 16px 40px rgb(16 24 40 / 0.1), 0 2px 8px rgb(16 24 40 / 0.05);
+  --eye-focus-ring: 0 0 0 3px rgb(15 118 110 / 0.18);
+  --eye-scrollbar-thumb: rgb(52 64 84 / 0.2);
+  --eye-scrollbar-thumb-hover: rgb(15 118 110 / 0.42);
   --eye-scrollbar-track: transparent;
   color: var(--eye-text);
   background: var(--eye-page);
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: Inter, "PingFang SC", "Microsoft YaHei", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }
@@ -39,7 +44,7 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background: #f7f7f5;
+  background: var(--eye-page);
 }
 
 html,
@@ -95,7 +100,8 @@ input {
 button:focus-visible,
 textarea:focus-visible,
 input:focus-visible {
-  outline: none;
+  outline: 2px solid var(--eye-primary);
+  outline-offset: 2px;
 }
 
 button {
@@ -149,7 +155,6 @@ button:not(:disabled):hover {
   color: var(--eye-muted);
 }
 
-.status,
 .generation-badge,
 .count-pill,
 .iteration-pill {
@@ -167,7 +172,6 @@ button:not(:disabled):hover {
   white-space: nowrap;
 }
 
-.status.ok,
 .generation-badge.done,
 .generation-badge.answering {
   border-color: #b8d2a6;
@@ -540,6 +544,42 @@ button:not(:disabled):hover {
   padding-top: 12px;
 }
 
+.sidebar-auth-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.sidebar-auth-chip.sidebar-auth-chip {
+  max-width: 100%;
+  justify-content: flex-start;
+}
+
+.sidebar-auth-chip .MuiChip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sidebar-auth-logout.sidebar-auth-logout.MuiIconButton-root {
+  width: 34px;
+  height: 34px;
+  border: 1px solid #deded9;
+  border-radius: 8px;
+  background: #fffdfa;
+  color: #777770;
+}
+
+.sidebar-auth-logout.sidebar-auth-logout.MuiIconButton-root:hover {
+  border-color: #c9d8bd;
+  background: #edf3e8;
+  color: var(--eye-primary-strong);
+}
+
+.sidebar-github-login-button.sidebar-github-login-button.MuiButton-root {
+  justify-content: flex-start;
+}
+
 .chat-main {
   background: #f7f7f5;
 }
@@ -591,6 +631,27 @@ button:not(:disabled):hover {
 
 .chat-header-side .generation-badge {
   flex: 0 0 auto;
+}
+
+.auth-chip.auth-chip {
+  max-width: 160px;
+  border-color: #d2d2cc;
+  background: #fffdfa;
+  color: #4d4d47;
+  font-weight: 700;
+}
+
+.github-login-button.github-login-button {
+  min-height: 38px;
+  border-color: #d2d2cc;
+  border-radius: 8px;
+  color: #2f3028;
+  text-transform: none;
+}
+
+.github-login-button.github-login-button:hover {
+  border-color: #c9d8bd;
+  background: #edf3e8;
 }
 
 .panel {
@@ -728,6 +789,13 @@ button:not(:disabled):hover {
   margin: 0;
 }
 
+.part-composer-editor.is-attachment-dragover {
+  border-radius: 10px;
+  outline: 1px dashed #65c7dd;
+  outline-offset: 4px;
+  background: rgb(232 250 253 / 0.42);
+}
+
 .user-part-surface {
   min-width: 0;
 }
@@ -743,26 +811,26 @@ button:not(:disabled):hover {
   white-space: pre-wrap;
 }
 
-.user-part-surface-editor .pm-part--media,
-.user-part-surface-editor .pm-part--media:hover {
+.user-part-surface-editor .pm-part--resource,
+.user-part-surface-editor .pm-part--resource:hover {
   background: #e9f4ed;
   color: var(--eye-primary);
   cursor: default;
 }
 
-.user-part-surface-editor .pm-part-media-remove {
+.user-part-surface-editor .pm-part-resource-remove {
   display: none;
   cursor: default;
 }
 
-.user-part-surface-editor .pm-part--media.ProseMirror-selectednode {
+.user-part-surface-editor .pm-part--resource.ProseMirror-selectednode {
   border-radius: 8px;
   background: #e9f4ed;
   color: var(--eye-primary);
   box-shadow: none;
 }
 
-.pm-part--media {
+.pm-part--resource {
   display: inline-flex;
   align-items: center;
   max-width: min(176px, 100%);
@@ -779,19 +847,26 @@ button:not(:disabled):hover {
   transition: background 0.16s ease, color 0.16s ease;
 }
 
-.pm-part--media:hover {
+.pm-part--resource:hover {
   background: #d8eee5;
   color: var(--eye-primary-strong);
 }
 
-.pm-part--media.ProseMirror-selectednode {
+.pm-part--resource.is-uploading,
+.pm-part--resource.is-uploading:hover {
+  background: #e8f8fb;
+  color: #63b8ca;
+  cursor: default;
+}
+
+.pm-part--resource.ProseMirror-selectednode {
   background: #d8eee5;
   border-radius: 0;
   color: var(--eye-primary-strong);
   box-shadow: 0 0 0 2px rgb(36 122 115 / 0.22);
 }
 
-.pm-part--media.is-range-selected {
+.pm-part--resource.is-range-selected {
   height: var(--part-composer-line-height);
   border-radius: 0;
   background: var(--part-composer-selection-background);
@@ -799,16 +874,16 @@ button:not(:disabled):hover {
   box-shadow: none;
 }
 
-.pm-part--media.is-range-selected .pm-part-media-thumb,
-.pm-part--media.is-range-selected .pm-part-media-placeholder {
+.pm-part--resource.is-range-selected .pm-part-resource-thumb,
+.pm-part--resource.is-range-selected .pm-part-resource-placeholder {
   border-color: rgb(31 41 55 / 0.24);
 }
 
-.pm-part--media.is-range-selected .pm-part-media-placeholder {
+.pm-part--resource.is-range-selected .pm-part-resource-placeholder {
   color: var(--part-composer-selection-color);
 }
 
-.pm-part-media-thumb {
+.pm-part-resource-thumb {
   flex: 0 0 auto;
   width: 18px;
   height: 18px;
@@ -818,7 +893,7 @@ button:not(:disabled):hover {
   object-fit: cover;
 }
 
-.pm-part-media-placeholder {
+.pm-part-resource-placeholder {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -834,7 +909,17 @@ button:not(:disabled):hover {
   line-height: 18px;
 }
 
-.pm-part-media-name {
+.pm-part-resource-spinner {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgb(99 184 202 / 0.22);
+  border-top-color: #63b8ca;
+  border-radius: 50%;
+  animation: attachment-upload-spin 0.72s linear infinite;
+}
+
+.pm-part-resource-name {
   min-width: 0;
   max-width: 118px;
   overflow: hidden;
@@ -845,7 +930,7 @@ button:not(:disabled):hover {
   white-space: nowrap;
 }
 
-.pm-part-media-remove {
+.pm-part-resource-remove {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -865,15 +950,21 @@ button:not(:disabled):hover {
   transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease, opacity 0.16s ease;
 }
 
-.pm-part--media:hover .pm-part-media-remove,
-.pm-part--media:focus-within .pm-part-media-remove {
+.pm-part--resource:hover .pm-part-resource-remove,
+.pm-part--resource:focus-within .pm-part-resource-remove {
   opacity: 1;
 }
 
-.pm-part-media-remove:hover {
+.pm-part-resource-remove:hover {
   border-color: var(--eye-primary);
   background: var(--eye-primary);
   color: #fffdf4;
+}
+
+@keyframes attachment-upload-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .part-composer-editor.is-empty::before {
@@ -1774,7 +1865,7 @@ textarea {
   min-width: 0;
 }
 
-.message-image-gallery {
+.message-resource-gallery {
   display: flex;
   flex-wrap: wrap;
   justify-content: start;
@@ -1784,18 +1875,23 @@ textarea {
   margin: 12px 0 4px;
 }
 
-.message-image-gallery.single {
+.message-resource-gallery.single {
   max-width: 100%;
 }
 
-.message-image-tile {
+.message-resource-tile {
   display: grid;
   gap: 6px;
   max-width: 300px;
   margin: 0;
 }
 
-.message-image-frame {
+.message-resource-tile.document {
+  width: min(100%, 360px);
+  max-width: min(100%, 360px);
+}
+
+.message-resource-frame {
   position: relative;
   display: flex;
   align-items: center;
@@ -1809,7 +1905,7 @@ textarea {
   line-height: 0;
 }
 
-.message-image-frame img {
+.message-resource-frame img {
   display: block;
   width: 100%;
   max-width: 100%;
@@ -1818,7 +1914,7 @@ textarea {
   object-fit: contain;
 }
 
-.message-image-canvas {
+.message-resource-canvas {
   width: 100%;
   height: 100%;
   padding: 0;
@@ -1826,11 +1922,11 @@ textarea {
   line-height: 0;
 }
 
-.message-image-canvas:hover {
+.message-resource-canvas:hover {
   transform: none;
 }
 
-.message-image-actions {
+.message-resource-actions {
   position: absolute;
   top: 8px;
   right: 8px;
@@ -1843,14 +1939,94 @@ textarea {
   transition: opacity 140ms ease;
 }
 
-.message-image-tile:hover .message-image-actions,
-.message-image-tile:focus-within .message-image-actions {
+.message-resource-tile:hover .message-resource-actions,
+.message-resource-tile:focus-within .message-resource-actions {
   opacity: 1;
   pointer-events: auto;
 }
 
-.message-image-actions a,
-.message-image-actions button {
+.message-resource-tile.video .message-resource-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.message-document-card {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 74px;
+  border: 1px solid var(--eye-border);
+  border-radius: 8px;
+  padding: 10px;
+  background: var(--eye-surface-raised);
+  color: var(--eye-text);
+  box-shadow: 0 10px 24px rgb(36 37 31 / 0.08);
+}
+
+.message-document-icon {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border: 1px solid #b8d2a6;
+  border-radius: 8px;
+  background: var(--eye-primary-soft);
+  color: var(--eye-primary-strong);
+}
+
+.message-document-main {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.message-document-main strong {
+  min-width: 0;
+  color: var(--eye-heading);
+  font-size: 14px;
+  font-weight: 850;
+  overflow-wrap: anywhere;
+}
+
+.message-document-main span {
+  color: var(--eye-muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.message-document-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.message-document-actions a,
+.message-document-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--eye-border-strong);
+  border-radius: 8px;
+  padding: 0;
+  background: rgb(255 253 250 / 0.94);
+  color: var(--eye-primary);
+  cursor: pointer;
+}
+
+.message-document-actions a:hover,
+.message-document-actions button:not(:disabled):hover {
+  border-color: var(--eye-primary);
+  background: var(--eye-primary-soft);
+  transform: none;
+}
+
+.message-resource-actions a,
+.message-resource-actions button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1865,14 +2041,14 @@ textarea {
   box-shadow: 0 8px 22px rgb(36 37 31 / 0.14);
 }
 
-.message-image-actions a:hover,
-.message-image-actions button:not(:disabled):hover {
+.message-resource-actions a:hover,
+.message-resource-actions button:not(:disabled):hover {
   border-color: var(--eye-primary);
   background: var(--eye-primary-soft);
   transform: none;
 }
 
-.message-image-frame.loading {
+.message-resource-frame.loading {
   position: relative;
   display: grid;
   place-items: center;
@@ -1882,14 +2058,14 @@ textarea {
     var(--eye-surface-muted);
 }
 
-.message-image-loading-shine {
+.message-resource-loading-shine {
   position: absolute;
   inset: 0;
   background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.76), transparent);
   animation: image-loading-shine 1.4s ease-in-out infinite;
 }
 
-.message-image-loading-content {
+.message-resource-loading-content {
   position: relative;
   z-index: 1;
   display: grid;
@@ -1901,25 +2077,25 @@ textarea {
   line-height: 1.45;
 }
 
-.message-image-loading-content strong {
+.message-resource-loading-content strong {
   color: var(--eye-heading);
   font-size: 14px;
 }
 
-.message-image-loading-content p {
+.message-resource-loading-content p {
   margin: 0;
   color: var(--eye-muted);
   font-size: 13px;
   line-height: 1.45;
 }
 
-.message-image-loading-content span {
+.message-resource-loading-content span {
   color: var(--eye-muted);
   font-size: 12px;
   font-weight: 800;
 }
 
-.message-image-frame.failed {
+.message-resource-frame.failed {
   display: grid;
   align-content: center;
   justify-items: center;
@@ -1931,15 +2107,15 @@ textarea {
   line-height: 1.45;
 }
 
-.message-image-frame.failed strong {
+.message-resource-frame.failed strong {
   font-size: 14px;
 }
 
-.message-image-failed-icon {
+.message-resource-failed-icon {
   color: #b73524;
 }
 
-.message-image-menu .MuiPaper-root {
+.message-resource-menu .MuiPaper-root {
   min-width: 136px;
   border: 1px solid var(--eye-border-strong);
   border-radius: 8px;
@@ -1947,13 +2123,13 @@ textarea {
   box-shadow: 0 16px 34px rgb(36 37 31 / 0.18);
 }
 
-.message-image-menu .MuiList-root {
+.message-resource-menu .MuiList-root {
   display: grid;
   gap: 4px;
   padding: 6px;
 }
 
-.message-image-menu .MuiMenuItem-root {
+.message-resource-menu .MuiMenuItem-root {
   display: flex;
   align-items: center;
   gap: 7px;
@@ -1971,17 +2147,17 @@ textarea {
   cursor: pointer;
 }
 
-.message-image-menu .MuiMenuItem-root:hover {
+.message-resource-menu .MuiMenuItem-root:hover {
   background: var(--eye-primary-soft);
   color: var(--eye-primary-strong);
   transform: none;
 }
 
-.message-image-lightbox .MuiBackdrop-root {
+.message-resource-lightbox .MuiBackdrop-root {
   background: rgb(36 37 31 / 0.72);
 }
 
-.message-image-lightbox .MuiDialog-paper {
+.message-resource-lightbox .MuiDialog-paper {
   margin: 0;
   overflow: visible;
   border-radius: 8px;
@@ -1989,12 +2165,13 @@ textarea {
   box-shadow: none;
 }
 
-.message-image-lightbox-content {
+.message-resource-lightbox-content {
   position: relative;
   padding: 0 !important;
 }
 
-.message-image-lightbox-content img {
+.message-resource-lightbox-content img,
+.resource-preview-native-video {
   display: block;
   max-width: min(92vw, 1280px);
   max-height: 88vh;
@@ -2003,8 +2180,38 @@ textarea {
   box-shadow: 0 24px 70px rgb(0 0 0 / 0.34);
 }
 
-.message-image-lightbox-close.message-image-lightbox-close.MuiIconButton-root,
-.message-image-lightbox-nav.message-image-lightbox-nav.MuiIconButton-root {
+.resource-preview-native-video {
+  width: min(92vw, 1180px);
+  height: auto;
+  background: #050505;
+}
+
+.resource-preview-file-viewer {
+  width: min(92vw, 1180px);
+  height: min(84vh, 760px);
+  overflow: hidden;
+  border: 1px solid rgb(255 255 255 / 0.18);
+  border-radius: 8px;
+  background: #10110f;
+  box-shadow: 0 24px 70px rgb(0 0 0 / 0.34);
+}
+
+.resource-preview-loading {
+  display: grid;
+  place-items: center;
+  width: min(92vw, 840px);
+  height: min(62vh, 480px);
+  border: 1px solid rgb(255 255 255 / 0.16);
+  border-radius: 8px;
+  background: rgb(16 17 15 / 0.94);
+  color: #fffdfa;
+  font-size: 14px;
+  font-weight: 800;
+  box-shadow: 0 24px 70px rgb(0 0 0 / 0.34);
+}
+
+.message-resource-lightbox-close.message-resource-lightbox-close.MuiIconButton-root,
+.message-resource-lightbox-nav.message-resource-lightbox-nav.MuiIconButton-root {
   position: absolute;
   z-index: 2;
   width: 34px;
@@ -2014,18 +2221,18 @@ textarea {
   color: #fffdfa;
 }
 
-.message-image-lightbox-close.message-image-lightbox-close.MuiIconButton-root {
+.message-resource-lightbox-close.message-resource-lightbox-close.MuiIconButton-root {
   top: -42px;
   right: 0;
 }
 
-.message-image-lightbox-nav.previous {
+.message-resource-lightbox-nav.previous {
   top: 50%;
   left: -46px;
   transform: translateY(-50%);
 }
 
-.message-image-lightbox-nav.next {
+.message-resource-lightbox-nav.next {
   top: 50%;
   right: -46px;
   transform: translateY(-50%);
@@ -2862,5 +3069,1348 @@ pre {
 
   .panel {
     padding: 15px;
+  }
+}
+
+/*
+ * 2026 workspace refresh
+ *
+ * This final layer keeps the runtime and resource renderers intact while moving
+ * the product shell onto one coherent set of layout and visual rules. New
+ * workspace work should extend these semantic hooks instead of adding another
+ * component-specific colour system above them.
+ */
+
+.workspace {
+  --session-panel-width: 248px;
+  --chat-main-left: var(--session-panel-width);
+  --chat-main-right: 0px;
+  background: var(--eye-page);
+}
+
+.workspace.sidebar-collapsed {
+  --chat-main-left: 0px;
+}
+
+.session-sidebar {
+  width: var(--session-panel-width);
+  border-right: 1px solid var(--eye-border);
+  padding: 16px 12px 14px;
+  background: var(--eye-surface);
+}
+
+.session-sidebar-content {
+  gap: 0;
+}
+
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 40px;
+  padding: 0 6px;
+}
+
+.sidebar-close-button.sidebar-close-button.MuiIconButton-root {
+  display: none;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  color: var(--eye-muted);
+}
+
+.sidebar-close-button.sidebar-close-button.MuiIconButton-root:hover {
+  background: var(--eye-surface-muted);
+  color: var(--eye-heading);
+}
+
+.sidebar-brand {
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+}
+
+.sidebar-brand strong {
+  color: var(--eye-heading);
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.sidebar-avatar {
+  width: 32px;
+  height: 32px;
+  border: 1px solid rgb(15 118 110 / 0.12);
+  border-radius: 10px;
+  background: var(--eye-primary-soft);
+  color: var(--eye-primary);
+}
+
+.sidebar-primary-action {
+  margin: 18px 0 12px;
+}
+
+.new-session-button.new-session-button.MuiButton-root {
+  justify-content: flex-start;
+  width: 100%;
+  min-height: 44px;
+  margin: 0;
+  border-radius: 10px;
+  padding: 9px 13px;
+  background: var(--eye-primary);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.new-session-button.new-session-button.MuiButton-root:hover {
+  background: var(--eye-primary-strong);
+}
+
+.sidebar-search {
+  min-height: 42px;
+  border-color: var(--eye-border-strong);
+  border-radius: 10px;
+  padding: 0 11px;
+  background: var(--eye-surface);
+  color: var(--eye-muted-soft);
+}
+
+.sidebar-search:focus-within {
+  border-color: var(--eye-primary);
+  box-shadow: var(--eye-focus-ring);
+}
+
+.sidebar-search input {
+  color: var(--eye-heading);
+  font-size: 14px;
+}
+
+.sidebar-search input::placeholder {
+  color: var(--eye-muted-soft);
+  opacity: 1;
+}
+
+.sidebar-divider.sidebar-divider.MuiDivider-root {
+  margin: 14px 4px 12px;
+  border-color: var(--eye-border);
+}
+
+.sidebar-history {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.sidebar-history-heading {
+  margin: 0 0 7px;
+  padding: 0 8px;
+  color: var(--eye-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.session-history-list {
+  flex: 1 1 auto;
+  align-content: start;
+  grid-auto-rows: min-content;
+  gap: 3px;
+}
+
+.session-history-row {
+  min-height: 40px;
+  margin: 0;
+  border-radius: 10px;
+}
+
+.session-history-row:hover {
+  background: var(--eye-surface-muted);
+}
+
+.session-history-row.selected,
+.session-history-row.selected:hover {
+  background: var(--eye-primary-soft);
+  border-radius: 10px;
+}
+
+.session-history-item.session-history-item.MuiListItemButton-root {
+  min-height: 40px;
+  border-radius: 10px;
+  padding: 8px 9px;
+  color: var(--eye-text);
+}
+
+.session-history-item.session-history-item.MuiListItemButton-root:hover,
+.session-history-item.session-history-item.Mui-selected,
+.session-history-item.session-history-item.Mui-selected:hover {
+  color: var(--eye-primary-strong);
+}
+
+.session-history-item .MuiListItemText-primary {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.session-delete-button.session-delete-button.MuiIconButton-root {
+  width: 34px;
+  height: 34px;
+  margin-right: 3px;
+  border-radius: 8px;
+  color: var(--eye-muted);
+}
+
+.session-delete-button.session-delete-button.MuiIconButton-root:hover {
+  background: var(--eye-danger-soft);
+  color: var(--eye-danger);
+}
+
+.session-history-empty {
+  padding: 14px 9px;
+  color: var(--eye-muted);
+  font-size: 13px;
+}
+
+.sidebar-footer {
+  border-top: 1px solid var(--eye-border);
+  padding: 12px 0 0;
+}
+
+.sidebar-user-card {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) 44px;
+  align-items: center;
+  gap: 9px;
+  min-height: 56px;
+  border-radius: 12px;
+  padding: 6px 4px 6px 8px;
+  background: var(--eye-surface-muted);
+}
+
+.sidebar-user-avatar {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--eye-surface);
+  color: var(--eye-primary);
+  box-shadow: inset 0 0 0 1px var(--eye-border);
+}
+
+.sidebar-user-copy {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.sidebar-user-copy strong,
+.sidebar-user-copy span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-user-copy strong {
+  color: var(--eye-heading);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.run-events-panel > .muted {
+  margin: 0;
+  border: 1px dashed var(--eye-border-strong);
+  border-radius: 14px;
+  padding: 30px 18px;
+  background: var(--eye-surface-muted);
+  color: var(--eye-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.sidebar-user-copy span {
+  color: var(--eye-muted);
+  font-size: 11px;
+}
+
+.github-login-button.github-login-button,
+.sidebar-auth-logout.sidebar-auth-logout.MuiIconButton-root {
+  min-height: 42px;
+  border-color: var(--eye-border-strong);
+  border-radius: 10px;
+  background: var(--eye-surface);
+  color: var(--eye-text);
+}
+
+.github-login-button.github-login-button:hover,
+.sidebar-auth-logout.sidebar-auth-logout.MuiIconButton-root:hover {
+  border-color: rgb(15 118 110 / 0.34);
+  background: var(--eye-primary-soft);
+  color: var(--eye-primary-strong);
+}
+
+.sidebar-user-card .sidebar-auth-logout.sidebar-auth-logout.MuiIconButton-root {
+  width: 44px;
+  height: 44px;
+  min-height: 44px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--eye-muted);
+}
+
+.sidebar-user-card .sidebar-auth-logout.sidebar-auth-logout.MuiIconButton-root:hover {
+  border: 0;
+  background: var(--eye-surface);
+  color: var(--eye-danger);
+}
+
+.chat-main,
+.response-column {
+  right: 0;
+  background: var(--eye-page);
+}
+
+.chat-main-header {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  column-gap: 12px;
+  min-height: 60px;
+  border-bottom: 1px solid var(--eye-border);
+  padding: 8px 20px;
+  background: rgb(255 255 255 / 0.92);
+  text-align: left;
+  backdrop-filter: blur(14px);
+}
+
+.chat-main-title {
+  overflow: hidden;
+}
+
+.chat-main-header h1 {
+  overflow: hidden;
+  color: var(--eye-heading);
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-main-header p {
+  color: var(--eye-muted);
+}
+
+.sidebar-toggle.sidebar-toggle.MuiIconButton-root,
+.inspector-close.inspector-close.MuiIconButton-root {
+  width: 40px;
+  height: 40px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--eye-muted);
+}
+
+.sidebar-toggle.sidebar-toggle.MuiIconButton-root:hover,
+.inspector-close.inspector-close.MuiIconButton-root:hover {
+  border-color: var(--eye-border);
+  background: var(--eye-surface-muted);
+  color: var(--eye-heading);
+}
+
+.inspector-trigger.inspector-trigger.MuiButton-root {
+  min-height: 40px;
+  border-radius: 10px;
+  padding: 7px 10px;
+  color: var(--eye-muted);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.inspector-trigger.inspector-trigger.MuiButton-root:hover {
+  background: var(--eye-surface-muted);
+  color: var(--eye-heading);
+}
+
+.generation-badge.generation-badge.MuiChip-root {
+  height: 28px;
+  border-color: rgb(15 118 110 / 0.24);
+  border-radius: 999px;
+  background: var(--eye-primary-soft);
+  color: var(--eye-primary-strong);
+  font-weight: 600;
+}
+
+.chat-panel.chat-panel.MuiPaper-root {
+  border: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.chat-scroll {
+  padding: 32px clamp(20px, 4vw, 56px) 44px;
+  background: transparent;
+}
+
+.chat-scroll-content {
+  gap: 32px;
+  width: min(100%, 760px);
+}
+
+.chat-system-row {
+  width: min(100%, 760px);
+  margin: 22px 0;
+}
+
+.chat-system-pill {
+  border-color: var(--eye-border);
+  padding: 5px 12px;
+  background: var(--eye-surface);
+  color: var(--eye-muted);
+  font-weight: 600;
+}
+
+.chat-content.user {
+  max-width: min(78%, 660px);
+}
+
+.chat-answer {
+  gap: 12px;
+  color: var(--eye-text);
+}
+
+.chat-bubble.user {
+  border: 1px solid var(--eye-user-bubble-border);
+  border-radius: 18px 18px 5px 18px;
+  padding: 11px 15px;
+  background: var(--eye-user-bubble);
+  color: var(--eye-user-bubble-text);
+  box-shadow: 0 1px 2px rgb(16 24 40 / 0.04);
+}
+
+.chat-bubble.user .message-meta-row,
+.chat-bubble.user .message-timestamp,
+.chat-bubble.user .message-action-button.message-action-button.MuiIconButton-root {
+  color: #4f716d;
+}
+
+.chat-bubble.user .message-meta-row {
+  min-height: 34px;
+  margin-top: 8px;
+  padding-top: 0;
+}
+
+.message-meta-row {
+  position: static;
+  min-height: 30px;
+  padding-top: 5px;
+  color: var(--eye-muted);
+  font-size: 12px;
+  font-weight: 500;
+  opacity: 1;
+  transform: none;
+}
+
+.chat-row.assistant:hover .message-meta-row,
+.chat-row.assistant:focus-within .message-meta-row,
+.chat-row.user:hover .message-meta-row,
+.chat-row.user:focus-within .message-meta-row {
+  transform: none;
+}
+
+.message-timestamp {
+  color: var(--eye-muted);
+}
+
+.message-action-button.message-action-button.MuiIconButton-root {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  color: var(--eye-muted);
+}
+
+.message-action-button.message-action-button.MuiIconButton-root:hover {
+  background: var(--eye-surface-muted);
+  color: var(--eye-primary-strong);
+}
+
+.thinking-process.thinking-process.MuiAccordion-root {
+  border: 1px solid var(--eye-border);
+  border-radius: 12px;
+  background: var(--eye-surface-muted);
+}
+
+.chat-empty {
+  width: min(760px, 100%);
+  gap: 28px;
+  padding: 24px 0;
+}
+
+.chat-empty-header {
+  display: grid;
+  justify-items: center;
+  gap: 9px;
+  max-width: 620px;
+}
+
+.chat-empty h2 {
+  color: var(--eye-heading);
+  font-size: clamp(26px, 3vw, 34px);
+  font-weight: 650;
+  line-height: 1.2;
+  letter-spacing: -0.035em;
+}
+
+.chat-empty-header p {
+  max-width: 560px;
+  color: var(--eye-muted);
+  font-size: 15px;
+  line-height: 1.65;
+}
+
+.empty-suggestions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  width: 100%;
+  max-width: 680px;
+  margin: 0;
+}
+
+.empty-suggestion-card {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  min-height: 108px;
+  border: 1px solid var(--eye-border);
+  border-radius: 14px;
+  padding: 15px;
+  background: var(--eye-surface);
+  color: var(--eye-text);
+  cursor: pointer;
+  text-align: left;
+  box-shadow: 0 1px 2px rgb(16 24 40 / 0.03);
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
+}
+
+.empty-suggestion-card:not(:disabled):hover {
+  border-color: rgb(15 118 110 / 0.34);
+  box-shadow: 0 8px 22px rgb(16 24 40 / 0.07);
+  transform: translateY(-2px);
+}
+
+.empty-suggestion-card:focus-visible {
+  border-color: var(--eye-primary);
+  outline: 0;
+  box-shadow: var(--eye-focus-ring);
+}
+
+.empty-suggestion-card:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.empty-suggestion-icon {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  background: var(--eye-primary-soft);
+  color: var(--eye-primary);
+}
+
+.empty-suggestion-content {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.empty-suggestion-category {
+  color: var(--eye-primary-strong);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.empty-suggestion-title {
+  color: var(--eye-heading);
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.4;
+}
+
+.empty-suggestion-description {
+  color: var(--eye-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.chat-composer,
+.chat-composer.chat-composer.MuiPaper-root {
+  width: min(760px, calc(100% - 48px));
+  margin: 8px auto max(18px, env(safe-area-inset-bottom));
+  border: 1px solid var(--eye-border-strong);
+  border-radius: 18px;
+  padding: 10px 11px 9px;
+  background: var(--eye-surface);
+  box-shadow: var(--eye-shadow-floating);
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.composer-dock {
+  position: relative;
+  z-index: 2;
+  padding: 8px 0 max(10px, env(safe-area-inset-bottom));
+  background: linear-gradient(to bottom, rgb(247 248 250 / 0), var(--eye-page) 22px);
+}
+
+.composer-dock .chat-composer,
+.composer-dock .chat-composer.chat-composer.MuiPaper-root {
+  margin: 0 auto;
+}
+
+.composer-disclaimer.composer-disclaimer {
+  width: min(760px, calc(100% - 48px));
+  margin: 6px auto 0;
+  color: var(--eye-muted);
+  font-size: 11px;
+  line-height: 1.4;
+  text-align: center;
+}
+
+.chat-composer:focus-within {
+  border-color: rgb(15 118 110 / 0.56);
+  box-shadow: var(--eye-focus-ring), var(--eye-shadow-floating);
+}
+
+.chat-composer.is-uploading {
+  border-color: rgb(217 119 6 / 0.46);
+}
+
+.part-composer-editor,
+.part-composer {
+  min-height: 48px;
+}
+
+.user-part-surface-editor.user-part-surface-editor {
+  min-height: 0;
+}
+
+.part-composer-editor.is-empty::before {
+  color: var(--eye-muted-soft);
+}
+
+.composer-toolbar {
+  gap: 8px;
+}
+
+.composer-icon-button.composer-icon-button,
+.composer-submit-button.composer-submit-button.MuiIconButton-root {
+  width: 42px;
+  height: 42px;
+  border-radius: 999px;
+}
+
+.composer-icon-button.composer-icon-button {
+  border: 0;
+  background: transparent;
+  color: var(--eye-muted);
+}
+
+.composer-icon-button.composer-icon-button:hover {
+  border: 0;
+  background: var(--eye-surface-muted);
+  color: var(--eye-heading);
+}
+
+.composer-icon-button.composer-icon-button.Mui-disabled {
+  border: 0;
+  background: transparent;
+  color: var(--eye-muted-soft);
+}
+
+.composer-submit-button.composer-submit-button.MuiIconButton-root {
+  border: 0;
+  background: var(--eye-primary);
+  color: #fff;
+}
+
+.composer-submit-button.composer-submit-button.MuiIconButton-root:not(:disabled):hover {
+  background: var(--eye-primary-strong);
+}
+
+.composer-submit-button.stop.composer-submit-button.MuiIconButton-root {
+  border: 0;
+  background: var(--eye-danger);
+}
+
+.composer-submit-button.composer-submit-button.Mui-disabled {
+  background: var(--eye-page-deep);
+  color: var(--eye-muted-soft);
+}
+
+.composer-shortcut-hint {
+  gap: 6px;
+  color: var(--eye-muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.composer-shortcut-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.composer-shortcut-key {
+  border: 1px solid var(--eye-border);
+  border-radius: 5px;
+  padding: 2px 5px;
+  background: var(--eye-surface-muted);
+  color: var(--eye-muted);
+  font-family: inherit;
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.composer-shortcut-divider {
+  color: var(--eye-muted-soft);
+}
+
+.composer-attachment-menu .MuiPaper-root {
+  min-width: 190px;
+  border: 1px solid var(--eye-border);
+  border-radius: 12px;
+  background: var(--eye-surface);
+  box-shadow: var(--eye-shadow-floating);
+}
+
+.composer-attachment-menu-list {
+  padding: 6px;
+}
+
+.composer-attachment-menu-item.composer-attachment-menu-item.MuiMenuItem-root {
+  min-height: 44px;
+  border-radius: 8px;
+  padding: 9px 10px;
+  color: var(--eye-text);
+  font-size: 14px;
+}
+
+.composer-attachment-menu-item.composer-attachment-menu-item.MuiMenuItem-root:hover {
+  background: var(--eye-surface-muted);
+}
+
+.composer-attachment-menu-icon.composer-attachment-menu-icon.MuiListItemIcon-root {
+  min-width: 32px;
+  color: var(--eye-primary);
+}
+
+.error-box,
+.inline-error.inline-error.MuiAlert-root {
+  border-color: rgb(220 38 38 / 0.18);
+  border-radius: 12px;
+  background: var(--eye-danger-soft);
+  color: var(--eye-danger);
+}
+
+.inspector-drawer .MuiDrawer-paper {
+  width: min(400px, 100vw);
+  background: var(--eye-surface);
+}
+
+.inspector-shell {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background: var(--eye-surface);
+}
+
+.inspector-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 72px;
+  border-bottom: 1px solid var(--eye-border);
+  padding: 13px 16px 12px 20px;
+}
+
+.inspector-header h2 {
+  margin: 0;
+  color: var(--eye-heading);
+  font-size: 18px;
+  font-weight: 650;
+}
+
+.inspector-session-title {
+  overflow: hidden;
+  max-width: 290px;
+  margin: 2px 0 0;
+  color: var(--eye-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inspector-tabs.inspector-tabs.MuiTabs-root {
+  min-height: 46px;
+  border-bottom: 1px solid var(--eye-border);
+  padding: 0 10px;
+}
+
+.inspector-tabs .MuiTab-root {
+  min-width: 0;
+  min-height: 46px;
+  color: var(--eye-muted);
+  font-size: 13px;
+}
+
+.inspector-tabs .MuiTab-root.Mui-selected {
+  color: var(--eye-primary-strong);
+}
+
+.inspector-tabs .MuiTabs-indicator {
+  height: 2px;
+  border-radius: 2px 2px 0 0;
+  background: var(--eye-primary);
+}
+
+.inspector-content {
+  min-height: 0;
+  overflow: auto;
+}
+
+.inspector-panel {
+  min-height: 100%;
+  padding: 20px;
+}
+
+.inspector-panel[hidden] {
+  display: none !important;
+}
+
+.inspector-panel-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.inspector-panel-heading h3 {
+  margin: 0;
+  color: var(--eye-heading);
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.inspector-panel-heading p,
+.panel-description {
+  margin: 3px 0 0;
+  color: var(--eye-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.task-status.task-status.MuiChip-root,
+.count-pill.count-pill.MuiChip-root {
+  height: 26px;
+  border-radius: 999px;
+  background: var(--eye-surface-muted);
+  color: var(--eye-muted);
+  font-size: 11px;
+}
+
+.task-status.running.task-status.MuiChip-root {
+  background: var(--eye-primary-soft);
+  color: var(--eye-primary-strong);
+}
+
+.inspector-task-list {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.inspector-task-item {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 10px;
+  padding-bottom: 18px;
+}
+
+.inspector-task-marker {
+  position: relative;
+  width: 10px;
+  height: 10px;
+  margin-top: 6px;
+  border: 2px solid var(--eye-border-strong);
+  border-radius: 999px;
+  background: var(--eye-surface);
+}
+
+.inspector-task-item:not(:last-child) .inspector-task-marker::after {
+  position: absolute;
+  top: 10px;
+  left: 2px;
+  width: 2px;
+  height: calc(100% + 24px);
+  background: var(--eye-border);
+  content: "";
+}
+
+.inspector-task-item.status-succeeded .inspector-task-marker {
+  border-color: #16a34a;
+  background: #dcfce7;
+}
+
+.inspector-task-item.status-running .inspector-task-marker {
+  border-color: var(--eye-primary);
+  background: #ccfbf1;
+}
+
+.inspector-task-item.status-failed .inspector-task-marker,
+.inspector-task-item.status-cancelled .inspector-task-marker {
+  border-color: var(--eye-danger);
+  background: var(--eye-danger-soft);
+}
+
+.inspector-task-body h4 {
+  margin: 0;
+  color: var(--eye-heading);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
+.inspector-task-body p {
+  margin: 3px 0 0;
+  color: var(--eye-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.inspector-task-status {
+  display: inline-flex;
+  margin-top: 6px;
+  color: var(--eye-muted-soft);
+  font-size: 11px;
+}
+
+.inspector-empty-state {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  border: 1px dashed var(--eye-border-strong);
+  border-radius: 14px;
+  padding: 32px 20px;
+  background: var(--eye-surface-muted);
+  text-align: center;
+}
+
+.inspector-empty-state h3 {
+  margin: 0;
+  color: var(--eye-heading);
+  font-size: 14px;
+}
+
+.inspector-empty-state p {
+  margin: 0;
+  color: var(--eye-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.knowledge-panel,
+.trace-panel,
+.trace-panel.trace-panel.MuiPaper-root,
+.knowledge-panel.knowledge-panel.MuiPaper-root {
+  border: 0;
+  border-radius: 0;
+  padding: 20px;
+  background: var(--eye-surface);
+  box-shadow: none;
+}
+
+.inspector-panel.knowledge-panel,
+.inspector-panel.trace-panel {
+  padding: 20px;
+}
+
+.panel-heading {
+  margin-bottom: 18px;
+}
+
+.panel-heading h2 {
+  color: var(--eye-heading);
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.eyebrow {
+  color: var(--eye-primary-strong);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+}
+
+.knowledge-actions {
+  gap: 6px;
+}
+
+.knowledge-upload-button.knowledge-upload-button.MuiButton-root {
+  min-height: 40px;
+  border-radius: 10px;
+  background: var(--eye-primary);
+  font-weight: 600;
+}
+
+.knowledge-upload-button.knowledge-upload-button.MuiButton-root:hover {
+  background: var(--eye-primary-strong);
+}
+
+.panel-icon-button.panel-icon-button.MuiIconButton-root {
+  width: 40px;
+  height: 40px;
+  border-color: var(--eye-border);
+  border-radius: 10px;
+  background: var(--eye-surface);
+  color: var(--eye-muted);
+}
+
+.panel-icon-button.panel-icon-button.MuiIconButton-root:hover {
+  border-color: rgb(15 118 110 / 0.3);
+  background: var(--eye-primary-soft);
+  color: var(--eye-primary-strong);
+}
+
+.knowledge-document-list {
+  gap: 8px;
+  max-height: none;
+}
+
+.knowledge-document-item {
+  border-color: var(--eye-border);
+  border-radius: 12px;
+  padding: 12px;
+  background: var(--eye-surface);
+}
+
+.knowledge-document-copy strong {
+  color: var(--eye-heading);
+  font-weight: 600;
+}
+
+.knowledge-document-meta {
+  color: var(--eye-muted);
+}
+
+.knowledge-document-meta .MuiChip-root {
+  height: 24px;
+  border-radius: 999px;
+  font-size: 11px;
+}
+
+.knowledge-empty {
+  display: grid;
+  justify-items: center;
+  gap: 5px;
+  border: 1px dashed var(--eye-border-strong);
+  border-radius: 14px;
+  padding: 30px 18px;
+  background: var(--eye-surface-muted);
+  color: var(--eye-muted);
+  text-align: center;
+}
+
+.knowledge-empty-icon {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  margin-bottom: 3px;
+  border-radius: 12px;
+  background: var(--eye-primary-soft);
+  color: var(--eye-primary);
+}
+
+.knowledge-empty strong {
+  color: var(--eye-heading);
+  font-size: 13px;
+}
+
+.knowledge-empty p {
+  margin: 0;
+  color: var(--eye-muted);
+  font-size: 12px;
+}
+
+.timeline-title {
+  color: var(--eye-heading);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.timeline-topline p {
+  max-height: 6.2em;
+  overflow: hidden;
+  color: var(--eye-muted);
+  font-size: 12px;
+}
+
+.timeline-body {
+  border-bottom-color: var(--eye-border);
+}
+
+.timeline-raw-event {
+  border-color: var(--eye-border);
+  border-radius: 10px;
+  background: var(--eye-surface-muted);
+}
+
+.timeline-raw-event .MuiAccordionSummary-root {
+  color: var(--eye-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+pre {
+  border-radius: 10px;
+  background: var(--eye-code-dark);
+  color: var(--eye-code-dark-text);
+}
+
+@media (max-width: 1023px) {
+  body {
+    overflow: hidden;
+  }
+
+  .fullscreen-shell {
+    width: 100vw;
+    height: 100dvh;
+    min-height: 0;
+    padding: 0;
+    overflow: hidden;
+  }
+
+  .workspace {
+    --chat-main-left: 0px;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    padding: 0;
+    overflow: hidden;
+  }
+
+  .chat-main,
+  .response-column {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    width: auto;
+    visibility: visible;
+    overflow: hidden;
+  }
+
+  .session-sidebar {
+    position: fixed;
+    top: 12px;
+    bottom: 12px;
+    left: 12px;
+    z-index: 1300;
+    width: min(320px, calc(100vw - 24px));
+    border: 1px solid var(--eye-border);
+    border-radius: 16px;
+    background: var(--eye-surface);
+    box-shadow: var(--eye-shadow-floating);
+    transform: translateX(0);
+    transition: transform 0.22s ease, visibility 0s linear;
+  }
+
+  .session-sidebar.collapsed {
+    display: flex;
+    left: 12px;
+    visibility: hidden;
+    transform: translateX(calc(-100% - 24px));
+    transition-delay: 0s, 0.22s;
+  }
+
+  .compact-sidebar-drawer .MuiDrawer-paper {
+    width: min(320px, calc(100vw - 24px));
+    border: 0;
+    border-right: 1px solid var(--eye-border);
+    background: var(--eye-surface);
+    box-shadow: var(--eye-shadow-floating);
+  }
+
+  .compact-sidebar-drawer .session-sidebar,
+  .compact-sidebar-drawer .session-sidebar.collapsed {
+    position: static;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    border-radius: 0;
+    background: var(--eye-surface);
+    box-shadow: none;
+    visibility: visible;
+    transform: none;
+  }
+
+  .sidebar-close-button.sidebar-close-button.MuiIconButton-root {
+    display: inline-flex;
+  }
+
+  .chat-scroll-content {
+    width: min(100%, 760px);
+  }
+}
+
+@media (max-width: 767px) {
+  .sidebar-toggle.sidebar-toggle.MuiIconButton-root,
+  .sidebar-close-button.sidebar-close-button.MuiIconButton-root,
+  .inspector-close.inspector-close.MuiIconButton-root {
+    width: 44px;
+    height: 44px;
+  }
+
+  .chat-main-header {
+    min-height: 56px;
+    column-gap: 8px;
+    padding: 7px 10px;
+  }
+
+  .chat-main-header h1 {
+    font-size: 15px;
+  }
+
+  .inspector-trigger.inspector-trigger.MuiButton-root {
+    min-width: 44px;
+    width: 44px;
+    min-height: 44px;
+    padding: 0;
+    font-size: 0;
+  }
+
+  .inspector-trigger .MuiButton-startIcon {
+    margin: 0;
+  }
+
+  .chat-scroll {
+    padding: 24px 16px 32px;
+  }
+
+  .chat-scroll-content {
+    gap: 28px;
+  }
+
+  .chat-content.user {
+    max-width: 88%;
+  }
+
+  .chat-empty {
+    justify-content: stretch;
+    gap: 22px;
+    padding: 12px 0;
+  }
+
+  .chat-empty h2 {
+    font-size: 27px;
+  }
+
+  .chat-empty-header p {
+    font-size: 14px;
+  }
+
+  .empty-suggestions {
+    grid-template-columns: 1fr;
+    gap: 9px;
+  }
+
+  .empty-suggestion-card {
+    min-height: 84px;
+    padding: 12px;
+  }
+
+  .empty-suggestion-description {
+    display: none;
+  }
+
+  .chat-composer,
+  .chat-composer.chat-composer.MuiPaper-root {
+    width: calc(100% - 24px);
+    margin: 6px auto max(10px, env(safe-area-inset-bottom));
+    border-radius: 16px;
+    padding: 8px 9px 7px;
+  }
+
+  .composer-dock {
+    padding: 6px 0 max(7px, env(safe-area-inset-bottom));
+  }
+
+  .composer-dock .chat-composer,
+  .composer-dock .chat-composer.chat-composer.MuiPaper-root {
+    margin: 0 auto;
+  }
+
+  .composer-disclaimer.composer-disclaimer {
+    width: calc(100% - 24px);
+    margin-top: 4px;
+    font-size: 10px;
+  }
+
+  .composer-shortcut-hint {
+    display: none;
+  }
+
+  .composer-icon-button.composer-icon-button,
+  .composer-submit-button.composer-submit-button.MuiIconButton-root,
+  .panel-icon-button.panel-icon-button.MuiIconButton-root {
+    width: 44px;
+    height: 44px;
+  }
+
+  .inspector-drawer .MuiDrawer-paper {
+    width: 100vw;
+  }
+
+  .inspector-panel,
+  .inspector-panel.knowledge-panel,
+  .inspector-panel.trace-panel {
+    padding: 16px;
+  }
+
+  .message-action-button.message-action-button.MuiIconButton-root,
+  .session-delete-button.session-delete-button.MuiIconButton-root {
+    width: 44px;
+    height: 44px;
+    opacity: 1;
+  }
+
+  .message-meta-row {
+    opacity: 1;
+  }
+}
+
+@media (hover: none) {
+  .session-delete-button.session-delete-button.MuiIconButton-root,
+  .message-meta-row {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
   }
 }

@@ -1,5 +1,5 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, type ClipboardEvent as ReactClipboardEvent } from "react";
-import type { MediaPart, MessagePart, PartExtra } from "../api/agent-client";
+import type { ResourcePart, MessagePart, PartExtra } from "../api/agent-client";
 import {
   AGENT_MESSAGE_PARTS_MIME,
   messagePartsToPlainText,
@@ -30,7 +30,7 @@ export const UserPartSurface = forwardRef<UserPartSurfaceHandle, UserPartSurface
 
     const ownerDocument = editor.ownerDocument;
     const refreshRangeSelection = () => {
-      syncMediaRangeSelection(editor);
+      syncResourceRangeSelection(editor);
     };
 
     ownerDocument.addEventListener("selectionchange", refreshRangeSelection);
@@ -38,7 +38,7 @@ export const UserPartSurface = forwardRef<UserPartSurfaceHandle, UserPartSurface
 
     return () => {
       ownerDocument.removeEventListener("selectionchange", refreshRangeSelection);
-      clearMediaRangeSelection(editor);
+      clearResourceRangeSelection(editor);
     };
   }, [parts]);
 
@@ -72,27 +72,27 @@ function renderUserPart(part: MessagePart, index: number) {
     );
   }
 
-  const mediaLabel = getMediaLabel(part.mime);
-  const label = part.name || mediaLabel;
-  const mediaAttrs = createMediaDataAttrs(part, index);
+  const resourceLabel = getResourceLabel(part.mime);
+  const label = part.name || resourceLabel;
+  const resourceAttrs = createResourceDataAttrs(part, index);
 
   return (
-    <span className="pm-part pm-part--media" key={`media-${index}`} {...mediaAttrs}>
-      {part.url && !isVideoMime(part.mime) ? (
-        <img className="pm-part-media-thumb" src={part.url} alt={label} draggable={false} />
+    <span className="pm-part pm-part--resource" key={`resource-${index}`} {...resourceAttrs}>
+      {part.url && isImageMime(part.mime) ? (
+        <img className="pm-part-resource-thumb" src={part.url} alt={label} draggable={false} />
       ) : (
-        <span className="pm-part-media-placeholder">{mediaLabel}</span>
+        <span className="pm-part-resource-placeholder">{resourceLabel}</span>
       )}
-      <span className="pm-part-media-name">{label}</span>
+      <span className="pm-part-resource-name">{label}</span>
     </span>
   );
 }
 
-function createMediaDataAttrs(part: MediaPart, index: number) {
-  const mediaLabel = getMediaLabel(part.mime);
+function createResourceDataAttrs(part: ResourcePart, index: number) {
+  const resourceLabel = getResourceLabel(part.mime);
 
   return {
-    "aria-label": part.name || mediaLabel,
+    "aria-label": part.name || resourceLabel,
     "data-height": typeof part.height === "number" ? String(part.height) : undefined,
     "data-extra": part.extra ? JSON.stringify(part.extra) : undefined,
     "data-mime": part.mime ?? "",
@@ -100,7 +100,7 @@ function createMediaDataAttrs(part: MediaPart, index: number) {
     "data-size": typeof part.size === "number" ? String(part.size) : undefined,
     "data-url": part.url ?? "",
     "data-user-part-index": index,
-    "data-user-part-kind": "media",
+    "data-user-part-kind": "resource",
     "data-width": typeof part.width === "number" ? String(part.width) : undefined
   };
 }
@@ -109,8 +109,30 @@ function isVideoMime(value?: string) {
   return value?.startsWith("video/") ?? false;
 }
 
-function getMediaLabel(mime?: string) {
-  return isVideoMime(mime) ? "视频" : "图片";
+function isImageMime(value?: string) {
+  return value?.startsWith("image/") ?? false;
+}
+
+function isDocumentMime(value?: string) {
+  return (
+    value?.startsWith("text/") ||
+    value === "application/markdown" ||
+    value === "application/pdf" ||
+    value === "application/msword" ||
+    value === "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  );
+}
+
+function getResourceLabel(mime?: string) {
+  if (isVideoMime(mime)) {
+    return "视频";
+  }
+
+  if (isDocumentMime(mime)) {
+    return "文档";
+  }
+
+  return "图片";
 }
 
 function getSelectedDomParts(root: HTMLElement | null): MessagePart[] | undefined {
@@ -135,8 +157,8 @@ function getSelectedDomParts(root: HTMLElement | null): MessagePart[] | undefine
       return;
     }
 
-    if (kind === "media" && ranges.some((range) => range.intersectsNode(element))) {
-      selectedParts.push(mediaElementToPart(element));
+    if (kind === "resource" && ranges.some((range) => range.intersectsNode(element))) {
+      selectedParts.push(resourceElementToPart(element));
     }
   });
 
@@ -180,11 +202,11 @@ function getSelectedTextFromRange(element: HTMLElement, range: Range) {
   return scopedRange.toString();
 }
 
-function mediaElementToPart(element: HTMLElement): MediaPart {
+function resourceElementToPart(element: HTMLElement): ResourcePart {
   const extra = parsePartExtra(element.dataset.extra);
 
   return {
-    type: "media",
+    type: "resource",
     mime: element.dataset.mime ?? "",
     url: element.dataset.url ?? "",
     ...(element.dataset.name ? { name: element.dataset.name } : {}),
@@ -208,16 +230,16 @@ function parsePartExtra(value?: string): PartExtra | null {
   }
 }
 
-function syncMediaRangeSelection(root: HTMLElement) {
+function syncResourceRangeSelection(root: HTMLElement) {
   const selection = root.ownerDocument.getSelection();
 
-  root.querySelectorAll<HTMLElement>(".pm-part--media").forEach((element) => {
+  root.querySelectorAll<HTMLElement>(".pm-part--resource").forEach((element) => {
     element.classList.toggle("is-range-selected", isRangeSelectionIntersectingNode(selection, element));
   });
 }
 
-function clearMediaRangeSelection(root: HTMLElement) {
-  root.querySelectorAll<HTMLElement>(".pm-part--media").forEach((element) => {
+function clearResourceRangeSelection(root: HTMLElement) {
+  root.querySelectorAll<HTMLElement>(".pm-part--resource").forEach((element) => {
     element.classList.remove("is-range-selected");
   });
 }

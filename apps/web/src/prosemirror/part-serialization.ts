@@ -13,21 +13,23 @@ export function stripRuntimeFields(parts: RuntimePart[]): MessagePart[] {
 
 export function partsToDoc(parts: RuntimePart[]): ProseMirrorNode {
   // MessagePart 是业务数据，ProseMirror doc 是编辑器内部数据。
-  // 文本会拆成 inline text/hard_break，媒体会变成不可拆分的 media_part atom。
+  // 文本会拆成 inline text/hard_break，资源会变成不可拆分的 resource_part atom。
   const inlineNodes = parts.flatMap((part) => {
     if (part.type === "text") {
       return textToInlineNodes(part.value);
     }
 
     return [
-      partSchema.nodes.media_part.create({
+      partSchema.nodes.resource_part.create({
         mime: part.mime,
         url: part.url,
         name: part.name ?? "",
         size: part.size ?? null,
         width: part.width ?? null,
         height: part.height ?? null,
-        extra: part.extra ?? null
+        extra: part.extra ?? null,
+        uploading: getRuntimeBoolean(part, "$uploading"),
+        uploadId: getRuntimeString(part, "$uploadId")
       })
     ];
   });
@@ -40,7 +42,7 @@ export function docToParts(doc: ProseMirrorNode): MessagePart[] {
   let textBuffer = "";
 
   function flushText() {
-    // 连续文本先攒在 textBuffer 里，遇到媒体再 flush。
+    // 连续文本先攒在 textBuffer 里，遇到资源再 flush。
     // 这样 “文字 + 图片 + 文字” 会变成三个 part，而不是每个字符一个 part。
     if (textBuffer) {
       parts.push({ type: "text", value: textBuffer });
@@ -59,17 +61,19 @@ export function docToParts(doc: ProseMirrorNode): MessagePart[] {
       return false;
     }
 
-    if (node.type.name === "media_part") {
+    if (node.type.name === "resource_part") {
       flushText();
       parts.push({
-        type: "media",
+        type: "resource",
         mime: String(node.attrs.mime ?? ""),
         url: String(node.attrs.url ?? ""),
         ...(node.attrs.name ? { name: String(node.attrs.name) } : {}),
         ...(typeof node.attrs.size === "number" ? { size: node.attrs.size } : {}),
         ...(typeof node.attrs.width === "number" ? { width: node.attrs.width } : {}),
         ...(typeof node.attrs.height === "number" ? { height: node.attrs.height } : {}),
-        ...(isPartExtra(node.attrs.extra) ? { extra: node.attrs.extra } : {})
+        ...(isPartExtra(node.attrs.extra) ? { extra: node.attrs.extra } : {}),
+        ...(node.attrs.uploading === true ? { $uploading: true } : {}),
+        ...(typeof node.attrs.uploadId === "string" ? { $uploadId: node.attrs.uploadId } : {})
       });
       return false;
     }
@@ -87,7 +91,7 @@ export function getSelectedParts(doc: ProseMirrorNode, selection: Selection): Me
   }
 
   // 复制/复用用户消息时，不一定取整条消息。
-  // 这里把当前选区投影回 MessagePart，选中图片时会保留媒体结构，选中文本时保留换行。
+  // 这里把当前选区投影回 MessagePart，选中资源时会保留结构，选中文本时保留换行。
   const parts: MessagePart[] = [];
   let textBuffer = "";
 
@@ -121,12 +125,12 @@ export function getSelectedParts(doc: ProseMirrorNode, selection: Selection): Me
       return false;
     }
 
-    if (node.type.name === "media_part") {
+    if (node.type.name === "resource_part") {
       const nodeTo = position + node.nodeSize;
 
       if (selection.from < nodeTo && selection.to > position) {
         flushText();
-        parts.push(mediaNodeToPart(node));
+        parts.push(resourceNodeToPart(node));
       }
 
       return false;
@@ -139,21 +143,33 @@ export function getSelectedParts(doc: ProseMirrorNode, selection: Selection): Me
   return parts.length > 0 ? parts : undefined;
 }
 
-function mediaNodeToPart(node: ProseMirrorNode): MessagePart {
+function resourceNodeToPart(node: ProseMirrorNode): MessagePart {
   return {
-    type: "media",
+    type: "resource",
     mime: String(node.attrs.mime ?? ""),
     url: String(node.attrs.url ?? ""),
     ...(node.attrs.name ? { name: String(node.attrs.name) } : {}),
     ...(typeof node.attrs.size === "number" ? { size: node.attrs.size } : {}),
     ...(typeof node.attrs.width === "number" ? { width: node.attrs.width } : {}),
     ...(typeof node.attrs.height === "number" ? { height: node.attrs.height } : {}),
-    ...(isPartExtra(node.attrs.extra) ? { extra: node.attrs.extra } : {})
+    ...(isPartExtra(node.attrs.extra) ? { extra: node.attrs.extra } : {}),
+    ...(node.attrs.uploading === true ? { $uploading: true } : {}),
+    ...(typeof node.attrs.uploadId === "string" ? { $uploadId: node.attrs.uploadId } : {})
   };
 }
 
 function isPartExtra(value: unknown): value is NonNullable<MessagePart["extra"]> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function getRuntimeBoolean(part: RuntimePart, key: `$${string}`) {
+  const value = (part as Record<`$${string}`, unknown>)[key];
+  return value === true;
+}
+
+function getRuntimeString(part: RuntimePart, key: `$${string}`) {
+  const value = (part as Record<`$${string}`, unknown>)[key];
+  return typeof value === "string" ? value : null;
 }
 
 function textToInlineNodes(value: string): ProseMirrorNode[] {

@@ -7,6 +7,13 @@ import App from "./App";
 
 const originalFetch = globalThis.fetch;
 const stylesPath = join(process.cwd(), "src/styles.css");
+const maxAttachmentBytes = 20 * 1024 * 1024;
+
+function createFileWithSize(name: string, type: string, size: number) {
+  const file = new File(["x"], name, { type });
+  Object.defineProperty(file, "size", { value: size });
+  return file;
+}
 
 function createSseResponse(events: string[]): Response {
   const encoder = new TextEncoder();
@@ -325,13 +332,27 @@ function jsonResponse(payload: unknown, ok = true): Response {
   } as Response;
 }
 
-function okResponse(): Response {
-  return {
-    ok: true
-  } as Response;
+function writeTestAuthSession() {
+  localStorage.setItem(
+    "agent.auth.session",
+    JSON.stringify({
+      user: { id: "user_test", githubId: "9911", githubLogin: "octocat" },
+      accessToken: "test-access-token",
+      refreshToken: "test-refresh-token",
+      expiresIn: 900,
+      refreshTokenExpiresIn: 1296000
+    })
+  );
 }
 
-function mockAppFetch(handler?: (url: string, init?: RequestInit) => Response | Promise<Response> | undefined) {
+function mockAppFetch(
+  handler?: (url: string, init?: RequestInit) => Response | Promise<Response> | undefined,
+  options: { authenticated?: boolean } = {}
+) {
+  if (options.authenticated !== false) {
+    writeTestAuthSession();
+  }
+
   globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     const customResponse = handler?.(url, init);
@@ -340,16 +361,18 @@ function mockAppFetch(handler?: (url: string, init?: RequestInit) => Response | 
       return Promise.resolve(customResponse);
     }
 
-    if (url.endsWith("/health")) {
-      return Promise.resolve(okResponse());
-    }
-
     if (url.endsWith("/agents/sessions") && (!init?.method || init.method === "GET")) {
       return Promise.resolve(jsonResponse({ sessions: [] }));
     }
 
     return Promise.reject(new Error(`未 mock 的请求：${url}`));
   });
+}
+
+function fetchWasCalledWith(url: string, matchesInit?: (init?: RequestInit) => boolean) {
+  return vi
+    .mocked(globalThis.fetch)
+    .mock.calls.some(([input, init]) => String(input) === url && (!matchesInit || matchesInit(init)));
 }
 
 afterEach(() => {
@@ -361,6 +384,46 @@ afterEach(() => {
 });
 
 describe("App", () => {
+  it("GitHub 回调页会用 code 换 token 并显示登录用户", async () => {
+    window.history.replaceState(null, "", "/auth/github/callback?code=github-code");
+    mockAppFetch((url) => {
+      if (url.endsWith("/auth/github/login")) {
+        return jsonResponse({
+          user: { id: "user_1", githubId: "9911", githubLogin: "octocat" },
+          accessToken: "access-token",
+          refreshToken: "refresh-token",
+          expiresIn: 900,
+          refreshTokenExpiresIn: 1296000
+        });
+      }
+
+      if (url.endsWith("/agents/sessions") || url.endsWith("/knowledge/documents")) {
+        return jsonResponse(url.endsWith("/knowledge/documents") ? { documents: [] } : { sessions: [] });
+      }
+
+      return undefined;
+    }, { authenticated: false });
+
+    render(<App />);
+
+    await screen.findByText("@octocat");
+    expect(document.querySelector(".sidebar-footer")).toHaveTextContent("@octocat");
+    expect(localStorage.getItem("agent.auth.session")).toContain("access-token");
+    expect(window.location.pathname).toBe("/");
+  });
+
+  it("未登录时展示登录入口且不加载受保护数据", async () => {
+    mockAppFetch(undefined, { authenticated: false });
+
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "GitHub 登录" })).toBeInTheDocument();
+    expect(screen.queryByText("请先登录 GitHub")).not.toBeInTheDocument();
+    expect(
+      vi.mocked(globalThis.fetch).mock.calls.some(([url]) => String(url).includes("/agents/sessions"))
+    ).toBe(false);
+  });
+
   it("消息列使用顶部标题、消息区、底部输入框的三段式布局", () => {
     const styles = readFileSync(stylesPath, "utf8");
 
@@ -369,21 +432,29 @@ describe("App", () => {
     expect(styles).toMatch(/\.chat-composer\s*{[^}]*margin:\s*5px auto 12px;/s);
   });
 
-  it("使用全屏三栏工作台布局", () => {
+  it("使用对话主区和按需打开的运行详情布局", async () => {
     mockAppFetch();
 
+    const user = userEvent.setup();
     const { container } = render(<App />);
 
     expect(container.querySelector(".fullscreen-shell")).toBeInTheDocument();
     expect(container.querySelector(".session-sidebar")).toBeInTheDocument();
     expect(container.querySelector(".chat-main")).toBeInTheDocument();
     expect(container.querySelector(".response-column")).toBeInTheDocument();
-    expect(container.querySelector(".trace-column")).toBeInTheDocument();
     expect(container.querySelector(".chat-composer")).toBeInTheDocument();
+    expect(screen.queryByRole("complementary", { name: "运行详情" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "运行详情" }));
+
+    expect(screen.getByRole("complementary", { name: "运行详情" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "事件" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "知识库" })).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "任务" })).not.toBeInTheDocument();
     expect(screen.queryByText("Runtime")).not.toBeInTheDocument();
   });
 
-  it("左右侧栏可以折叠和展开", async () => {
+  it("会话栏可折叠，运行详情可打开、切换和关闭", async () => {
     mockAppFetch();
 
     const user = userEvent.setup();
@@ -392,23 +463,26 @@ describe("App", () => {
     const header = container.querySelector(".chat-main-header");
 
     expect(workspace).not.toHaveClass("sidebar-collapsed");
-    expect(workspace).not.toHaveClass("trace-collapsed");
+    expect(workspace).toHaveClass("inspector-closed");
     expect(header).toContainElement(screen.getByRole("button", { name: "收起会话栏" }));
-    expect(header).toContainElement(screen.getByRole("button", { name: "收起事件时间线" }));
+    expect(header).toContainElement(screen.getByRole("button", { name: "运行详情" }));
 
     await user.click(screen.getByRole("button", { name: "收起会话栏" }));
     expect(workspace).toHaveClass("sidebar-collapsed");
     expect(screen.getByRole("button", { name: "展开会话栏" })).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "收起事件时间线" }));
-    expect(workspace).toHaveClass("trace-collapsed");
-    expect(screen.getByRole("button", { name: "展开事件时间线" })).toBeInTheDocument();
-
     await user.click(screen.getByRole("button", { name: "展开会话栏" }));
-    await user.click(screen.getByRole("button", { name: "展开事件时间线" }));
-
     expect(workspace).not.toHaveClass("sidebar-collapsed");
-    expect(workspace).not.toHaveClass("trace-collapsed");
+
+    await user.click(screen.getByRole("button", { name: "运行详情" }));
+    expect(workspace).toHaveClass("inspector-open");
+    expect(screen.getByRole("tab", { name: "事件" })).toHaveAttribute("aria-selected", "true");
+
+    await user.click(screen.getByRole("tab", { name: "知识库" }));
+    expect(screen.getByRole("tabpanel", { name: "知识库" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "关闭运行详情" }));
+    expect(workspace).toHaveClass("inspector-closed");
   });
 
   it("刷新进入页面时输入框不预填示例任务", () => {
@@ -466,6 +540,7 @@ describe("App", () => {
     const { container } = render(<App />);
 
     await waitFor(() => expect(screen.getByRole("button", { name: "URL 会话" })).toBeInTheDocument());
+    expect(screen.getByRole("heading", { level: 1, name: "URL 会话" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "另一个会话" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "新建会话" })).toBeInTheDocument();
     expect(screen.getByLabelText("搜索会话")).toBeInTheDocument();
@@ -702,7 +777,7 @@ describe("App", () => {
     fireEvent.scroll(listElement);
 
     await waitFor(() => expect(screen.getByRole("button", { name: "旧会话" })).toBeInTheDocument());
-    expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/sessions?after=session_new&limit=30");
+    expect(fetchWasCalledWith("http://localhost:4001/agents/sessions?after=session_new&limit=30")).toBe(true);
   });
 
   it("删除当前会话后从列表移除并回到新对话", async () => {
@@ -756,12 +831,11 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByText("删除前回答")).toBeInTheDocument());
     await userEvent.click(screen.getByRole("button", { name: "删除会话：要删除的会话" }));
 
-    expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/sessions/session_delete", {
-      method: "DELETE"
-    });
+    expect(fetchWasCalledWith("http://localhost:4001/agents/sessions/session_delete", (init) => init?.method === "DELETE"))
+      .toBe(true);
     await waitFor(() => expect(screen.queryByText("要删除的会话")).not.toBeInTheDocument());
     expect(screen.queryByText("删除前回答")).not.toBeInTheDocument();
-    expect(screen.getByText("有什么我能帮你的吗？")).toBeInTheDocument();
+    expect(screen.getByText("今天想完成什么？")).toBeInTheDocument();
     expect(window.location.search).toBe("");
   });
 
@@ -844,15 +918,18 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getAllByText("重新生成的回答").length).toBeGreaterThan(0));
     expect(screen.getByText("旧回答")).toBeInTheDocument();
-    expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/messages/msg_assistant_old/regenerate", {
-      method: "POST"
-    });
+    expect(
+      fetchWasCalledWith(
+        "http://localhost:4001/agents/messages/msg_assistant_old/regenerate",
+        (init) => init?.method === "POST"
+      )
+    ).toBe(true);
     expect(globalThis.fetch).toHaveBeenCalledWith(
       "http://localhost:4001/agents/runs/run_regen_1/stream",
       expect.objectContaining({
-        headers: {
+        headers: expect.objectContaining({
           accept: "text/event-stream"
-        }
+        })
       })
     );
   });
@@ -943,9 +1020,9 @@ describe("App", () => {
     scrollHeight = 1300;
 
     await waitFor(() => expect(screen.getByText("消息 1")).toBeInTheDocument());
-    expect(globalThis.fetch).toHaveBeenCalledWith(
-      "http://localhost:4001/agents/sessions/session_paged/messages?before=msg_3&limit=30"
-    );
+    expect(
+      fetchWasCalledWith("http://localhost:4001/agents/sessions/session_paged/messages?before=msg_3&limit=30")
+    ).toBe(true);
     expect(screen.queryByText("上滑加载更早消息")).not.toBeInTheDocument();
   });
 
@@ -980,7 +1057,7 @@ describe("App", () => {
 
     expect(window.location.search).toBe("");
     expect(screen.queryByText("URL 会话回答")).not.toBeInTheDocument();
-    expect(screen.getByText("有什么我能帮你的吗？")).toBeInTheDocument();
+    expect(screen.getByText("今天想完成什么？")).toBeInTheDocument();
   });
 
   it("基础交互控件使用 MUI 组件承载", async () => {
@@ -995,55 +1072,61 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "发送" })).toHaveClass("MuiIconButton-root");
     expect(screen.queryByRole("button", { name: "运行" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "流式运行" })).not.toBeInTheDocument();
-    await waitFor(() => expect(screen.getByText("API 正常")).toHaveClass("MuiChip-label"));
   });
 
-  it("聊天工作台细节保持统一、舒适且没有突兀 outline", () => {
+  it("附件前端预检失败时用 toast 提示且不调用上传接口", async () => {
+    mockAppFetch((url) => {
+      if (url.endsWith("/agents/uploads/documents")) {
+        return jsonResponse({ error: { code: "VALIDATION_ERROR", message: "附件不能超过 20MB" } }, false);
+      }
+
+      return undefined;
+    });
+
+    render(<App />);
+
+    await userEvent.click(screen.getByRole("button", { name: "添加附件" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: "上传文档" }));
+    await userEvent.upload(
+      screen.getByLabelText("选择文档"),
+      createFileWithSize("large.md", "text/markdown", maxAttachmentBytes + 1)
+    );
+
+    await waitFor(() => {
+      expect(document.querySelector(".attachment-toast")).toHaveTextContent("附件不能超过 20MB");
+    });
+    expect(vi.mocked(globalThis.fetch).mock.calls.some(([url]) => String(url).endsWith("/agents/uploads/documents"))).toBe(false);
+  });
+
+  it("左下角展示 GitHub 登录状态并移除 API 健康状态", async () => {
+    mockAppFetch();
+
+    const { container } = render(<App />);
+    const sidebarFooter = container.querySelector(".sidebar-footer");
+
+    await waitFor(() => expect(fetchWasCalledWith("http://localhost:4001/agents/sessions")).toBe(true));
+    expect(sidebarFooter).toHaveTextContent("@octocat");
+    expect(sidebarFooter?.querySelector(".sidebar-user-card")).toBeInTheDocument();
+    expect(sidebarFooter).toHaveTextContent("GitHub 账户");
+    expect(sidebarFooter).not.toHaveTextContent("API");
+    expect(container.querySelector(".chat-main-header")).not.toHaveTextContent("@octocat");
+    expect(fetchWasCalledWith("http://localhost:4001/health")).toBe(false);
+  });
+
+  it("聊天工作台使用现代布局、按需 Inspector 和可见焦点态", () => {
     const styles = readFileSync(stylesPath, "utf8");
 
-    expect(styles).toMatch(/\.chat-scroll\s*{[^}]*overflow:\s*auto;[^}]*padding:\s*28px 24px 48px;/s);
-    expect(styles).toMatch(/\.chat-scroll-content\s*{[^}]*width:\s*min\(100%,\s*800px\);[^}]*margin:\s*0 auto;/s);
-    expect(styles).toMatch(/\.chat-scroll-content-empty\s*{[^}]*align-content:\s*center;[^}]*justify-items:\s*center;/s);
-    expect(styles).toMatch(/\.chat-panel\.chat-panel\.MuiPaper-root\s*{[^}]*background:\s*transparent;/s);
-    expect(styles).toMatch(/\.trace-panel\.trace-panel\.MuiPaper-root\s*{[^}]*background:\s*#f7f7f5;/s);
-    expect(styles).toMatch(/\.chat-empty\s*{[^}]*border:\s*0;[^}]*background:\s*transparent;[^}]*text-align:\s*center;/s);
-    expect(styles).toMatch(/\.chat-composer\s*{[^}]*margin:\s*5px auto 12px;[^}]*border:\s*1px solid var\(--eye-border\);/s);
-    expect(styles).toMatch(/\.chat-composer\.chat-composer\.MuiPaper-root\s*{[^}]*background:\s*#fffdfa;/s);
-    expect(styles).toMatch(/\.chat-composer \.MuiOutlinedInput-root\.Mui-focused \.MuiOutlinedInput-notchedOutline\s*{[^}]*border-color:\s*transparent;/s);
-    expect(styles).toMatch(/\.sidebar-search \.MuiInputBase-root\.Mui-focused\s*{[^}]*box-shadow:\s*none;/s);
-    expect(styles).toMatch(/\.primary-button\s*{[^}]*background:\s*var\(--eye-primary-strong\);[^}]*color:\s*#fff;/s);
-    expect(styles).toMatch(/\.composer-submit-button\.composer-submit-button\.MuiIconButton-root\s*{[^}]*width:\s*38px;[^}]*height:\s*38px;/s);
-    expect(styles).toMatch(/\.chat-answer\s*{[^}]*width:\s*100%;[^}]*color:\s*var\(--eye-text\);/s);
-    expect(styles).toMatch(/\.chat-system-row\s*{[^}]*margin:\s*42px 0;/s);
-    expect(styles).toMatch(/\.chat-status\.failed\.chat-status\.MuiChip-root\s*{[^}]*border-color:\s*#d58b76;[^}]*background:\s*#fff5f1;[^}]*color:\s*#7a2418;/s);
-    expect(styles).toMatch(/\.inline-error\.inline-error\.MuiAlert-root\s*{[^}]*border-color:\s*#d58b76;[^}]*background:\s*#fff8f6;[^}]*color:\s*#6f2318;/s);
-    expect(styles).toMatch(/\.inline-error \.MuiAlert-icon\s*{[^}]*color:\s*#b73524;/s);
-    expect(styles).toMatch(/\.inline-error \.MuiAlert-message\s*{[^}]*overflow-wrap:\s*anywhere;[^}]*color:\s*#6f2318;/s);
-    expect(styles).toMatch(/\.new-session-button\.MuiButton-root\s*{[^}]*margin-bottom:\s*10px;/s);
-    expect(styles).toMatch(/\.sidebar-divider\.sidebar-divider\.MuiDivider-root\s*{[^}]*margin:\s*2px 0 12px;[^}]*border-color:\s*#e4e4df;/s);
-    expect(styles).toMatch(/\.sidebar-history-heading\s*{[^}]*margin:\s*0 0 10px;/s);
-    expect(styles).toMatch(/\.session-history-list\s*{[^}]*gap:\s*6px;/s);
-    expect(styles).toMatch(/\.session-history-row\s*{[^}]*margin:\s*0 4px;[^}]*border-radius:\s*8px;/s);
-    expect(styles).toMatch(/\.session-history-item\.session-history-item\.MuiListItemButton-root\s*{[^}]*margin:\s*0;[^}]*border-radius:\s*8px;[^}]*overflow:\s*hidden;/s);
-    expect(styles).toMatch(/\.session-history-row:hover\s*{[^}]*background:\s*#edf3e8;/s);
-    expect(styles).toMatch(/\.session-history-row\.selected,\s*\.session-history-row\.selected:hover\s*{[^}]*background:\s*#e7f1d9;[^}]*border-radius:\s*8px;/s);
-    expect(styles).toMatch(/\.session-history-item\.session-history-item\.MuiListItemButton-root:hover\s*{[^}]*background:\s*transparent;[^}]*color:\s*var\(--eye-primary-strong\);/s);
-    expect(styles).toMatch(/\.session-history-item\.session-history-item\.Mui-selected,\s*\.session-history-item\.session-history-item\.Mui-selected:hover\s*{[^}]*background:\s*transparent;[^}]*color:\s*var\(--eye-primary-strong\);/s);
-    expect(styles).toMatch(/\.session-history-item > svg\s*{[^}]*flex:\s*0 0 15px;[^}]*width:\s*15px;[^}]*height:\s*15px;/s);
-    expect(styles).toMatch(/\.session-history-item \.MuiListItemText-root\s*{[^}]*min-width:\s*0;/s);
-    expect(styles).toMatch(/\.workspace\s*{[^}]*--session-panel-width:\s*280px;[^}]*--trace-panel-width:\s*clamp\(320px,\s*24vw,\s*380px\);[^}]*--chat-main-left:\s*var\(--session-panel-width\);[^}]*--chat-main-right:\s*var\(--trace-panel-width\);/s);
+    expect(styles).toMatch(/button:focus-visible,[\s\S]*input:focus-visible\s*{[^}]*outline:\s*2px solid var\(--eye-primary\);/s);
+    expect(styles).toMatch(/\.workspace\s*{[^}]*--session-panel-width:\s*248px;[^}]*--chat-main-right:\s*0px;[^}]*background:\s*var\(--eye-page\);/s);
     expect(styles).toMatch(/\.workspace\.sidebar-collapsed\s*{[^}]*--chat-main-left:\s*0px;/s);
-    expect(styles).toMatch(/\.workspace\.trace-collapsed\s*{[^}]*--chat-main-right:\s*0px;/s);
-    expect(styles).toMatch(/\.session-sidebar,\s*\.trace-column\s*{[^}]*position:\s*absolute;[^}]*top:\s*0;[^}]*bottom:\s*0;/s);
-    expect(styles).toMatch(/\.session-sidebar\s*{[^}]*left:\s*0;[^}]*width:\s*var\(--session-panel-width\);[^}]*transition:\s*[\s\S]*left 0\.22s ease,/s);
-    expect(styles).toMatch(/\.session-sidebar\.collapsed\s*{[^}]*left:\s*calc\(0px - var\(--session-panel-width\) - 1px\);/s);
-    expect(styles).toMatch(/\.trace-column\s*{[^}]*right:\s*0;[^}]*width:\s*var\(--trace-panel-width\);[^}]*transition:\s*[\s\S]*right 0\.22s ease,/s);
-    expect(styles).toMatch(/\.trace-column\.collapsed\s*{[^}]*right:\s*calc\(0px - var\(--trace-panel-width\) - 1px\);/s);
-    expect(styles).toMatch(/\.chat-main,\s*\.response-column\s*{[^}]*position:\s*absolute;[^}]*right:\s*var\(--chat-main-right\);[^}]*left:\s*var\(--chat-main-left\);[^}]*transition:\s*[\s\S]*left 0\.22s ease,[\s\S]*right 0\.22s ease,/s);
-    expect(styles).toMatch(/\.chat-main-header\s*{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(112px,\s*1fr\) auto minmax\(112px,\s*1fr\);/s);
-    expect(styles).toMatch(/\.chat-header-side\.left\s*{[^}]*justify-content:\s*flex-start;/s);
-    expect(styles).toMatch(/\.chat-header-side\.right\s*{[^}]*justify-content:\s*flex-end;[^}]*gap:\s*8px;/s);
-    expect(styles).toMatch(/\.sidebar-toggle\.sidebar-toggle\.MuiIconButton-root\s*{[^}]*width:\s*38px;[^}]*height:\s*38px;[^}]*transition:\s*[\s\S]*border-color 0\.16s ease,/s);
+    expect(styles).toMatch(/\.chat-scroll-content\s*{[^}]*gap:\s*32px;[^}]*width:\s*min\(100%,\s*760px\);/s);
+    expect(styles).toMatch(/\.session-history-list\s*{[^}]*align-content:\s*start;[^}]*grid-auto-rows:\s*min-content;/s);
+    expect(styles).toMatch(/\.empty-suggestions\s*{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/s);
+    expect(styles).toMatch(/\.chat-composer,[\s\S]*\.chat-composer\.chat-composer\.MuiPaper-root\s*{[^}]*border-radius:\s*18px;[^}]*box-shadow:\s*var\(--eye-shadow-floating\);/s);
+    expect(styles).toMatch(/\.user-part-surface-editor\.user-part-surface-editor\s*{[^}]*min-height:\s*0;/s);
+    expect(styles).toMatch(/\.chat-bubble\.user \.message-meta-row\s*{[^}]*margin-top:\s*8px;[^}]*padding-top:\s*0;/s);
+    expect(styles).toMatch(/\.inspector-drawer \.MuiDrawer-paper\s*{[^}]*width:\s*min\(400px,\s*100vw\);/s);
+    expect(styles).toMatch(/@media \(max-width:\s*1023px\)[\s\S]*\.session-sidebar\s*{[^}]*position:\s*fixed;[^}]*width:\s*min\(320px,\s*calc\(100vw - 24px\)\);/s);
   });
 
   it("新建会话空状态在消息区居中显示", async () => {
@@ -1051,9 +1134,9 @@ describe("App", () => {
 
     const { container } = render(<App />);
 
-    await waitFor(() => expect(screen.getByText("有什么我能帮你的吗？")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("今天想完成什么？")).toBeInTheDocument());
     expect(container.querySelector(".chat-scroll-empty")).toBeInTheDocument();
-    expect(container.querySelector(".chat-empty")).toContainElement(screen.getByText("有什么我能帮你的吗？"));
+    expect(container.querySelector(".chat-empty")).toContainElement(screen.getByText("今天想完成什么？"));
   });
 
   it("点击空状态建议会回填输入框并聚焦", async () => {
@@ -1061,9 +1144,9 @@ describe("App", () => {
 
     render(<App />);
 
-    await userEvent.click(screen.getByRole("button", { name: "现在上海时间是多少？" }));
+    await userEvent.click(screen.getByRole("button", { name: "查资料：搜索并整理关键信息" }));
 
-    expect(screen.getByLabelText("发消息")).toHaveTextContent("现在上海时间是多少？");
+    expect(screen.getByLabelText("发消息")).toHaveTextContent("帮我搜索并整理一项主题的关键信息");
     expect(screen.getByLabelText("发消息")).toHaveFocus();
   });
 
@@ -1108,7 +1191,7 @@ describe("App", () => {
     const userParts = [
       { type: "text", value: "你能告诉我这是什么吗 " },
       {
-        type: "media",
+        type: "resource",
         mime: "image/png",
         url: "https://example.com/screenshot.png",
         name: "截图2026-06-29.png",
@@ -1192,16 +1275,19 @@ describe("App", () => {
     });
   });
 
-  it("保留护眼主题变量并使用豆包式全屏底色", () => {
+  it("使用中性画布和统一的 teal 品牌设计变量", () => {
     const styles = readFileSync(stylesPath, "utf8");
 
-    expect(styles).toContain("--eye-page: #fff2c6;");
-    expect(styles).toContain("--eye-surface: #fff8df;");
-    expect(styles).toContain("--eye-border: #eadfaf;");
-    expect(styles).toContain("--eye-primary: #247a73;");
-    expect(styles).toMatch(/body\s*{[^}]*background:\s*#f7f7f5;/s);
-    expect(styles).toMatch(/\.workspace\s*{[^}]*background:\s*#f7f7f5;/s);
+    expect(styles).toContain("--eye-page: #f7f8fa;");
+    expect(styles).toContain("--eye-surface: #ffffff;");
+    expect(styles).toContain("--eye-border: #eaecf0;");
+    expect(styles).toContain("--eye-primary: #0f766e;");
+    expect(styles).toContain("--eye-user-bubble: #dff1ed;");
+    expect(styles).toContain("--eye-user-bubble-border: #8fc8bf;");
+    expect(styles).toMatch(/body\s*{[^}]*background:\s*var\(--eye-page\);/s);
+    expect(styles).toMatch(/\.workspace\s*{[^}]*background:\s*var\(--eye-page\);/s);
     expect(styles).toMatch(/\.panel\s*{[^}]*background:\s*var\(--eye-surface\);/s);
+    expect(styles).toMatch(/\.chat-bubble\.user\s*{[^}]*border:\s*1px solid var\(--eye-user-bubble-border\);[^}]*background:\s*var\(--eye-user-bubble\);/s);
     expect(styles).toMatch(/\.primary-button\s*{[^}]*background:\s*var\(--eye-primary-strong\);/s);
   });
 
@@ -1425,7 +1511,7 @@ describe("App", () => {
     render(<App />);
 
     await waitFor(() => expect(screen.getByText("URL 会话回答")).toBeInTheDocument());
-    expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/sessions/session_from_url");
+    expect(fetchWasCalledWith("http://localhost:4001/agents/sessions/session_from_url")).toBe(true);
   });
 
   it("刷新恢复已完成会话时从 message.parts 展示生成图片", async () => {
@@ -1457,7 +1543,7 @@ describe("App", () => {
               parts: [
                 { type: "text", value: "图片已生成。" },
                 {
-                  type: "media",
+                  type: "resource",
                   mime: "image/png",
                   url: "https://example.com/dog.png",
                   extra: {
@@ -1525,7 +1611,7 @@ describe("App", () => {
               parts: [
                 { type: "text", value: "图片已生成。" },
                 {
-                  type: "media",
+                  type: "resource",
                   mime: "image/png",
                   url: "https://example.com/quote-dog.png",
                   name: "一只小狗",
@@ -1590,7 +1676,7 @@ describe("App", () => {
             id: "msg_user_quote_new",
             parts: [
               {
-                type: "media",
+                type: "resource",
                 mime: "image/png",
                 url: "https://example.com/quote-dog.png",
                 name: "一只小狗",
@@ -1627,7 +1713,7 @@ describe("App", () => {
         sessionId: "session_quote_image",
         parts: [
           expect.objectContaining({
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "https://example.com/quote-dog.png",
             name: "一只小狗",
@@ -1690,7 +1776,7 @@ describe("App", () => {
 
     render(<App />);
 
-    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/health", expect.any(Object)));
+    await waitFor(() => expect(fetchWasCalledWith("http://localhost:4001/agents/sessions")).toBe(true));
     expect(vi.mocked(globalThis.fetch).mock.calls.some(([url]) => String(url).includes("/agents/sessions/"))).toBe(false);
     expect(window.location.search).toBe("");
   });
@@ -1784,7 +1870,7 @@ describe("App", () => {
             messageId: "msg_1",
             partIndex: 1,
             part: {
-              type: "media",
+              type: "resource",
               mime: "image/png",
               width: 1024,
               height: 1024,
@@ -1818,7 +1904,7 @@ describe("App", () => {
             messageId: "msg_1",
             partIndex: 1,
             part: {
-              type: "media",
+              type: "resource",
               mime: "image/png",
               url: "https://example.com/pig.png",
               width: 1024,
@@ -1880,7 +1966,7 @@ describe("App", () => {
             messageId: "msg_1",
             partIndex: 1,
             part: {
-              type: "media",
+              type: "resource",
               mime: "video/mp4",
               url: "https://example.com/pig-video.mp4",
               width: 1280,
@@ -2359,9 +2445,8 @@ describe("App", () => {
     await userEvent.click(screen.getByRole("button", { name: "停止" }));
 
     await waitFor(() =>
-      expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/runs/msg_1/cancel", {
-        method: "POST"
-      })
+      expect(fetchWasCalledWith("http://localhost:4001/agents/runs/msg_1/cancel", (init) => init?.method === "POST"))
+        .toBe(true)
     );
     expect(screen.getByText("已中断")).toBeInTheDocument();
   });
@@ -2642,9 +2727,8 @@ describe("App", () => {
     await userEvent.type(screen.getByLabelText("发消息"), "第二轮{Enter}");
 
     await waitFor(() =>
-      expect(globalThis.fetch).toHaveBeenCalledWith("http://localhost:4001/agents/runs/msg_1/cancel", {
-        method: "POST"
-      })
+      expect(fetchWasCalledWith("http://localhost:4001/agents/runs/msg_1/cancel", (init) => init?.method === "POST"))
+        .toBe(true)
     );
     await waitFor(() => expect(screen.getAllByText("第二轮答案").length).toBeGreaterThan(0));
     expect(screen.getByText("已中断")).toBeInTheDocument();
@@ -2846,22 +2930,15 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getAllByText("恢复").length).toBeGreaterThan(0));
     expect(window.location.search).toBe("?sessionId=session_1");
-    expect(globalThis.fetch).toHaveBeenCalledWith(
-      "http://localhost:4001/agents/runs/msg_1"
-    );
+    expect(fetchWasCalledWith("http://localhost:4001/agents/runs/msg_1")).toBe(true);
   });
 
   it("卸载时取消刷新恢复的事件流订阅", async () => {
     localStorage.setItem("agent.activeRunId", "msg_1");
+    writeTestAuthSession();
     let streamSignal: AbortSignal | undefined;
 
     globalThis.fetch = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
-      if (url.endsWith("/health")) {
-        return Promise.resolve({
-          ok: true
-        } as Response);
-      }
-
       if (url.endsWith("/agents/sessions")) {
         return Promise.resolve(jsonResponse({ sessions: [] }));
       }

@@ -163,13 +163,13 @@ describe("RedisRunningMessageStateStore", () => {
 
     const updated = await store.setParts("msg_1", [
       { type: "text", value: "生成完成" },
-      { type: "media", mime: "image/png", extra: { resource: { id: "res_1" } } }
+      { type: "resource", mime: "image/png", extra: { resource: { id: "res_1" } } }
     ]);
 
     expect(updated).toMatchObject({
       parts: [
         { type: "text", value: "生成完成" },
-        { type: "media", mime: "image/png", extra: { resource: { id: "res_1" } } }
+        { type: "resource", mime: "image/png", extra: { resource: { id: "res_1" } } }
       ],
       version: 1
     });
@@ -179,7 +179,7 @@ describe("RedisRunningMessageStateStore", () => {
     expect(await store.get("msg_1")).toBeUndefined();
   });
 
-  it("appends text delta after a media part into a new trailing text part", async () => {
+  it("appends text delta after a resource part into a new trailing text part", async () => {
     const client = new FakeRedisClient();
     const store = new RedisRunningMessageStateStore({
       client,
@@ -193,7 +193,7 @@ describe("RedisRunningMessageStateStore", () => {
       sessionId: "session_1",
       parts: [
         { type: "text", value: "好的，我来生成图片！" },
-        { type: "media", mime: "image/png", extra: { resource: { id: "res_1" } } }
+        { type: "resource", mime: "image/png", extra: { resource: { id: "res_1" } } }
       ]
     });
 
@@ -204,7 +204,7 @@ describe("RedisRunningMessageStateStore", () => {
       state: {
         parts: [
           { type: "text", value: "好的，我来生成图片！" },
-          { type: "media", mime: "image/png", extra: { resource: { id: "res_1" } } },
+          { type: "resource", mime: "image/png", extra: { resource: { id: "res_1" } } },
           { type: "text", value: "图片已生成~" }
         ],
         version: 1

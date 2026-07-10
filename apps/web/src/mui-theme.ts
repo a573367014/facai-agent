@@ -4,40 +4,59 @@ export const appTheme = createTheme({
   palette: {
     mode: "light",
     primary: {
-      main: "#247a73",
-      dark: "#15514d",
-      light: "#e7f1d9",
-      contrastText: "#fffdf4"
+      main: "#0f766e",
+      dark: "#115e59",
+      light: "#ccfbf1",
+      contrastText: "#ffffff"
     },
     secondary: {
-      main: "#8b6f24",
-      dark: "#5b4716",
-      light: "#f6e9bb",
-      contrastText: "#2f3028"
+      main: "#475467",
+      dark: "#344054",
+      light: "#f2f4f7",
+      contrastText: "#ffffff"
     },
     error: {
-      main: "#a44824",
-      light: "#fff0e7",
-      dark: "#753016"
+      main: "#dc2626",
+      light: "#fef2f2",
+      dark: "#b91c1c"
     },
     background: {
-      default: "#fff2c6",
-      paper: "#fff8df"
+      default: "#f7f8fa",
+      paper: "#ffffff"
     },
     text: {
-      primary: "#2f3028",
-      secondary: "#766f5f"
+      primary: "#101828",
+      secondary: "#667085"
+    },
+    divider: "#eaecf0",
+    success: {
+      main: "#16a34a",
+      light: "#f0fdf4",
+      dark: "#15803d"
+    },
+    warning: {
+      main: "#d97706",
+      light: "#fffbeb",
+      dark: "#b45309"
     }
   },
   shape: {
-    borderRadius: 8
+    borderRadius: 12
   },
   typography: {
     fontFamily:
-      'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+      'Inter, "PingFang SC", "Microsoft YaHei", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+    body1: {
+      fontSize: "0.9375rem",
+      lineHeight: 1.65
+    },
+    body2: {
+      fontSize: "0.875rem",
+      lineHeight: 1.55
+    },
     button: {
       textTransform: "none",
-      fontWeight: 800
+      fontWeight: 600
     }
   },
   components: {
@@ -47,8 +66,8 @@ export const appTheme = createTheme({
           margin: 0,
           minWidth: 320,
           minHeight: "100vh",
-          background: "#fff2c6",
-          color: "#2f3028"
+          background: "#f7f8fa",
+          color: "#101828"
         }
       }
     },
@@ -58,8 +77,8 @@ export const appTheme = createTheme({
       },
       styleOverrides: {
         root: {
-          borderRadius: 8,
-          minHeight: 40
+          borderRadius: 10,
+          minHeight: 44
         }
       }
     },
@@ -72,10 +91,11 @@ export const appTheme = createTheme({
     MuiOutlinedInput: {
       styleOverrides: {
         root: {
-          background: "#fffdf4"
+          borderRadius: 12,
+          background: "#ffffff"
         },
         notchedOutline: {
-          borderColor: "#eadfaf"
+          borderColor: "#d0d5dd"
         }
       }
     },
@@ -89,8 +109,8 @@ export const appTheme = createTheme({
     MuiChip: {
       styleOverrides: {
         root: {
-          borderRadius: 999,
-          fontWeight: 800
+          borderRadius: 8,
+          fontWeight: 600
         }
       }
     },
@@ -103,6 +123,31 @@ export const appTheme = createTheme({
       defaultProps: {
         disableGutters: true,
         elevation: 0
+      }
+    },
+    MuiAlert: {
+      styleOverrides: {
+        root: {
+          borderRadius: 12
+        }
+      }
+    },
+    MuiDrawer: {
+      styleOverrides: {
+        paper: {
+          backgroundImage: "none",
+          borderLeft: "1px solid #eaecf0",
+          boxShadow: "-12px 0 32px rgb(16 24 40 / 0.08)"
+        }
+      }
+    },
+    MuiTab: {
+      styleOverrides: {
+        root: {
+          minHeight: 44,
+          textTransform: "none",
+          fontWeight: 600
+        }
       }
     }
   }

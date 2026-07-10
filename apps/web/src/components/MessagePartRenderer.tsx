@@ -1,22 +1,22 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Ref } from "react";
-import type { AgentResourceRecord, MediaPart, MessagePart } from "../api/agent-client";
-import { MessageImageGallery, type MessageImageGalleryItem } from "./MessageImageGallery";
-import type { ToolImageActionPayload } from "./ToolResultPreview";
+import type { AgentResourceRecord, ResourcePart, MessagePart } from "../api/agent-client";
+import { MessageResourceGallery, type MessageResourceGalleryItem } from "./MessageResourceGallery";
+import type { ToolResourceActionPayload } from "./ToolResultPreview";
 import type { ToolTrace } from "../utils/tool-traces";
 import { UserPartSurface, type UserPartSurfaceHandle } from "./UserPartSurface";
 
 type AssistantPartGroup =
   | { type: "text"; startIndex: number; value: string }
-  | { type: "media"; startIndex: number; parts: MediaPart[] };
+  | { type: "resource"; startIndex: number; parts: ResourcePart[] };
 
 interface MessagePartRendererProps {
   role: "user" | "assistant";
   parts: MessagePart[];
   resourcesById?: Record<string, AgentResourceRecord>;
   showCursor?: boolean;
-  onImageAction?: (payload: ToolImageActionPayload) => void;
+  onResourceAction?: (payload: ToolResourceActionPayload) => void;
   userPartSurfaceRef?: Ref<UserPartSurfaceHandle>;
 }
 
@@ -25,7 +25,7 @@ export function MessagePartRenderer({
   parts,
   resourcesById = {},
   showCursor = false,
-  onImageAction,
+  onResourceAction,
   userPartSurfaceRef
 }: MessagePartRendererProps) {
   if (role === "user") {
@@ -49,10 +49,10 @@ export function MessagePartRenderer({
         }
 
         return (
-          <MessageImageGallery
-            key={`media:${group.startIndex}`}
-            items={group.parts.map((part, index) => toMediaGalleryItem(part, index))}
-            onImageAction={onImageAction}
+          <MessageResourceGallery
+            key={`resource:${group.startIndex}`}
+            items={group.parts.map((part, index) => toResourceGalleryItem(part, index, resourcesById))}
+            onResourceAction={onResourceAction}
           />
         );
       })}
@@ -81,24 +81,27 @@ function groupAssistantParts(parts: MessagePart[]): AssistantPartGroup[] {
       continue;
     }
 
-    if (lastGroup?.type === "media") {
+    if (lastGroup?.type === "resource") {
       lastGroup.parts.push(part);
     } else {
-      groups.push({ type: "media", startIndex: index, parts: [part] });
+      groups.push({ type: "resource", startIndex: index, parts: [part] });
     }
   }
 
   return groups;
 }
 
-function toMediaGalleryItem(part: MediaPart, index: number): MessageImageGalleryItem {
-  const trace = toMediaTrace(part, index);
+function toResourceGalleryItem(part: ResourcePart, index: number, resourcesById: Record<string, AgentResourceRecord>): MessageResourceGalleryItem {
+  const resourceId = part.extra?.resource?.id;
+  const resource = resourceId ? resourcesById[resourceId] : undefined;
+  const trace = toResourceTrace(part, index);
   const state = part.extra?.lifecycle?.state;
   const url = part.url;
-  const prompt = part.extra?.generation?.prompt ?? part.name;
+  const name = part.name ?? resource?.name;
+  const prompt = part.extra?.generation?.prompt ?? name;
   const width = part.width;
   const height = part.height;
-  const missingUrlError = isVideoPart(part) ? "视频资源缺少地址" : "图片资源缺少地址";
+  const missingUrlError = isDocumentPart(part, resource) ? "文档资源缺少地址" : isVideoPart(part) ? "视频资源缺少地址" : "图片资源缺少地址";
   const galleryState =
     state === "failed"
       ? "failed"
@@ -109,13 +112,15 @@ function toMediaGalleryItem(part: MediaPart, index: number): MessageImageGallery
           : "succeeded";
 
   return {
-    id: `${part.extra?.resource?.id ?? part.extra?.tool?.toolCallId ?? url ?? "media"}:${part.extra?.tool?.outputIndex ?? index}`,
-    resourceId: part.extra?.resource?.id,
+    id: `${part.extra?.resource?.id ?? part.extra?.tool?.toolCallId ?? url ?? "resource"}:${part.extra?.tool?.outputIndex ?? index}`,
+    resourceId,
     url,
     mime: part.mime,
+    name,
     prompt,
     width,
     height,
+    resourceType: resource?.type,
     toolCallRowId: part.extra?.tool?.toolCallRowId,
     outputIndex: part.extra?.tool?.outputIndex ?? index,
     state: galleryState,
@@ -124,18 +129,20 @@ function toMediaGalleryItem(part: MediaPart, index: number): MessageImageGallery
   };
 }
 
-function toMediaTrace(part: MediaPart, index: number): ToolTrace {
+function toResourceTrace(part: ResourcePart, index: number): ToolTrace {
   const state = part.extra?.lifecycle?.state;
   const url = part.url;
   const prompt = part.extra?.generation?.prompt;
   const width = part.width;
   const height = part.height;
-  const missingUrlError = isVideoPart(part) ? "视频资源缺少地址" : "图片资源缺少地址";
+  const isVideo = isVideoPart(part);
+  const isDocument = isDocumentPart(part);
+  const missingUrlError = isDocument ? "文档资源缺少地址" : isVideo ? "视频资源缺少地址" : "图片资源缺少地址";
 
   return {
-    id: part.extra?.tool?.toolCallId ?? `media:${index}`,
+    id: part.extra?.tool?.toolCallId ?? `resource:${index}`,
     iteration: 0,
-    toolName: part.extra?.tool?.name ?? "media",
+    toolName: part.extra?.tool?.name ?? "resource",
     status:
       state === "failed"
         ? "failed"
@@ -147,11 +154,23 @@ function toMediaTrace(part: MediaPart, index: number): ToolTrace {
       width,
       height
     },
-    result: url ? { imageUrls: [url], prompt } : undefined,
-    error: part.extra?.lifecycle?.error ?? (!url && state !== "pending" ? { code: "MEDIA_URL_MISSING", message: missingUrlError } : undefined)
+    result: url ? { [isDocument ? "documents" : isVideo ? "videoUrls" : "imageUrls"]: [url], prompt } : undefined,
+    error: part.extra?.lifecycle?.error ?? (!url && state !== "pending" ? { code: "RESOURCE_URL_MISSING", message: missingUrlError } : undefined)
   };
 }
 
-function isVideoPart(part: MediaPart) {
+function isVideoPart(part: ResourcePart) {
   return part.mime?.startsWith("video/") || part.extra?.tool?.name === "generate_video";
+}
+
+function isDocumentPart(part: ResourcePart, resource?: AgentResourceRecord) {
+  return (
+    resource?.type === "document" ||
+    part.extra?.tool?.name === "generate_document" ||
+    part.mime?.startsWith("text/") ||
+    part.mime === "application/markdown" ||
+    part.mime === "application/pdf" ||
+    part.mime === "application/msword" ||
+    part.mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  );
 }

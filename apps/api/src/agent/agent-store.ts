@@ -21,6 +21,7 @@ export type AgentProcessStepStatus = "running" | "succeeded" | "failed" | "cance
 
 export interface AgentSessionRecord {
   id: string;
+  userId: string;
   title?: string;
   createdAt: string;
   updatedAt: string;
@@ -64,6 +65,7 @@ export interface AgentMessagePage {
 }
 
 export interface ListAgentSessionsOptions {
+  userId?: string;
   after?: string;
   limit?: number;
 }
@@ -299,9 +301,9 @@ export interface UpdateAgentProcessStepInput {
 }
 
 export interface AgentStore {
-  createSession(title?: string): Promise<AgentSessionRecord>;
+  createSession(title?: string, userId?: string): Promise<AgentSessionRecord>;
   listSessions(options?: ListAgentSessionsOptions): Promise<AgentSessionRecord[]>;
-  getSession(sessionId: string): Promise<AgentSessionRecord | undefined>;
+  getSession(sessionId: string, userId?: string): Promise<AgentSessionRecord | undefined>;
   deleteSession(sessionId: string): Promise<boolean>;
   getSessionSummary(sessionId: string): Promise<AgentSessionSummaryRecord | undefined>;
   getSessionSummaryBeforeMessage(sessionId: string, messageId: string): Promise<AgentSessionSummaryRecord | undefined>;

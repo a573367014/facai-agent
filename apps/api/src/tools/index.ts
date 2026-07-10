@@ -1,5 +1,6 @@
 import { calculatorTool } from "./calculator.js";
 import { currentTimeTool } from "./current-time.js";
+import { createDocumentFileTool } from "./document-file.js";
 import {
   createJimengImageEditTool,
   createJimengImageTool,
@@ -25,6 +26,7 @@ export function createDefaultToolRegistry(options: DefaultToolRegistryOptions = 
   const registry = new ToolRegistry();
   registry.register(calculatorTool);
   registry.register(currentTimeTool);
+  registry.register(createDocumentFileTool());
 
   // 搜索工具依赖外部 Tavily Key。没配 key 时不注册，让 LLM 看不到不可用工具；
   // 配好 key 后，web_search 会和其他工具一样走 ToolExecutor 的校验、超时和事件流。

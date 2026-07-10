@@ -1,4 +1,6 @@
 import { createHash, createHmac } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { isAbsolute, join, normalize } from "node:path";
 import { z } from "zod";
 import { AppError } from "../errors/app-error.js";
 import type { JsonObject, RegisteredTool, ToolExecutionContext } from "./types.js";
@@ -154,6 +156,7 @@ export interface JimengImageToolOptions {
   maxPollAttempts?: number;
   timeoutMs?: number;
   batchConcurrency?: number;
+  uploadDirectory?: string;
   now?: () => Date;
   fetchImpl?: typeof fetch;
 }
@@ -260,11 +263,17 @@ function isLocalhost(hostname: string) {
 // 第三方服务（火山引擎）无法访问 localhost 地址的图片。
 // 如果图片 URL 是 localhost，服务端先 fetch 下载再转 base64 提交。
 // 生产环境用公网域名时（R2/CDN），火山引擎可以直接访问，不需要转 base64。
-async function tryReadLocalUploadAsBase64(imageUrl: string) {
+async function tryReadLocalUploadAsBase64(imageUrl: string, uploadDirectory?: string) {
   const parsedUrl = new URL(imageUrl);
 
   if (!isLocalhost(parsedUrl.hostname)) {
     return undefined;
+  }
+
+  const localUploadBase64 = await readLocalUploadFileAsBase64(parsedUrl, uploadDirectory);
+
+  if (localUploadBase64) {
+    return localUploadBase64;
   }
 
   const response = await fetch(imageUrl);
@@ -277,8 +286,26 @@ async function tryReadLocalUploadAsBase64(imageUrl: string) {
   return buffer.toString("base64");
 }
 
-async function toEditSubmitBody(args: EditImageArgs, reqKey: string) {
-  const localUploadBase64 = await tryReadLocalUploadAsBase64(args.imageUrl);
+async function readLocalUploadFileAsBase64(parsedUrl: URL, uploadDirectory?: string): Promise<string | undefined> {
+  if (!uploadDirectory || !parsedUrl.pathname.startsWith("/uploads/")) {
+    return undefined;
+  }
+
+  const relativePath = normalize(decodeURIComponent(parsedUrl.pathname.slice("/uploads/".length)));
+
+  if (relativePath === ".." || relativePath.startsWith("..") || isAbsolute(relativePath)) {
+    return undefined;
+  }
+
+  try {
+    return (await readFile(join(uploadDirectory, relativePath))).toString("base64");
+  } catch {
+    return undefined;
+  }
+}
+
+async function toEditSubmitBody(args: EditImageArgs, reqKey: string, uploadDirectory?: string) {
+  const localUploadBase64 = await tryReadLocalUploadAsBase64(args.imageUrl, uploadDirectory);
 
   return {
     req_key: reqKey,
@@ -889,7 +916,7 @@ export function createJimengImageEditTool(options: JimengImageEditToolOptions): 
     // 本地上传图会在 toEditSubmitBody 里转换成 base64，公网图则直接传 image_urls。
     const submitPayload = await request(
       "CVSync2AsyncSubmitTask",
-      await toEditSubmitBody(args, reqKey),
+      await toEditSubmitBody(args, reqKey, options.uploadDirectory),
       context
     );
     ensureSuccessfulResponse(submitPayload, "提交任务", "火山 SeedEdit3.0");

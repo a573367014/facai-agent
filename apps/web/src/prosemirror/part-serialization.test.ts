@@ -16,11 +16,11 @@ describe("part prosemirror serialization", () => {
     expect(docToParts(doc)).toEqual([{ type: "text", value: "第一行\n第二行" }]);
   });
 
-  it("round trips media parts", () => {
+  it("round trips resource parts", () => {
     const parts: RuntimePart[] = [
       { type: "text", value: "看" },
       {
-        type: "media",
+        type: "resource",
         mime: "image/png",
         url: "http://localhost:4001/uploads/images/a.png",
         name: "a.png",
@@ -42,6 +42,32 @@ describe("part prosemirror serialization", () => {
   it("strips runtime fields before submit", () => {
     expect(stripRuntimeFields([{ type: "text", value: "你好", $id: "part_1" }])).toEqual([
       { type: "text", value: "你好" }
+    ]);
+  });
+
+  it("keeps uploading runtime fields inside editor and strips them before submit", () => {
+    const parts: RuntimePart[] = [
+      {
+        type: "resource",
+        mime: "text/markdown",
+        url: "",
+        name: "report.md",
+        size: 8,
+        $uploading: true,
+        $uploadId: "upload_1"
+      }
+    ];
+    const roundTripped = docToParts(partsToDoc(parts));
+
+    expect(roundTripped).toEqual(parts);
+    expect(stripRuntimeFields(roundTripped)).toEqual([
+      {
+        type: "resource",
+        mime: "text/markdown",
+        url: "",
+        name: "report.md",
+        size: 8
+      }
     ]);
   });
 });

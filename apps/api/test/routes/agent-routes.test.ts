@@ -15,6 +15,9 @@ import { AgentSummaryService } from "../../src/agent/agent-summary-service.js";
 import { InMemoryRunningMessageStateStore } from "../../src/agent/running-message-state-store.js";
 import { PostgresAgentStore } from "../../src/agent/postgres-agent-store.js";
 import { buildApp } from "../../src/app.js";
+import { AuthTokenService } from "../../src/auth/auth-token-service.js";
+import type { GithubOAuthClient } from "../../src/auth/github-oauth-client.js";
+import { InMemoryUserStore } from "../../src/auth/user-store.js";
 import { LangChainAgentService } from "../../src/langchain/langchain-agent-service.js";
 import type { LlmProvider } from "../../src/providers/types.js";
 import { ToolExecutor } from "../../src/tools/executor.js";
@@ -52,6 +55,12 @@ class CapturingAgentRunQueue implements AgentRunQueue {
   }
 }
 
+class UnusedGithubOAuthClient implements GithubOAuthClient {
+  async getUserProfile(): Promise<never> {
+    throw new Error("GitHub OAuth client should not be used by route authorization tests");
+  }
+}
+
 type TestFastifyApp = FastifyInstance & {
   agentCoordinator?: AgentMessageCoordinator;
   testRunQueue: CapturingAgentRunQueue;
@@ -66,11 +75,68 @@ async function buildTestApp(options: Parameters<typeof buildApp>[0]) {
     runQueue: testRunQueue,
     cancellationStore: options.cancellationStore ?? new InMemoryAgentCancellationStore(),
     runLock: options.runLock ?? new InMemoryAgentRunLock(),
-    databasePath: TEST_DATABASE_URL
+    databasePath: TEST_DATABASE_URL,
+    skipAuth: true
   }) as TestFastifyApp;
   app.testRunQueue = testRunQueue;
   apps.push(app);
   return app;
+}
+
+function createAuthTokenService() {
+  return new AuthTokenService({
+    accessSecret: "access-secret",
+    refreshSecret: "refresh-secret",
+    accessTokenTtlSeconds: 900,
+    refreshTokenTtlSeconds: 15 * 24 * 60 * 60
+  });
+}
+
+function createAuthHeaders(tokenService: AuthTokenService, userId: string, githubLogin: string) {
+  const token = tokenService.issueTokenPair({
+    userId,
+    githubId: `${userId}_github`,
+    githubLogin
+  }).accessToken;
+
+  return {
+    authorization: `Bearer ${token}`
+  };
+}
+
+async function buildAuthenticatedAgentTestApp() {
+  const testRunQueue = new CapturingAgentRunQueue();
+  const coordinator = new AgentMessageCoordinator(
+    createTestAgentService(),
+    resetStore,
+    new AgentContextBuilder(),
+    undefined,
+    new InMemoryRunningMessageStateStore(),
+    undefined,
+    {
+      eventBus: noopEventBus,
+      runQueue: testRunQueue,
+      cancellationStore: new InMemoryAgentCancellationStore(),
+      runLock: new InMemoryAgentRunLock()
+    }
+  );
+  const tokenService = createAuthTokenService();
+  const app = (await buildApp({
+    coordinator,
+    skipAgentRuntime: true,
+    auth: {
+      userStore: new InMemoryUserStore(),
+      githubClient: new UnusedGithubOAuthClient(),
+      tokenService
+    }
+  })) as TestFastifyApp;
+  app.testRunQueue = testRunQueue;
+  apps.push(app);
+
+  return {
+    app,
+    headersFor: (userId: string, githubLogin: string) => createAuthHeaders(tokenService, userId, githubLogin)
+  };
 }
 
 class FailingRunningMessageStateStore extends InMemoryRunningMessageStateStore {
@@ -189,6 +255,67 @@ function parseSseEvents(body: string) {
 }
 
 describe("agent routes", () => {
+  it("按登录用户隔离会话、run 和消息快照", async () => {
+    const { app, headersFor } = await buildAuthenticatedAgentTestApp();
+    const aliceHeaders = headersFor("user_alice", "alice");
+    const bobHeaders = headersFor("user_bob", "bob");
+
+    const createSessionResponse = await app.inject({
+      method: "POST",
+      url: "/agents/sessions",
+      headers: aliceHeaders,
+      payload: { title: "Alice 的会话" }
+    });
+    const { session } = createSessionResponse.json() as { session: { id: string } };
+
+    const aliceListResponse = await app.inject({ method: "GET", url: "/agents/sessions", headers: aliceHeaders });
+    const bobListResponse = await app.inject({ method: "GET", url: "/agents/sessions", headers: bobHeaders });
+
+    expect(createSessionResponse.statusCode).toBe(201);
+    expect((aliceListResponse.json() as { sessions: Array<{ id: string }> }).sessions.map((item) => item.id)).toEqual([
+      session.id
+    ]);
+    expect((bobListResponse.json() as { sessions: Array<{ id: string }> }).sessions).toEqual([]);
+
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/agents/sessions/${session.id}`,
+          headers: bobHeaders
+        })
+      ).statusCode
+    ).toBe(404);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/agents/sessions/${session.id}/runs`,
+          headers: bobHeaders,
+          payload: { input: "尝试写入别人会话" }
+        })
+      ).statusCode
+    ).toBe(404);
+
+    const runResponse = await app.inject({
+      method: "POST",
+      url: `/agents/sessions/${session.id}/runs`,
+      headers: aliceHeaders,
+      payload: { input: "你好" }
+    });
+    const { run } = runResponse.json() as { run: { id: string; assistantMessageId: string } };
+
+    expect(runResponse.statusCode).toBe(202);
+    expect((await app.inject({ method: "GET", url: `/agents/runs/${run.id}`, headers: aliceHeaders })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: `/agents/runs/${run.id}`, headers: bobHeaders })).statusCode).toBe(404);
+    expect(
+      (await app.inject({ method: "GET", url: `/agents/messages/${run.assistantMessageId}`, headers: bobHeaders })).statusCode
+    ).toBe(404);
+    expect(
+      (await app.inject({ method: "POST", url: `/agents/runs/${run.id}/cancel`, headers: bobHeaders })).statusCode
+    ).toBe(404);
+  });
+
   it("执行 run 不再写入本地 JSONL 日志", async () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-event-log-"));
     tempDirs.push(dir);
@@ -247,7 +374,7 @@ describe("agent routes", () => {
 
     expect(uploadResponse.statusCode).toBe(201);
     expect(payload.file).toMatchObject({
-      type: "media",
+      type: "resource",
       mime: "image/png",
       name: "hello.png",
       size: 8
@@ -321,6 +448,99 @@ describe("agent routes", () => {
       error: {
         code: "VALIDATION_ERROR",
         message: "当前只支持上传图片"
+      }
+    });
+  });
+
+  it("POST /agents/uploads/images 拒绝超过 20MB 的附件", async () => {
+    const uploadDirectory = mkdtempSync(join(tmpdir(), "agent-upload-images-"));
+    tempDirs.push(uploadDirectory);
+    const app = await buildTestApp({ agentService: createTestAgentService(), uploadDirectory });
+    const multipart = createMultipartPayload({
+      fieldName: "image",
+      fileName: "large.png",
+      contentType: "image/png",
+      content: Buffer.alloc(20 * 1024 * 1024 + 1)
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/agents/uploads/images",
+      headers: multipart.headers,
+      payload: multipart.payload
+    });
+
+    expect(response.statusCode).toBe(413);
+    expect(response.json()).toMatchObject({
+      error: {
+        code: "VALIDATION_ERROR",
+        message: "附件不能超过 20MB"
+      }
+    });
+  });
+
+  it("POST /agents/uploads/documents 保存聊天文档并返回 resource part", async () => {
+    const uploadDirectory = mkdtempSync(join(tmpdir(), "agent-upload-documents-"));
+    tempDirs.push(uploadDirectory);
+    const app = await buildTestApp({ agentService: createTestAgentService(), uploadDirectory });
+    const markdown = "# 年度复盘\n\n收入增长 20%";
+    const multipart = createMultipartPayload({
+      fieldName: "document",
+      fileName: "年度复盘.md",
+      contentType: "text/markdown",
+      content: markdown
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/agents/uploads/documents",
+      headers: {
+        host: "127.0.0.1:4001",
+        ...multipart.headers
+      },
+      payload: multipart.payload
+    });
+    const payload = response.json() as { file: { type: string; mime: string; name: string; url: string; size: number; extra?: unknown } };
+
+    expect(response.statusCode).toBe(201);
+    expect(payload.file).toMatchObject({
+      type: "resource",
+      mime: "text/markdown",
+      name: "年度复盘.md",
+      size: Buffer.byteLength(markdown, "utf8"),
+      extra: {
+        inputResource: {
+          type: "document"
+        }
+      }
+    });
+    expect(payload.file.url).toMatch(/^http:\/\/127\.0\.0\.1:4001\/uploads\/agent-documents\/[a-f0-9]{64}\.md$/);
+    expect(existsSync(join(uploadDirectory, "agent-documents", payload.file.url.split("/").at(-1)!))).toBe(true);
+  });
+
+  it("POST /agents/uploads/documents 拒绝超过 20MB 的附件", async () => {
+    const uploadDirectory = mkdtempSync(join(tmpdir(), "agent-upload-documents-"));
+    tempDirs.push(uploadDirectory);
+    const app = await buildTestApp({ agentService: createTestAgentService(), uploadDirectory });
+    const multipart = createMultipartPayload({
+      fieldName: "document",
+      fileName: "large.md",
+      contentType: "text/markdown",
+      content: Buffer.alloc(20 * 1024 * 1024 + 1)
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/agents/uploads/documents",
+      headers: multipart.headers,
+      payload: multipart.payload
+    });
+
+    expect(response.statusCode).toBe(413);
+    expect(response.json()).toMatchObject({
+      error: {
+        code: "VALIDATION_ERROR",
+        message: "附件不能超过 20MB"
       }
     });
   });
@@ -650,7 +870,8 @@ describe("agent routes", () => {
       eventBus: noopEventBus,
       runQueue: new CapturingAgentRunQueue(),
       cancellationStore: new InMemoryAgentCancellationStore(),
-      runLock: new InMemoryAgentRunLock()
+      runLock: new InMemoryAgentRunLock(),
+      skipAuth: true
     });
     apps.push(app);
     const response = await app.inject({
@@ -742,7 +963,7 @@ describe("agent routes", () => {
         triggerCharacterCount: 0
       })
     );
-    const app = await buildApp({ coordinator });
+    const app = await buildApp({ coordinator, skipAuth: true });
     apps.push(app);
 
     try {
@@ -861,7 +1082,7 @@ describe("agent routes", () => {
       store,
       new AgentContextBuilder({ maxHistoryMessages: 10 })
     );
-    const app = await buildApp({ coordinator });
+    const app = await buildApp({ coordinator, skipAuth: true });
     apps.push(app);
 
     const response = await app.inject({
@@ -938,7 +1159,7 @@ describe("agent routes", () => {
     ]);
   });
 
-  it("GET /agents/sessions/:sessionId 返回带 media parts 的消息列表", async () => {
+  it("GET /agents/sessions/:sessionId 返回带 resource parts 的消息列表", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "generate_image",
@@ -1036,12 +1257,12 @@ describe("agent routes", () => {
 
     expect(sessionResponse.statusCode).toBe(200);
     const assistant = payload.messages.find((message) => message.id === created.run.assistantMessageId);
-    const mediaPart = assistant?.parts.find((part) => part.type === "media");
-    const resourceId = mediaPart?.extra?.resource?.id;
+    const resourcePart = assistant?.parts.find((part) => part.type === "resource");
+    const resourceId = resourcePart?.extra?.resource?.id;
 
     expect(resourceId).toMatch(/^res_/);
-    expect(mediaPart).toMatchObject({
-      type: "media",
+    expect(resourcePart).toMatchObject({
+      type: "resource",
       mime: "image/png",
       url: "http://127.0.0.1:4001/uploads/resources/images/local-pig.png",
       extra: {
@@ -1072,7 +1293,7 @@ describe("agent routes", () => {
         status: "completed",
         parts: [
           expect.objectContaining({
-            type: "media",
+            type: "resource",
             mime: "image/png",
             url: "http://127.0.0.1:4001/uploads/resources/images/local-pig.png",
             extra: expect.objectContaining({

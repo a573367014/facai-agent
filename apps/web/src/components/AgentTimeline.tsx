@@ -136,7 +136,7 @@ export function AgentTimeline({ events }: AgentTimelineProps) {
   const visibleEvents = events.filter(isVisibleTimelineEvent);
 
   if (visibleEvents.length === 0) {
-    return <p className="muted">流式运行后会在这里展示实时 trace。</p>;
+    return <p className="muted">运行后会在这里展示实时事件。</p>;
   }
 
   return (

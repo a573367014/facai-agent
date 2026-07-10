@@ -1,4 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { Buffer } from "node:buffer";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { z } from "zod";
 import { AIMessage, HumanMessage, SystemMessage, ToolMessage, type BaseMessage } from "@langchain/core/messages";
 import type { ChatOpenAI } from "@langchain/openai";
@@ -19,6 +23,16 @@ import { createMockModel, type MockModel, type MockModelResponse } from "../help
 
 const TEST_DATABASE_URL = process.env.DATABASE_URL ?? "postgres://postgres:postgres@localhost:5432/agent_test";
 
+async function readStreamAsUtf8(stream: AsyncIterable<Buffer | Uint8Array | string>) {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 async function waitForMessage(coordinator: AgentMessageCoordinator, messageId: string) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const { message } = await coordinator.getMessage(messageId);
@@ -38,6 +52,9 @@ async function waitForRun(coordinator: AgentMessageCoordinator, runId: string) {
     const { run } = await coordinator.getRun(runId);
 
     if (run.status !== "running") {
+      const execution = (coordinator as unknown as { runningRunExecutions?: Map<string, Promise<void>> })
+        .runningRunExecutions?.get(runId);
+      await execution;
       return run;
     }
 
@@ -901,7 +918,7 @@ describe("AgentMessageCoordinator", () => {
     }
   });
 
-  it("重新生成媒体回答时复用目标回答的工具参数，避免连续重试丢失批量数量", async () => {
+  it("重新生成资源回答时复用目标回答的工具参数，避免连续重试丢失批量数量", async () => {
     const executedArguments: unknown[] = [];
     const registry = new ToolRegistry();
     registry.register({
@@ -945,7 +962,7 @@ describe("AgentMessageCoordinator", () => {
     });
     const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
-    const session = await store.createSession("连续重试媒体回答");
+    const session = await store.createSession("连续重试资源回答");
     const targetUser = await store.createMessage({
       sessionId: session.id,
       role: "user",
@@ -977,7 +994,7 @@ describe("AgentMessageCoordinator", () => {
       await waitForRun(coordinator, regenerated.run.id);
       const completedRun = (await coordinator.getRun(regenerated.run.id)).run;
       const regeneratedAssistant = completedRun.assistantMessageId ? await store.getMessage(completedRun.assistantMessageId) : undefined;
-      const mediaParts = regeneratedAssistant?.parts.filter((part) => part.type === "media") ?? [];
+      const resourceParts = regeneratedAssistant?.parts.filter((part) => part.type === "resource") ?? [];
 
       expect(regenerated.userMessage.id).toBe(targetUser.id);
       expect(executedArguments).toEqual([
@@ -985,7 +1002,7 @@ describe("AgentMessageCoordinator", () => {
           items: [{ prompt: "小猫" }, { prompt: "小狗" }]
         }
       ]);
-      expect(mediaParts).toHaveLength(2);
+      expect(resourceParts).toHaveLength(2);
     } finally {
       await store.close();
     }
@@ -1390,7 +1407,7 @@ describe("AgentMessageCoordinator", () => {
     }
   });
 
-  it("图片工具结果写入资源表，并让 assistant media part 引用资源", async () => {
+  it("图片工具结果写入资源表，并让 assistant resource part 引用资源", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "generate_image",
@@ -1443,12 +1460,12 @@ describe("AgentMessageCoordinator", () => {
       await waitForMessage(coordinator, started.assistantMessage.id);
       const session = await coordinator.getSession(started.session.id);
       const assistant = session.messages.find((message) => message.id === started.assistantMessage.id);
-      const mediaPart = assistant?.parts.find((part) => part.type === "media");
-      const resourceId = mediaPart?.extra?.resource?.id;
+      const resourcePart = assistant?.parts.find((part) => part.type === "resource");
+      const resourceId = resourcePart?.extra?.resource?.id;
 
       expect(resourceId).toMatch(/^res_/);
-      expect(mediaPart).toMatchObject({
-        type: "media",
+      expect(resourcePart).toMatchObject({
+        type: "resource",
         mime: "image/png",
         url: "http://127.0.0.1:4001/uploads/resources/images/local-pig.png",
         extra: {
@@ -1465,7 +1482,7 @@ describe("AgentMessageCoordinator", () => {
           role: "assistant",
           parts: [
             expect.objectContaining({
-              type: "media",
+              type: "resource",
               extra: expect.objectContaining({
                 resource: { id: resourceId },
                 tool: expect.objectContaining({
@@ -1497,7 +1514,7 @@ describe("AgentMessageCoordinator", () => {
     }
   });
 
-  it("视频工具结果写入资源表，并让 assistant media part 引用资源", async () => {
+  it("视频工具结果写入资源表，并让 assistant resource part 引用资源", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "generate_video",
@@ -1552,12 +1569,12 @@ describe("AgentMessageCoordinator", () => {
       await waitForMessage(coordinator, started.assistantMessage.id);
       const session = await coordinator.getSession(started.session.id);
       const assistant = session.messages.find((message) => message.id === started.assistantMessage.id);
-      const mediaPart = assistant?.parts.find((part) => part.type === "media");
-      const resourceId = mediaPart?.extra?.resource?.id;
+      const resourcePart = assistant?.parts.find((part) => part.type === "resource");
+      const resourceId = resourcePart?.extra?.resource?.id;
 
       expect(resourceId).toMatch(/^res_/);
-      expect(mediaPart).toMatchObject({
-        type: "media",
+      expect(resourcePart).toMatchObject({
+        type: "resource",
         mime: "video/mp4",
         url: "http://127.0.0.1:4001/uploads/resources/videos/local-pig.mp4",
         extra: {
@@ -1574,7 +1591,7 @@ describe("AgentMessageCoordinator", () => {
           role: "assistant",
           parts: [
             expect.objectContaining({
-              type: "media",
+              type: "resource",
               extra: expect.objectContaining({
                 resource: { id: resourceId },
                 tool: expect.objectContaining({
@@ -1611,7 +1628,168 @@ describe("AgentMessageCoordinator", () => {
     }
   });
 
-  it("图片编辑工具结果也写入资源表，并让 assistant media part 引用资源", async () => {
+  it("文档工具结果写入资源表，并让 assistant resource part 引用资源", async () => {
+    const outputDirectory = await mkdtemp(join(tmpdir(), "agent-document-output-"));
+    const outputPath = join(outputDirectory, "年度复盘.md");
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "generate_document",
+      description: "生成文档",
+      parameters: {
+        type: "object",
+        properties: {
+          format: { type: "string" },
+          fileName: { type: "string" },
+          content: { type: "string" }
+        },
+        required: ["format", "content"]
+      },
+      argumentSchema: z.object({
+        format: z.enum(["txt", "markdown", "docx"]),
+        fileName: z.string().optional(),
+        content: z.string()
+      }),
+      execute: async ({ content }) => {
+        await writeFile(outputPath, String(content));
+
+        return {
+          data: {
+            provider: "agent_document",
+            status: "done",
+            documents: [
+              {
+                name: "年度复盘.md",
+                mime: "text/markdown",
+                source: {
+                  type: "local_file",
+                  path: outputPath
+                },
+                size: Buffer.byteLength(String(content), "utf8")
+              }
+            ]
+          },
+          llmContent: "已生成文档：年度复盘.md"
+        };
+      }
+    });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
+    await store.reset();
+    const storedGeneratedResources: unknown[] = [];
+    const loggedEvents: StoredAgentEvent[] = [];
+    const resourceStorage = {
+      storeRemoteResource: async () => {
+        throw new Error("文档资源不应该走远端 URL 转储");
+      },
+      storeGeneratedResourceStream: async (input: unknown) => {
+        const streamInput = input as { stream: AsyncIterable<Buffer | Uint8Array | string> };
+        storedGeneratedResources.push({
+          ...(input as Record<string, unknown>),
+          streamText: await readStreamAsUtf8(streamInput.stream)
+        });
+        return {
+          url: "http://127.0.0.1:4001/uploads/resources/documents/local-review.md",
+          mime: "text/markdown",
+          name: "年度复盘.md",
+          size: 28,
+          relativePath: "resources/documents/local-review.md"
+        };
+      }
+    };
+    const coordinator = new AgentMessageCoordinator(
+      createAgentService(
+        [
+          {
+            toolCalls: [
+              {
+                id: "call_document",
+                name: "generate_document",
+                args: { format: "markdown", fileName: "年度复盘", content: "# 年度复盘\n\n增长 20%" }
+              }
+            ]
+          },
+          { content: "文档已生成。" }
+        ],
+        registry
+      ),
+      store,
+      undefined,
+      undefined,
+      undefined,
+      resourceStorage,
+      {
+        agentEventLogger: {
+          log: (event) => {
+            loggedEvents.push(event);
+          }
+        }
+      }
+    );
+
+    try {
+      const started = await startRunAndWait(coordinator, { input: "生成一份年度复盘 Markdown 文档" });
+
+      await waitForMessage(coordinator, started.assistantMessage.id);
+      const runEvents = loggedEvents.map((event) => event.event);
+      const documentToolResult = runEvents.find(
+        (event) => event.type === "tool_result" && event.toolName === "generate_document"
+      );
+      const documentResult = documentToolResult?.type === "tool_result"
+        ? documentToolResult.result as { documents?: Array<{ source?: { path?: string; status?: string } }> }
+        : undefined;
+      const session = await coordinator.getSession(started.session.id);
+      const assistant = session.messages.find((message) => message.id === started.assistantMessage.id);
+      const resourcePart = assistant?.parts.find((part) => part.type === "resource");
+      const resourceId = resourcePart?.extra?.resource?.id;
+
+      expect(documentResult?.documents?.[0]?.source).toEqual({
+        type: "local_file",
+        status: "consumed"
+      });
+      expect(documentResult?.documents?.[0]?.source?.path).toBeUndefined();
+      expect(storedGeneratedResources).toEqual([
+        expect.objectContaining({
+          type: "document",
+          mime: "text/markdown",
+          fileName: "年度复盘.md",
+          size: Buffer.byteLength("# 年度复盘\n\n增长 20%", "utf8"),
+          streamText: "# 年度复盘\n\n增长 20%"
+        })
+      ]);
+      expect(resourceId).toMatch(/^res_/);
+      expect(resourcePart).toMatchObject({
+        type: "resource",
+        mime: "text/markdown",
+        url: "http://127.0.0.1:4001/uploads/resources/documents/local-review.md",
+        name: "年度复盘.md",
+        extra: {
+          lifecycle: { state: "succeeded" },
+          generation: { provider: "agent_document" }
+        }
+      });
+      expect(session.resources).toEqual([
+        expect.objectContaining({
+          id: resourceId,
+          messageId: started.assistantMessage.id,
+          toolCallId: "call_document",
+          type: "document",
+          mime: "text/markdown",
+          name: "年度复盘.md",
+          status: "succeeded",
+          url: "http://127.0.0.1:4001/uploads/resources/documents/local-review.md",
+          metadata: expect.objectContaining({
+            provider: "agent_document",
+            outputIndex: 0,
+            size: 28
+          })
+        })
+      ]);
+    } finally {
+      await rm(outputDirectory, { recursive: true, force: true });
+      await store.close();
+    }
+  });
+
+  it("图片编辑工具结果也写入资源表，并让 assistant resource part 引用资源", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "edit_image",
@@ -1665,12 +1843,12 @@ describe("AgentMessageCoordinator", () => {
       await waitForMessage(coordinator, started.assistantMessage.id);
       const session = await coordinator.getSession(started.session.id);
       const assistant = session.messages.find((message) => message.id === started.assistantMessage.id);
-      const mediaPart = assistant?.parts.find((part) => part.type === "media");
-      const resourceId = mediaPart?.extra?.resource?.id;
+      const resourcePart = assistant?.parts.find((part) => part.type === "resource");
+      const resourceId = resourcePart?.extra?.resource?.id;
 
       expect(resourceId).toMatch(/^res_/);
-      expect(mediaPart).toMatchObject({
-        type: "media",
+      expect(resourcePart).toMatchObject({
+        type: "resource",
         mime: "image/png",
         url: "https://example.com/edited-pig.png",
         extra: {
@@ -1807,12 +1985,12 @@ describe("AgentMessageCoordinator", () => {
 
       await waitForMessage(coordinator, started.assistantMessage.id);
       const { message } = await coordinator.getMessage(started.assistantMessage.id);
-      const mediaPart = message.parts.find((part) => part.type === "media");
-      const resourceId = mediaPart?.extra?.resource?.id;
+      const resourcePart = message.parts.find((part) => part.type === "resource");
+      const resourceId = resourcePart?.extra?.resource?.id;
 
       expect(resourceId).toMatch(/^res_/);
-      expect(mediaPart).toMatchObject({
-        type: "media",
+      expect(resourcePart).toMatchObject({
+        type: "resource",
         mime: "image/png",
         url: "https://example.com/pig.png",
         extra: {
@@ -1822,7 +2000,7 @@ describe("AgentMessageCoordinator", () => {
       });
       expect(message.parts).toEqual([
         expect.objectContaining({
-          type: "media",
+          type: "resource",
           extra: expect.objectContaining({
             resource: { id: resourceId },
             tool: {
@@ -2063,7 +2241,7 @@ describe("AgentMessageCoordinator", () => {
       await waitForMessage(coordinator, started.assistantMessage.id);
       const session = await coordinator.getSession(started.session.id);
       const assistant = session.messages.find((message) => message.id === started.assistantMessage.id);
-      const mediaParts = assistant?.parts.filter((part) => part.type === "media") ?? [];
+      const resourceParts = assistant?.parts.filter((part) => part.type === "resource") ?? [];
       const resourcesById = new Map(session.resources.map((resource) => [resource.id, resource]));
 
       expect(executeCount).toBe(1);
@@ -2082,17 +2260,17 @@ describe("AgentMessageCoordinator", () => {
         type: "text",
         value: "狗狗图片已生成，宝宝图片因并发限制失败。可以稍后再试。"
       });
-      expect(mediaParts).toHaveLength(2);
-      expect(mediaParts.map((part) => resourcesById.get(part.extra?.resource?.id ?? "")?.metadata?.prompt)).toEqual([
+      expect(resourceParts).toHaveLength(2);
+      expect(resourceParts.map((part) => resourcesById.get(part.extra?.resource?.id ?? "")?.metadata?.prompt)).toEqual([
         "宝宝",
         "狗狗"
       ]);
-      expect(mediaParts.map((part) => resourcesById.get(part.extra?.resource?.id ?? "")?.url)).toEqual([
+      expect(resourceParts.map((part) => resourcesById.get(part.extra?.resource?.id ?? "")?.url)).toEqual([
         undefined,
         "https://example.com/dog.png"
       ]);
-      expect(mediaParts.map((part) => part.extra?.lifecycle?.state)).toEqual(["failed", "succeeded"]);
-      expect(mediaParts.map((part) => (part.type === "media" ? part.url : undefined))).toEqual([
+      expect(resourceParts.map((part) => part.extra?.lifecycle?.state)).toEqual(["failed", "succeeded"]);
+      expect(resourceParts.map((part) => (part.type === "resource" ? part.url : undefined))).toEqual([
         undefined,
         "https://example.com/dog.png"
       ]);

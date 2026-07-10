@@ -45,12 +45,14 @@ import type { AgentRunLock } from "./agent-run-lock.js";
 import { toRuntimeDependencyAppError } from "../errors/runtime-dependency-error.js";
 import { AgentRunningDraftManager } from "./agent-running-draft-manager.js";
 import { AgentProcessStepProjector } from "./agent-process-step-projector.js";
-import { AgentMediaOutputProjector } from "./agent-media-output-projector.js";
+import { AgentResourceOutputProjector } from "./agent-resource-output-projector.js";
 import {
-  isMediaOutputToolName,
+  isResourceOutputToolName,
+  sanitizeToolResultEventForPublication,
   summarizeToolResult
 } from "./agent-message-projection-utils.js";
 import { AgentRunCleanupService, type StaleRunningCleanupResult } from "./agent-run-cleanup-service.js";
+import type { InputResourceResolver } from "./input-resource-resolver.js";
 
 const DEFAULT_SESSION_MESSAGE_LIMIT = 30;
 const DEFAULT_SESSION_PAGE_LIMIT = 30;
@@ -62,6 +64,10 @@ type AgentMessagePageWithResources = AgentMessagePage & {
   processSteps: AgentProcessStepRecord[];
 };
 
+type AgentOwnerScope = {
+  userId?: string;
+};
+
 export interface AgentMessageCoordinatorOptions {
   runQueue?: AgentRunQueue;
   eventBus?: AgentEventBus;
@@ -69,6 +75,7 @@ export interface AgentMessageCoordinatorOptions {
   runLock?: AgentRunLock;
   agentEventLogger?: AgentEventLogger;
   observability?: AgentObservability;
+  inputResourceResolver?: InputResourceResolver;
 }
 
 function toErrorDetail(error: unknown): AgentErrorDetail {
@@ -101,7 +108,7 @@ export class AgentMessageCoordinator {
   private readonly runningRunExecutions = new Map<string, Promise<void>>();
   private readonly draftManager: AgentRunningDraftManager;
   private readonly processStepProjector: AgentProcessStepProjector;
-  private readonly mediaOutputProjector: AgentMediaOutputProjector;
+  private readonly resourceOutputProjector: AgentResourceOutputProjector;
   private readonly cleanupService: AgentRunCleanupService;
   private readonly observability: AgentObservability;
 
@@ -115,13 +122,13 @@ export class AgentMessageCoordinator {
     private readonly options: AgentMessageCoordinatorOptions = {}
   ) {
     // coordinator 保留“主流程编排”：建 run、排队、取消、最终落库。
-    // 运行中草稿、进度步骤、媒体资源、重启清理分别交给小类，避免这个文件重新膨胀。
+    // 运行中草稿、进度步骤、资源、重启清理分别交给小类，避免这个文件重新膨胀。
     this.observability = options.observability ?? getAgentObservability();
     this.draftManager = new AgentRunningDraftManager(this.store, this.runningStateStore);
     this.processStepProjector = new AgentProcessStepProjector(this.store, (messageId, event, runId) => {
       return this.appendEvent(messageId, event, runId);
     });
-    this.mediaOutputProjector = new AgentMediaOutputProjector({
+    this.resourceOutputProjector = new AgentResourceOutputProjector({
       store: this.store,
       resourceStorage: this.resourceStorage,
       draftManager: this.draftManager,
@@ -140,13 +147,14 @@ export class AgentMessageCoordinator {
     );
   }
 
-  async createSession(title?: string) {
-    return this.store.createSession(title);
+  async createSession(title?: string, userId?: string) {
+    return this.store.createSession(title, userId);
   }
 
-  async listSessions(options: { after?: string; limit?: number } = {}) {
+  async listSessions(options: { after?: string; limit?: number; userId?: string } = {}) {
     const limit = this.normalizeSessionLimit(options.limit);
     const sessionsWithOverflow = await this.store.listSessions({
+      userId: options.userId,
       after: options.after,
       limit: limit + 1
     });
@@ -175,8 +183,8 @@ export class AgentMessageCoordinator {
     ]);
   }
 
-  async deleteSession(sessionId: string) {
-    const session = await this.store.getSession(sessionId);
+  async deleteSession(sessionId: string, userId?: string) {
+    const session = await this.store.getSession(sessionId, userId);
 
     if (!session) {
       throw new AppError("VALIDATION_ERROR", `未找到会话：${sessionId}`, 404);
@@ -190,8 +198,8 @@ export class AgentMessageCoordinator {
     return { session };
   }
 
-  async getSession(sessionId: string, options: { messageLimit?: number } = {}) {
-    const session = await this.store.getSession(sessionId);
+  async getSession(sessionId: string, options: { messageLimit?: number; userId?: string } = {}) {
+    const session = await this.store.getSession(sessionId, options.userId);
 
     if (!session) {
       throw new AppError("VALIDATION_ERROR", `未找到会话：${sessionId}`, 404);
@@ -209,8 +217,8 @@ export class AgentMessageCoordinator {
     };
   }
 
-  async getSessionMessages(sessionId: string, options: { before?: string; messageLimit?: number } = {}): Promise<AgentMessagePageWithResources> {
-    const session = await this.store.getSession(sessionId);
+  async getSessionMessages(sessionId: string, options: { before?: string; messageLimit?: number; userId?: string } = {}): Promise<AgentMessagePageWithResources> {
+    const session = await this.store.getSession(sessionId, options.userId);
 
     if (!session) {
       throw new AppError("VALIDATION_ERROR", `未找到会话：${sessionId}`, 404);
@@ -228,12 +236,14 @@ export class AgentMessageCoordinator {
     );
   }
 
-  async startRun(input: AgentExecutionInput & { sessionId?: string }, traceContext?: TraceContextCarrier) {
+  async startRun(input: AgentExecutionInput & { sessionId?: string; userId?: string }, traceContext?: TraceContextCarrier) {
     // startRun 是 API 请求的边界：这里只创建“可恢复的任务外壳”，不在请求线程里长时间跑模型。
     // SQLite 先落 user message / run，前端马上拿到 runId；Worker 后面会用这些 id 重新读取最新状态。
     const userParts = input.parts?.length ? input.parts : [createTextPart(input.input)];
-    const userText = partsToLlmText(userParts);
-    const session = input.sessionId ? (await this.getSession(input.sessionId)).session : await this.store.createSession(userText.slice(0, 32));
+    const userText = await this.resolveInputPartsToLlmText(userParts);
+    const session = input.sessionId
+      ? (await this.getSession(input.sessionId, { userId: input.userId })).session
+      : await this.store.createSession(userText.slice(0, 32), input.userId);
     const userMessage = await this.store.createMessage({
       sessionId: session.id,
       role: "user",
@@ -347,8 +357,10 @@ export class AgentMessageCoordinator {
     };
   }
 
-  async regenerateMessage(messageId: string) {
+  async regenerateMessage(messageId: string, userId?: string) {
     const sourceAssistantMessage = await this.ensureAssistantMessage(messageId);
+
+    await this.ensureSessionOwner(sourceAssistantMessage.sessionId, userId);
 
     if (sourceAssistantMessage.status === "running") {
       throw new AppError("VALIDATION_ERROR", "运行中的回答不能重新生成，请先停止当前生成", 400);
@@ -360,8 +372,8 @@ export class AgentMessageCoordinator {
       throw new AppError("VALIDATION_ERROR", "未找到这条回答对应的用户输入，无法重新生成", 404);
     }
 
-    const session = (await this.getSession(sourceAssistantMessage.sessionId)).session;
-    const userText = partsToLlmText(userMessage.parts);
+    const session = (await this.getSession(sourceAssistantMessage.sessionId, { userId })).session;
+    const userText = await this.resolveInputPartsToLlmText(userMessage.parts);
     const run = await this.store.createRun({
       sessionId: session.id,
       userMessageId: userMessage.id,
@@ -370,7 +382,7 @@ export class AgentMessageCoordinator {
     });
     const controller = new AbortController();
     const history = await this.buildConversationHistoryBefore(session.id, userMessage.id);
-    const replayToolCalls = await this.getReplayableMediaToolCalls(sourceAssistantMessage);
+    const replayToolCalls = await this.getReplayableResourceToolCalls(sourceAssistantMessage);
 
     this.runningRuns.set(run.id, controller);
     const execution = this.executeRun(
@@ -401,8 +413,8 @@ export class AgentMessageCoordinator {
     };
   }
 
-  async cancelRun(runId: string, reason = "用户中断") {
-    const run = await this.ensureRun(runId);
+  async cancelRun(runId: string, reason = "用户中断", userId?: string) {
+    const run = await this.ensureRun(runId, { userId });
 
     if (run.status !== "running") {
       return { run };
@@ -472,8 +484,8 @@ export class AgentMessageCoordinator {
     return { run: cancelledRun };
   }
 
-  async getRun(runId: string) {
-    const run = await this.ensureRun(runId);
+  async getRun(runId: string, userId?: string) {
+    const run = await this.ensureRun(runId, { userId });
 
     return {
       run
@@ -511,7 +523,7 @@ export class AgentMessageCoordinator {
       await this.executeRun(
         run.id,
         {
-          input: partsToLlmText(userMessage.parts),
+          input: await this.resolveInputPartsToLlmText(userMessage.parts),
           parts: userMessage.parts,
           maxIterations: assistantMessage.maxIterations,
           sessionId: run.sessionId,
@@ -529,8 +541,8 @@ export class AgentMessageCoordinator {
     return this.getRun(run.id);
   }
 
-  async subscribeRun(runId: string, listener: AgentEventListener) {
-    await this.ensureRun(runId);
+  async subscribeRun(runId: string, listener: AgentEventListener, userId?: string) {
+    await this.ensureRun(runId, { userId });
     // 本进程 store.subscribeRun 能接到当前 API 进程写入的事件；
     // eventBus.subscribeRun 能接到 Worker 进程通过 Redis Pub/Sub 发布的事件。
     // SSE 同时订阅两边，才兼容测试、单进程和多进程部署。
@@ -572,8 +584,10 @@ export class AgentMessageCoordinator {
     };
   }
 
-  async getMessage(messageId: string) {
+  async getMessage(messageId: string, userId?: string) {
     const message = await this.ensureAssistantMessage(messageId);
+
+    await this.ensureSessionOwner(message.sessionId, userId);
 
     return {
       message,
@@ -582,7 +596,8 @@ export class AgentMessageCoordinator {
     };
   }
 
-  async getMessageSnapshot(messageId: string) {
+  async getMessageSnapshot(messageId: string, userId?: string) {
+    await this.ensureMessageOwner(messageId, userId);
     const { message, version } = await this.draftManager.getSnapshot(await this.ensureAssistantMessage(messageId));
 
     return {
@@ -795,10 +810,10 @@ export class AgentMessageCoordinator {
     return [...sessionMessages.slice(0, assistantIndex)].reverse().find((message) => message.role === "user");
   }
 
-  private async getReplayableMediaToolCalls(assistantMessage: AgentMessageRecord): Promise<ToolCall[]> {
+  private async getReplayableResourceToolCalls(assistantMessage: AgentMessageRecord): Promise<ToolCall[]> {
     return (await this.store
       .getToolCallsBySession(assistantMessage.sessionId))
-      .filter((toolCall) => toolCall.messageId === assistantMessage.id && isMediaOutputToolName(toolCall.toolName))
+      .filter((toolCall) => toolCall.messageId === assistantMessage.id && isResourceOutputToolName(toolCall.toolName))
       .sort((leftToolCall, rightToolCall) => {
         const iterationOrder = leftToolCall.iteration - rightToolCall.iteration;
         return iterationOrder || leftToolCall.startedAt.localeCompare(rightToolCall.startedAt);
@@ -820,12 +835,31 @@ export class AgentMessageCoordinator {
     return message;
   }
 
-  private async ensureRun(runId: string): Promise<AgentRunRecord> {
+  private async ensureMessageOwner(messageId: string, userId?: string): Promise<void> {
+    const message = await this.ensureMessage(messageId);
+    await this.ensureSessionOwner(message.sessionId, userId);
+  }
+
+  private async ensureSessionOwner(sessionId: string, userId?: string): Promise<void> {
+    if (!userId) {
+      return;
+    }
+
+    const session = await this.store.getSession(sessionId, userId);
+
+    if (!session) {
+      throw new AppError("VALIDATION_ERROR", `未找到会话：${sessionId}`, 404);
+    }
+  }
+
+  private async ensureRun(runId: string, scope: AgentOwnerScope = {}): Promise<AgentRunRecord> {
     const run = await this.store.getRun(runId);
 
     if (!run) {
       throw new AppError("VALIDATION_ERROR", `未找到运行：${runId}`, 404);
     }
+
+    await this.ensureSessionOwner(run.sessionId, scope.userId);
 
     return run;
   }
@@ -840,11 +874,11 @@ export class AgentMessageCoordinator {
       await this.ensureToolCallRecord(messageId, event, runId, "pending");
     }
 
-    if (event.type === "tool_start" && !(await this.mediaOutputProjector.handleToolStart(messageId, event, runId)) && event.toolCallId) {
+    if (event.type === "tool_start" && !(await this.resourceOutputProjector.handleToolStart(messageId, event, runId)) && event.toolCallId) {
       await this.ensureToolCallRecord(messageId, event, runId, "running");
     }
 
-    if (event.type === "tool_result" && !(await this.mediaOutputProjector.handleToolResult(messageId, event, runId)) && event.toolCallId) {
+    if (event.type === "tool_result" && !(await this.resourceOutputProjector.handleToolResult(messageId, event, runId)) && event.toolCallId) {
       const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
       if (toolCall) {
         await this.store.updateToolCall(toolCall.id, {
@@ -855,7 +889,7 @@ export class AgentMessageCoordinator {
       }
     }
 
-    if (event.type === "tool_error" && !(await this.mediaOutputProjector.handleToolError(messageId, event, runId)) && event.toolCallId) {
+    if (event.type === "tool_error" && !(await this.resourceOutputProjector.handleToolError(messageId, event, runId)) && event.toolCallId) {
       const toolCall = await this.ensureToolCallRecord(messageId, event, runId, "running");
       if (toolCall) {
         await this.store.updateToolCall(toolCall.id, {
@@ -869,8 +903,9 @@ export class AgentMessageCoordinator {
       }
     }
 
-    await this.processStepProjector.project(messageId, event, runId);
-    await this.appendEvent(messageId, event, runId);
+    const eventForPublication = sanitizeToolResultEventForPublication(event);
+    await this.processStepProjector.project(messageId, eventForPublication, runId);
+    await this.appendEvent(messageId, eventForPublication, runId);
   }
 
   private async ensureToolCallRecord(
@@ -1022,6 +1057,10 @@ export class AgentMessageCoordinator {
         : await this.store.getRecentContextMessagesBefore(sessionId, beforeMessageId, summary?.coveredMessageId, messageLimit);
 
     return this.contextBuilder.buildConversationHistory(messages, summary);
+  }
+
+  private async resolveInputPartsToLlmText(parts: MessagePart[]): Promise<string> {
+    return this.options.inputResourceResolver?.resolvePartsToLlmText(parts) ?? partsToLlmText(parts);
   }
 
   private async refreshSessionSummaryBeforeAnswer(

@@ -21,6 +21,13 @@ const statusColor: Record<KnowledgeDocumentRecord["status"], "default" | "error"
   failed: "error"
 };
 
+const statusText: Record<KnowledgeDocumentRecord["status"], string> = {
+  pending: "等待处理",
+  indexing: "索引中",
+  ready: "可使用",
+  failed: "处理失败"
+};
+
 export function KnowledgeAdminPanel({
   documents,
   isLoading,
@@ -44,9 +51,12 @@ export function KnowledgeAdminPanel({
     <Box className="knowledge-admin-panel">
       <Box className="panel-heading compact">
         <Box>
-          <span className="eyebrow">Knowledge</span>
+          <span className="eyebrow">知识资产</span>
           <Typography component="h2" variant="h6">
             知识库
+          </Typography>
+          <Typography className="panel-description" component="p">
+            上传资料，让 Agent 在回答中检索和引用。
           </Typography>
         </Box>
         <Box className="knowledge-actions">
@@ -79,9 +89,13 @@ export function KnowledgeAdminPanel({
 
       <Box className="knowledge-document-list">
         {documents.length === 0 ? (
-          <Typography className="knowledge-empty" component="p">
-            暂无文档
-          </Typography>
+          <Box className="knowledge-empty">
+            <span className="knowledge-empty-icon" aria-hidden="true">
+              <FileText size={20} />
+            </span>
+            <Typography component="strong">还没有知识文档</Typography>
+            <Typography component="p">上传 PDF、Word、Markdown 或 TXT 文件。</Typography>
+          </Box>
         ) : (
           documents.map((document) => (
             <Box className="knowledge-document-item" key={document.id}>
@@ -90,8 +104,8 @@ export function KnowledgeAdminPanel({
                 <Box className="knowledge-document-copy">
                   <Typography component="strong">{document.name}</Typography>
                   <Box className="knowledge-document-meta">
-                    <Chip color={statusColor[document.status]} label={document.status} size="small" variant="outlined" />
-                    <span>{document.chunkCount} chunks</span>
+                    <Chip color={statusColor[document.status]} label={statusText[document.status]} size="small" variant="outlined" />
+                    <span>{document.chunkCount} 个片段</span>
                   </Box>
                   {document.errorMessage ? <span className="knowledge-document-error">{document.errorMessage}</span> : null}
                 </Box>

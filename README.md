@@ -19,6 +19,10 @@
 - `AGENT_WORKER_CONCURRENCY`：Worker 同时执行 run 的数量，默认 `2`。
 - `DATABASE_URL`：PostgreSQL 连接串，默认 `postgres://postgres:postgres@localhost:5432/agent`。需要安装 pgvector 扩展。
 - `AGENT_UPLOAD_DIR`：用户上传和工具资源转储目录，默认 `./data/uploads`。
+- `GITHUB_OAUTH_CLIENT_ID`、`GITHUB_OAUTH_CLIENT_SECRET`、`GITHUB_OAUTH_REDIRECT_URI`：GitHub OAuth 登录配置。兼容旧的 `GITHUB_CLIENT_ID`、`GITHUB_CLIENT_SECRET`、`GITHUB_REDIRECT_URI` 命名。
+- `VITE_GITHUB_OAUTH_CLIENT_ID`、`VITE_GITHUB_OAUTH_REDIRECT_URI`：前端跳转 GitHub OAuth 授权页使用；client id 是公开值，client secret 只放后端环境变量。
+- `JWT_ACCESS_SECRET`、`JWT_REFRESH_SECRET`：JWT 签名密钥；生产环境必须使用不同的长随机字符串。
+- `AUTH_ACCESS_TOKEN_TTL_SECONDS`、`AUTH_REFRESH_TOKEN_TTL_SECONDS`：JWT 过期时间，access token 默认 15 分钟，refresh token 默认 15 天（`1296000` 秒）。
 - `TAVILY_API_KEY`：配置后启用 `web_search` 工具。
 - `VOLCENGINE_ACCESS_KEY_ID`、`VOLCENGINE_SECRET_ACCESS_KEY`：同时配置后启用图片 / 视频生成工具。
 - `AGENT_ALLOWED_TOOLS`：允许暴露和执行的工具名，逗号分隔；留空表示允许全部已注册工具。
@@ -194,7 +198,7 @@ PostgreSQL 仍然是最终可信的数据源：session、message、run、tool ca
 - [x] 设计 PostgreSQL schema 初始化方案：进程启动时跑 `initializeSchema`，用 `CREATE TABLE / EXTENSION / INDEX IF NOT EXISTS` 幂等建表，并用 `migrateVectorDimension` 处理向量列维度变更。
 - [x] 增加数据库连接池、事务边界和索引设计（`pg.Pool` 连接池、`BEGIN/COMMIT/ROLLBACK` 事务、`CREATE INDEX` 索引）。
 - [ ] 引入版本化 migration 工具（如 `node-pg-migrate` / `drizzle-kit`），支持破坏性变更（删列 / 改类型 / 重命名）、数据回填、回滚和迁移历史审计；当前自愈式建表只能追加表和索引，无法处理破坏性变更。
-- [ ] 增加用户 / 租户字段，为后续多用户隔离做准备。
+- [x] 增加用户字段，为后续多用户隔离做准备；当前不引入租户维度。
 
 为什么做它：本地开发存储适合起步，但产品化需要连接池、迁移、索引、事务和数据隔离。当前已落地 PostgreSQL + pgvector，并通过 `AgentStore` 接口保留可替换数据库实现的能力。
 
@@ -256,9 +260,8 @@ PostgreSQL 仍然是最终可信的数据源：session、message、run、tool ca
 - [x] Worker 支持并发配置，并通过 Redis run lock 降低重复执行风险。
 - [x] SSE gateway 先返回 message snapshot，再从 Redis Pub/Sub 接收实时运行事件。
 - [x] 增加 BullMQ 队列深度观测指标，并接入 Grafana 大盘。
-- [ ] 增加任务重试和 worker 心跳。
 
-为什么做它：真实 Agent 任务可能很长，API 进程不适合长期承载所有执行逻辑。队列化后可以让 API 专注请求和 SSE，让 Worker 独立扩容和恢复。
+为什么做它：真实 Agent 任务可能很长，API 进程不适合长期承载所有执行逻辑。队列化后可以让 API 专注请求和 SSE，让 Worker 独立扩容和恢复。队列层不做自动重试，避免失败任务在用户未确认时继续消耗模型或工具额度。
 
 ### 8. 评测与观测
 
@@ -275,18 +278,14 @@ PostgreSQL 仍然是最终可信的数据源：session、message、run、tool ca
 
 注意：当前产品方向不做完整 delta 回放。实时恢复依赖 `message.snapshot` + running draft；过程事件只做 live 观测和 Loki/Grafana 排查，不作为用户界面恢复源。
 
-### 9. 用户、权限和产品 UI
+### 9. 用户和数据隔离
 
-目标：从单机本地工作台升级为多用户可用的产品形态。
+目标：从单机本地工作台升级为可识别用户、可控制数据边界的形态。
 
-- [ ] 登录和用户体系。
-- [ ] session、message、resource 按 user / tenant 隔离。
-- [ ] 工具权限按用户或团队配置。
-- [ ] API rate limit 和用量额度。
-- [ ] 普通用户模式隐藏 raw event，开发者模式显示事件时间线和原始事件。
-- [ ] 增加设置页，管理模型、工具、密钥和资源策略。
+- [x] 登录和用户体系。
+- [x] 用户级数据边界：session 写入 `user_id`，message、run、resource 通过 session 归属校验；知识库为登录后公共。
 
-为什么做它：本地 Demo 可以默认信任所有操作，产品化必须考虑身份、权限、限流、用量、密钥和不同用户的 UI 复杂度。
+为什么做它：本地 Demo 可以默认信任所有操作，多用户使用前需要明确身份和数据归属边界。
 
 ## 测试
 

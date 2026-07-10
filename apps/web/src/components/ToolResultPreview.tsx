@@ -41,10 +41,10 @@ interface ImageResultItem {
   error?: string;
 }
 
-export type ToolImageActionType = "preview" | "download" | "copy_link" | "quote" | "open_original";
+export type ToolResourceActionType = "preview" | "download" | "copy_link" | "quote" | "open_original";
 
-export interface ToolImageActionPayload {
-  action: ToolImageActionType;
+export interface ToolResourceActionPayload {
+  action: ToolResourceActionType;
   url: string;
   index: number;
   prompt: string;
@@ -59,7 +59,7 @@ export interface ToolImageActionPayload {
 
 interface ToolResultPreviewProps {
   trace: ToolTrace;
-  onImageAction?: (payload: ToolImageActionPayload) => void;
+  onResourceAction?: (payload: ToolResourceActionPayload) => void;
 }
 
 function isImageToolName(toolName: string) {
@@ -223,11 +223,11 @@ export function ImageLoadingPreview({ trace }: { trace: ToolTrace }) {
 export function ImagePreview({
   trace,
   result,
-  onImageAction
+  onResourceAction
 }: {
   trace: ToolTrace;
   result: ImageResult;
-  onImageAction?: (payload: ToolImageActionPayload) => void;
+  onResourceAction?: (payload: ToolResourceActionPayload) => void;
 }) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
@@ -238,28 +238,28 @@ export function ImagePreview({
   const batchItems = result.items ?? [];
   const hasBatchItems = batchItems.length > 0;
 
-  const emitImageAction = (action: ToolImageActionType, url: string, index: number, itemPrompt = prompt) => {
-    onImageAction?.({ action, url, index, prompt: itemPrompt, trace });
+  const emitResourceAction = (action: ToolResourceActionType, url: string, index: number, itemPrompt = prompt) => {
+    onResourceAction?.({ action, url, index, prompt: itemPrompt, trace });
   };
 
   const previewImage = (url: string, index: number, itemPrompt?: string) => {
     setPreviewUrl(url);
-    emitImageAction("preview", url, index, itemPrompt);
+    emitResourceAction("preview", url, index, itemPrompt);
   };
 
-  const copyImageLink = (url: string, index: number, itemPrompt?: string) => {
+  const copyResourceLink = (url: string, index: number, itemPrompt?: string) => {
     copyText(url);
     setCopiedUrl(url);
     setActionMenu(null);
-    emitImageAction("copy_link", url, index, itemPrompt);
+    emitResourceAction("copy_link", url, index, itemPrompt);
   };
 
-  const quoteImage = (url: string, index: number, itemPrompt?: string) => {
+  const quoteResource = (url: string, index: number, itemPrompt?: string) => {
     setActionMenu(null);
-    emitImageAction("quote", url, index, itemPrompt);
+    emitResourceAction("quote", url, index, itemPrompt);
   };
 
-  const openImageMenu = (event: MouseEvent<HTMLElement>, url: string, index: number) => {
+  const openResourceMenu = (event: MouseEvent<HTMLElement>, url: string, index: number) => {
     setActionMenu({ url, index, anchorEl: event.currentTarget });
   };
 
@@ -327,7 +327,7 @@ export function ImagePreview({
                                 aria-label={`下载图片 ${flatIndex + 1}`}
                                 title="下载"
                                 size="small"
-                                onClick={() => emitImageAction("download", url, flatIndex, itemPrompt)}
+                                onClick={() => emitResourceAction("download", url, flatIndex, itemPrompt)}
                               >
                                 <Download size={14} />
                               </IconButton>
@@ -338,7 +338,7 @@ export function ImagePreview({
                                 aria-haspopup="menu"
                                 aria-expanded={actionMenu?.url === url}
                                 size="small"
-                                onClick={(event) => openImageMenu(event, url, flatIndex)}
+                                onClick={(event) => openResourceMenu(event, url, flatIndex)}
                               >
                                 <MoreHorizontal size={15} />
                               </IconButton>
@@ -357,11 +357,11 @@ export function ImagePreview({
                               anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
                               transformOrigin={{ vertical: "top", horizontal: "right" }}
                             >
-                              <MenuItem aria-label={`复制图片链接 ${flatIndex + 1}`} onClick={() => copyImageLink(url, flatIndex, itemPrompt)}>
+                              <MenuItem aria-label={`复制图片链接 ${flatIndex + 1}`} onClick={() => copyResourceLink(url, flatIndex, itemPrompt)}>
                                 <Copy size={14} />
                                 复制链接
                               </MenuItem>
-                              <MenuItem aria-label={`引用图片 ${flatIndex + 1}`} onClick={() => quoteImage(url, flatIndex, itemPrompt)}>
+                              <MenuItem aria-label={`引用图片 ${flatIndex + 1}`} onClick={() => quoteResource(url, flatIndex, itemPrompt)}>
                                 <Quote size={14} />
                                 引用
                               </MenuItem>
@@ -373,7 +373,7 @@ export function ImagePreview({
                                 aria-label={`打开原图 ${flatIndex + 1}`}
                                 onClick={() => {
                                   setActionMenu(null);
-                                  emitImageAction("open_original", url, flatIndex, itemPrompt);
+                                  emitResourceAction("open_original", url, flatIndex, itemPrompt);
                                 }}
                               >
                                 <ExternalLink size={14} />
@@ -416,7 +416,7 @@ export function ImagePreview({
                     aria-label={`下载图片 ${index + 1}`}
                     title="下载"
                     size="small"
-                    onClick={() => emitImageAction("download", url, index)}
+                    onClick={() => emitResourceAction("download", url, index)}
                   >
                     <Download size={14} />
                   </IconButton>
@@ -427,7 +427,7 @@ export function ImagePreview({
                     aria-haspopup="menu"
                     aria-expanded={actionMenu?.url === url}
                     size="small"
-                    onClick={(event) => openImageMenu(event, url, index)}
+                    onClick={(event) => openResourceMenu(event, url, index)}
                   >
                     <MoreHorizontal size={15} />
                   </IconButton>
@@ -446,11 +446,11 @@ export function ImagePreview({
                   anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
                   transformOrigin={{ vertical: "top", horizontal: "right" }}
                 >
-                  <MenuItem aria-label={`复制图片链接 ${index + 1}`} onClick={() => copyImageLink(url, index)}>
+                  <MenuItem aria-label={`复制图片链接 ${index + 1}`} onClick={() => copyResourceLink(url, index)}>
                     <Copy size={14} />
                     复制链接
                   </MenuItem>
-                  <MenuItem aria-label={`引用图片 ${index + 1}`} onClick={() => quoteImage(url, index)}>
+                  <MenuItem aria-label={`引用图片 ${index + 1}`} onClick={() => quoteResource(url, index)}>
                     <Quote size={14} />
                     引用
                   </MenuItem>
@@ -462,7 +462,7 @@ export function ImagePreview({
                     aria-label={`打开原图 ${index + 1}`}
                     onClick={() => {
                       setActionMenu(null);
-                      emitImageAction("open_original", url, index);
+                      emitResourceAction("open_original", url, index);
                     }}
                   >
                     <ExternalLink size={14} />
@@ -512,7 +512,7 @@ function ImageTraceSummary({ trace }: { trace: ToolTrace }) {
   );
 }
 
-export function ToolResultPreview({ trace, onImageAction }: ToolResultPreviewProps) {
+export function ToolResultPreview({ trace, onResourceAction }: ToolResultPreviewProps) {
   // 工具的完整 result 仍然是 unknown：不同工具返回结构不一样。
   // 展示层只对已知工具做“友好预览”，未知工具保留 JSON 折叠块，避免为了 UI 反向约束所有工具必须长成一种格式。
   if (trace.error) {

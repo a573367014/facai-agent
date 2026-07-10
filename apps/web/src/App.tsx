@@ -1,10 +1,12 @@
-import { Box, Chip, IconButton, Paper, Typography } from "@mui/material";
-import { ChevronsLeft, ChevronsRight } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Alert, Box, Button, Chip, Drawer, IconButton, Snackbar, Tab, Tabs, Typography, useMediaQuery } from "@mui/material";
+import { Menu, PanelLeftClose, PanelLeftOpen, PanelRightOpen, X } from "lucide-react";
+import { useCallback, useEffect, useRef, useState, type SyntheticEvent } from "react";
 import {
-  apiBaseUrl,
+  authSessionChangedEvent,
   cancelAgentRun,
+  clearAuthSession,
   deleteAgentSession,
+  getGithubAuthorizeUrl,
   getAgentRun,
   getAgentSession,
   getAgentSessionMessages,
@@ -13,8 +15,11 @@ import {
   regenerateAgentMessage,
   deleteKnowledgeDocument,
   reindexKnowledgeDocument,
+  loginWithGithubCode,
+  readAuthSession,
   startAgentRun,
   streamAgentRunEvents,
+  uploadAgentDocument,
   uploadAgentImage,
   uploadKnowledgeDocument,
   type AgentMessagePageInfo,
@@ -34,7 +39,7 @@ import { AgentTimeline } from "./components/AgentTimeline";
 import { AgentComposer } from "./components/AgentComposer";
 import { KnowledgeAdminPanel } from "./components/KnowledgeAdminPanel";
 import { SessionSidebar, type SessionHistoryItem } from "./components/SessionSidebar";
-import type { ToolImageActionPayload } from "./components/ToolResultPreview";
+import type { ToolResourceActionPayload } from "./components/ToolResultPreview";
 import { stripRuntimeFields, type RuntimePart } from "./prosemirror/part-serialization";
 import "./styles.css";
 
@@ -43,10 +48,13 @@ const runningRunsBySessionKey = "agent.runningRunsBySession";
 const sessionIdQueryKey = "sessionId";
 const defaultMessagePageLimit = 30;
 const defaultSessionPageLimit = 30;
+const githubOAuthClientId = import.meta.env.VITE_GITHUB_OAUTH_CLIENT_ID?.trim() ?? "";
+const configuredGithubRedirectUri = import.meta.env.VITE_GITHUB_OAUTH_REDIRECT_URI?.trim();
 
 type ResourceMap = Record<string, AgentResourceRecord>;
 type RunningRunState = { runId: string };
 type RunningRunsBySession = Record<string, RunningRunState>;
+type InspectorTab = "events" | "knowledge";
 
 function readRunningRunsBySession(): RunningRunsBySession {
   // 这里记录“每个会话当前还在跑的 run”。
@@ -92,6 +100,10 @@ function writeRunningRunsBySession(runningRuns: RunningRunsBySession) {
 
 function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === "AbortError";
+}
+
+function getGithubRedirectUri() {
+  return configuredGithubRedirectUri || `${window.location.origin}/auth/github/callback`;
 }
 
 function toChatMessageStatus(status: AgentMessageRecord["status"]): ChatMessage["status"] {
@@ -390,7 +402,7 @@ function setTextPartValue(parts: MessagePart[] = [], value: string): MessagePart
 }
 
 function applyPartEventToMessage(message: ChatMessage, event: AgentStreamEvent): ChatMessage {
-  // 后端不会每次都重发整条消息：流式文本用 delta，媒体/占位用 created/updated。
+  // 后端不会每次都重发整条消息：流式文本用 delta，resource/占位用 created/updated。
   // 这个函数只负责把“一个 part 事件”折叠到当前 ChatMessage 上。
   if (event.type === "message.part.created") {
     const partIndex = normalizePartIndex(event.partIndex);
@@ -529,23 +541,23 @@ function buildHistoryItems(sessions: AgentSessionRecord[]): SessionHistoryItem[]
   }));
 }
 
-function appendQuotedMediaPart(currentParts: RuntimePart[], quotedMediaPart: RuntimePart): RuntimePart[] {
-  const meaningfulParts = currentParts.filter((part) => part.type === "media" || (part.type === "text" && part.value.trim()));
+function appendQuotedResourcePart(currentParts: RuntimePart[], quotedResourcePart: RuntimePart): RuntimePart[] {
+  const meaningfulParts = currentParts.filter((part) => part.type === "resource" || (part.type === "text" && part.value.trim()));
 
   if (meaningfulParts.length === 0) {
-    return [quotedMediaPart];
+    return [quotedResourcePart];
   }
 
-  return [...currentParts, quotedMediaPart];
+  return [...currentParts, quotedResourcePart];
 }
 
-function createQuotedMediaPart(payload: ToolImageActionPayload): RuntimePart {
+function createQuotedResourcePart(payload: ToolResourceActionPayload): RuntimePart {
   const prompt = payload.prompt.trim();
-  const mime = payload.mime ?? inferMediaMimeFromUrl(payload.url);
-  const mediaLabel = getMediaLabel(mime);
-  const name = prompt || `${mediaLabel} ${payload.index + 1}`;
+  const mime = payload.mime ?? inferResourceMimeFromUrl(payload.url);
+  const resourceLabel = getResourceLabel(mime);
+  const name = prompt || `${resourceLabel} ${payload.index + 1}`;
   const tool =
-    payload.trace.toolName === "media"
+    payload.trace.toolName === "resource"
       ? undefined
       : {
           name: payload.trace.toolName,
@@ -555,7 +567,7 @@ function createQuotedMediaPart(payload: ToolImageActionPayload): RuntimePart {
         };
 
   return {
-    type: "media",
+    type: "resource",
     mime,
     url: payload.url,
     name,
@@ -570,7 +582,7 @@ function createQuotedMediaPart(payload: ToolImageActionPayload): RuntimePart {
   };
 }
 
-function inferMediaMimeFromUrl(url: string) {
+function inferResourceMimeFromUrl(url: string) {
   const pathname = safeUrlPathname(url).toLowerCase();
 
   if (pathname.endsWith(".mp4")) {
@@ -600,7 +612,7 @@ function inferMediaMimeFromUrl(url: string) {
   return "image/png";
 }
 
-function getMediaLabel(mime: string) {
+function getResourceLabel(mime: string) {
   return mime.startsWith("video/") ? "视频" : "图片";
 }
 
@@ -613,6 +625,7 @@ function safeUrlPathname(url: string) {
 }
 
 export default function App() {
+  const isCompactWorkspace = useMediaQuery("(max-width: 1023px)", { noSsr: true });
   const [composerParts, setComposerParts] = useState<RuntimePart[]>([{ type: "text", value: "" }]);
   const [composerFocusToken, setComposerFocusToken] = useState(0);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -621,20 +634,23 @@ export default function App() {
   const [messagePageInfo, setMessagePageInfo] = useState<AgentMessagePageInfo>(() => createDefaultMessagePageInfo());
   const [isLoadingOlderMessages, setIsLoadingOlderMessages] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [attachmentToastMessage, setAttachmentToastMessage] = useState<string | null>(null);
   const [knowledgeDocuments, setKnowledgeDocuments] = useState<KnowledgeDocumentRecord[]>([]);
   const [isKnowledgeLoading, setIsKnowledgeLoading] = useState(false);
   const [isKnowledgeUploading, setIsKnowledgeUploading] = useState(false);
   const [knowledgeError, setKnowledgeError] = useState<string | null>(null);
   const [events, setEvents] = useState<AgentStreamEvent[]>([]);
-  const [health, setHealth] = useState("检查中");
+  const [authSession, setAuthSession] = useState(() => readAuthSession());
+  const [authError, setAuthError] = useState<string | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | undefined>(() => readSessionIdFromUrl());
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<AgentSessionRecord[]>([]);
   const [sessionPageInfo, setSessionPageInfo] = useState<AgentSessionPageInfo>(() => createDefaultSessionPageInfo());
   const [isLoadingMoreSessions, setIsLoadingMoreSessions] = useState(false);
   const [deletingSessionIds, setDeletingSessionIds] = useState<Set<string>>(() => new Set());
-  const [isSessionSidebarCollapsed, setIsSessionSidebarCollapsed] = useState(false);
-  const [isTracePanelCollapsed, setIsTracePanelCollapsed] = useState(false);
+  const [isSessionSidebarCollapsed, setIsSessionSidebarCollapsed] = useState(isCompactWorkspace);
+  const [isInspectorOpen, setIsInspectorOpen] = useState(false);
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("events");
   const activeStreamControllerRef = useRef<AbortController | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
   const activeSessionIdRef = useRef<string | undefined>(activeSessionId);
@@ -642,7 +658,35 @@ export default function App() {
   // 这些 ref 是为了给异步 SSE 回调读“最新状态”。
   // React state 在闭包里可能是旧值，ref.current 可以避免旧流把事件写进新的会话。
 
+  useEffect(() => {
+    if (isCompactWorkspace) {
+      setIsSessionSidebarCollapsed(true);
+    }
+  }, [isCompactWorkspace]);
+
+  const closeAttachmentToast = useCallback(() => {
+    setAttachmentToastMessage(null);
+  }, []);
+
+  const handleAttachmentToastClose = useCallback((_event: SyntheticEvent | Event, reason?: string) => {
+    if (reason === "clickaway") {
+      return;
+    }
+
+    closeAttachmentToast();
+  }, [closeAttachmentToast]);
+
+  const handleAttachmentUploadNotice = useCallback((message: string | null) => {
+    setAttachmentToastMessage(message);
+  }, []);
+
   const loadKnowledgeDocuments = useCallback(async () => {
+    if (!authSession) {
+      setKnowledgeDocuments([]);
+      setKnowledgeError(null);
+      return;
+    }
+
     setIsKnowledgeLoading(true);
     setKnowledgeError(null);
 
@@ -653,10 +697,15 @@ export default function App() {
     } finally {
       setIsKnowledgeLoading(false);
     }
-  }, []);
+  }, [authSession]);
 
   const handleUploadKnowledgeDocument = useCallback(
     async (file: File) => {
+      if (!authSession) {
+        setKnowledgeError("请先登录 GitHub");
+        return;
+      }
+
       setIsKnowledgeUploading(true);
       setKnowledgeError(null);
 
@@ -669,11 +718,16 @@ export default function App() {
         setIsKnowledgeUploading(false);
       }
     },
-    [loadKnowledgeDocuments]
+    [authSession, loadKnowledgeDocuments]
   );
 
   const handleDeleteKnowledgeDocument = useCallback(
     async (documentId: string) => {
+      if (!authSession) {
+        setKnowledgeError("请先登录 GitHub");
+        return;
+      }
+
       setKnowledgeError(null);
 
       try {
@@ -683,11 +737,16 @@ export default function App() {
         setKnowledgeError(deleteError instanceof Error ? deleteError.message : "知识库删除失败");
       }
     },
-    [loadKnowledgeDocuments]
+    [authSession, loadKnowledgeDocuments]
   );
 
   const handleReindexKnowledgeDocument = useCallback(
     async (documentId: string) => {
+      if (!authSession) {
+        setKnowledgeError("请先登录 GitHub");
+        return;
+      }
+
       setKnowledgeError(null);
 
       try {
@@ -697,32 +756,78 @@ export default function App() {
         setKnowledgeError(reindexError instanceof Error ? reindexError.message : "知识库重新索引失败");
       }
     },
-    [loadKnowledgeDocuments]
+    [authSession, loadKnowledgeDocuments]
   );
 
   useEffect(() => {
-    const controller = new AbortController();
+    const syncAuthSession = () => {
+      setAuthSession(readAuthSession());
+    };
 
-    fetch(`${apiBaseUrl}/health`, {
-      signal: controller.signal
-    })
-      .then((response) => setHealth(response.ok ? "正常" : "异常"))
-      .catch((healthError) => {
-        if (!isAbortError(healthError)) {
-          setHealth("异常");
-        }
-      });
-
+    window.addEventListener(authSessionChangedEvent, syncAuthSession);
+    window.addEventListener("storage", syncAuthSession);
     return () => {
-      controller.abort();
+      window.removeEventListener(authSessionChangedEvent, syncAuthSession);
+      window.removeEventListener("storage", syncAuthSession);
     };
   }, []);
 
   useEffect(() => {
-    void loadKnowledgeDocuments();
-  }, [loadKnowledgeDocuments]);
+    const url = new URL(window.location.href);
+
+    if (url.pathname !== "/auth/github/callback") {
+      return;
+    }
+
+    const code = url.searchParams.get("code");
+
+    if (!code) {
+      setAuthError("GitHub 登录回调缺少 code");
+      return;
+    }
+
+    let cancelled = false;
+    setAuthError(null);
+
+    loginWithGithubCode({
+      code,
+      redirectUri: getGithubRedirectUri()
+    })
+      .then((session) => {
+        if (cancelled) {
+          return;
+        }
+
+        setAuthSession(session);
+        window.history.replaceState(null, "", "/");
+      })
+      .catch((loginError) => {
+        if (!cancelled) {
+          setAuthError(loginError instanceof Error ? loginError.message : "GitHub 登录失败");
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
+    if (!authSession) {
+      setKnowledgeDocuments([]);
+      return;
+    }
+
+    void loadKnowledgeDocuments();
+  }, [authSession, loadKnowledgeDocuments]);
+
+  useEffect(() => {
+    if (!authSession) {
+      setSessions([]);
+      setSessionPageInfo(createDefaultSessionPageInfo());
+      return;
+    }
+
     let cancelled = false;
 
     listAgentSessions()
@@ -742,9 +847,13 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [authSession]);
 
   useEffect(() => {
+    if (!authSession) {
+      return;
+    }
+
     const sessionId = readSessionIdFromUrl();
 
     if (!sessionId) {
@@ -778,9 +887,13 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [authSession]);
 
   useEffect(() => {
+    if (!authSession) {
+      return;
+    }
+
     const storedActiveRunId = localStorage.getItem(activeRunIdKey);
 
     if (!storedActiveRunId) {
@@ -855,7 +968,7 @@ export default function App() {
       cancelled = true;
       controller.abort();
     };
-  }, []);
+  }, [authSession]);
 
   function clearActiveRun() {
     activeRunIdRef.current = null;
@@ -1222,8 +1335,13 @@ export default function App() {
   }
 
   async function handleSubmitMessage() {
+    if (!authSession) {
+      setError("请先登录 GitHub");
+      return;
+    }
+
     const submittedParts = stripRuntimeFields(composerParts).filter(
-      (part) => part.type === "media" || (part.type === "text" && part.value.trim())
+      (part) => part.type === "resource" || (part.type === "text" && part.value.trim())
     );
 
     if (submittedParts.length === 0) {
@@ -1272,6 +1390,11 @@ export default function App() {
   }
 
   async function handleRegenerateMessage(messageId: string) {
+    if (!authSession) {
+      setError("请先登录 GitHub");
+      return;
+    }
+
     if (activeRunId) {
       // 重新生成本质上也是启动一个新的 run，所以同样先释放旧 run。
       await cancelActiveRun({ refreshAfterCancel: false, settleStreaming: false });
@@ -1326,6 +1449,9 @@ export default function App() {
     setIsLoadingOlderMessages(false);
     setEvents([]);
     setError(null);
+    if (isCompactWorkspace) {
+      setIsSessionSidebarCollapsed(true);
+    }
   }
 
   async function handleNewSession() {
@@ -1346,16 +1472,25 @@ export default function App() {
     setComposerFocusToken((currentToken) => currentToken + 1);
   }
 
-  function handleImageAction(payload: ToolImageActionPayload) {
+  function handleResourceAction(payload: ToolResourceActionPayload) {
     if (payload.action !== "quote") {
       return;
     }
 
-    setComposerParts((currentParts) => appendQuotedMediaPart(currentParts, createQuotedMediaPart(payload)));
+    setComposerParts((currentParts) => appendQuotedResourcePart(currentParts, createQuotedResourcePart(payload)));
     setComposerFocusToken((currentToken) => currentToken + 1);
   }
 
   async function handleSelectSession(sessionId: string) {
+    if (isCompactWorkspace) {
+      setIsSessionSidebarCollapsed(true);
+    }
+
+    if (!authSession) {
+      setError("请先登录 GitHub");
+      return;
+    }
+
     if (sessionId === activeSessionId) {
       return;
     }
@@ -1388,6 +1523,10 @@ export default function App() {
   }
 
   async function handleLoadMoreSessions() {
+    if (!authSession) {
+      return;
+    }
+
     const after = sessionPageInfo.nextCursor;
 
     if (!after || !sessionPageInfo.hasMore || isLoadingMoreSessions) {
@@ -1414,6 +1553,11 @@ export default function App() {
   }
 
   async function handleDeleteSession(sessionId: string) {
+    if (!authSession) {
+      setError("请先登录 GitHub");
+      return;
+    }
+
     setDeletingSessionIds((currentIds) => new Set(currentIds).add(sessionId));
     setError(null);
     forgetRunningRunForSession(sessionId);
@@ -1443,6 +1587,11 @@ export default function App() {
   }
 
   async function handleLoadOlderMessages() {
+    if (!authSession) {
+      setError("请先登录 GitHub");
+      return;
+    }
+
     const sessionId = activeSessionId ?? readSessionIdFromUrl();
     const before = messagePageInfo.nextCursor;
 
@@ -1470,30 +1619,82 @@ export default function App() {
   }
 
   const historyItems = buildHistoryItems(sessions);
+  const activeSessionTitle = activeSessionId
+    ? sessions.find((session) => session.id === activeSessionId)?.title?.trim() || "未命名会话"
+    : "新对话";
+  // 未登录是正常的访客状态，登录入口已经固定在会话栏底部；只有用户
+  // 真正触发受保护操作后才把“请先登录”作为上下文错误显示在对话区。
+  const displayError = authError ?? error;
   const workspaceClassName = [
     "workspace",
     isSessionSidebarCollapsed ? "sidebar-collapsed" : null,
-    isTracePanelCollapsed ? "trace-collapsed" : null
+    isCompactWorkspace ? "compact-workspace" : "desktop-workspace",
+    isCompactWorkspace && !isSessionSidebarCollapsed ? "sidebar-overlay-open" : null,
+    isInspectorOpen ? "inspector-open" : "inspector-closed"
   ]
     .filter(Boolean)
     .join(" ");
 
+  function handleGithubLogin() {
+    if (!githubOAuthClientId) {
+      setAuthError("缺少 VITE_GITHUB_OAUTH_CLIENT_ID 配置");
+      return;
+    }
+
+    window.location.href = getGithubAuthorizeUrl({
+      clientId: githubOAuthClientId,
+      redirectUri: getGithubRedirectUri(),
+      state: crypto.randomUUID()
+    });
+  }
+
+  function handleLogout() {
+    clearAuthSession();
+    setAuthSession(undefined);
+    resetToNewSession();
+    setSessions([]);
+    setKnowledgeDocuments([]);
+  }
+
+  function renderSessionSidebar(collapsed: boolean) {
+    return (
+      <SessionSidebar
+        activeSessionId={activeSessionId}
+        historyItems={historyItems}
+        isCollapsed={collapsed}
+        hasMoreSessions={sessionPageInfo.hasMore}
+        isLoadingMoreSessions={isLoadingMoreSessions}
+        deletingSessionIds={deletingSessionIds}
+        githubLogin={authSession?.user.githubLogin}
+        isGithubLoginConfigured={Boolean(githubOAuthClientId)}
+        onNewSession={handleNewSession}
+        onCollapse={() => setIsSessionSidebarCollapsed(true)}
+        onSelectSession={handleSelectSession}
+        onLoadMoreSessions={handleLoadMoreSessions}
+        onDeleteSession={handleDeleteSession}
+        onGithubLogin={handleGithubLogin}
+        onLogout={handleLogout}
+      />
+    );
+  }
+
   return (
     <Box component="main" className="app-shell fullscreen-shell">
       <Box className={workspaceClassName}>
-        <SessionSidebar
-          activeSessionId={activeSessionId}
-          health={health}
-          historyItems={historyItems}
-          isCollapsed={isSessionSidebarCollapsed}
-          hasMoreSessions={sessionPageInfo.hasMore}
-          isLoadingMoreSessions={isLoadingMoreSessions}
-          deletingSessionIds={deletingSessionIds}
-          onNewSession={handleNewSession}
-          onSelectSession={handleSelectSession}
-          onLoadMoreSessions={handleLoadMoreSessions}
-          onDeleteSession={handleDeleteSession}
-        />
+        {isCompactWorkspace ? (
+          <Drawer
+            anchor="left"
+            className="compact-sidebar-drawer"
+            classes={{ paper: "compact-sidebar-drawer-paper" }}
+            ModalProps={{ keepMounted: true }}
+            open={!isSessionSidebarCollapsed}
+            onClose={() => setIsSessionSidebarCollapsed(true)}
+          >
+            {renderSessionSidebar(false)}
+          </Drawer>
+        ) : (
+          renderSessionSidebar(isSessionSidebarCollapsed)
+        )}
 
         <Box component="section" className="chat-main response-column">
           <Box component="header" className="chat-main-header">
@@ -1506,31 +1707,38 @@ export default function App() {
                 size="small"
                 type="button"
               >
-                {isSessionSidebarCollapsed ? <ChevronsRight size={18} /> : <ChevronsLeft size={18} />}
+                {isCompactWorkspace ? (
+                  <Menu size={20} />
+                ) : isSessionSidebarCollapsed ? (
+                  <PanelLeftOpen size={18} />
+                ) : (
+                  <PanelLeftClose size={18} />
+                )}
               </IconButton>
             </Box>
 
             <Box className="chat-main-title">
               <Typography component="h1" variant="h6">
-                {activeSessionId ? "当前会话" : "新对话"}
+                {activeSessionTitle}
               </Typography>
-              <Typography component="p">AI 生成可能有误，请核实工具结果</Typography>
             </Box>
 
             <Box className="chat-header-side right">
               {isStreaming ? (
                 <Chip className="generation-badge streaming" size="small" label="生成中" color="primary" variant="outlined" />
               ) : null}
-              <IconButton
-                aria-expanded={!isTracePanelCollapsed}
-                aria-label={isTracePanelCollapsed ? "展开事件时间线" : "收起事件时间线"}
-                className="sidebar-toggle chat-header-toggle"
-                onClick={() => setIsTracePanelCollapsed((current) => !current)}
+              <Button
+                aria-controls={isInspectorOpen ? "run-inspector" : undefined}
+                aria-expanded={isInspectorOpen}
+                className="inspector-trigger"
+                onClick={() => setIsInspectorOpen(true)}
                 size="small"
+                startIcon={<PanelRightOpen size={17} />}
                 type="button"
+                variant="text"
               >
-                {isTracePanelCollapsed ? <ChevronsLeft size={18} /> : <ChevronsRight size={18} />}
-              </IconButton>
+                运行详情
+              </Button>
             </Box>
           </Box>
 
@@ -1538,54 +1746,130 @@ export default function App() {
             messages={messages}
             resourcesById={resourcesById}
             isActive={isStreaming}
-            error={error}
+            error={displayError}
             hasMoreMessages={messagePageInfo.hasMore}
             isLoadingOlderMessages={isLoadingOlderMessages}
             onLoadOlderMessages={handleLoadOlderMessages}
-            onImageAction={handleImageAction}
+            onResourceAction={handleResourceAction}
             onReuseUserMessage={handleReuseUserMessage}
             onRegenerateMessage={handleRegenerateMessage}
             onSuggestionSelect={handleSuggestionSelect}
           />
 
-          <AgentComposer
-            parts={composerParts}
-            isStreaming={isStreaming}
-            focusToken={composerFocusToken}
-            onPartsChange={setComposerParts}
-            onSubmit={handleSubmitMessage}
-            onCancel={handleCancelMessage}
-            onUploadImage={uploadAgentImage}
-          />
+          <Box className="composer-dock">
+            <AgentComposer
+              parts={composerParts}
+              isStreaming={isStreaming}
+              focusToken={composerFocusToken}
+              onPartsChange={setComposerParts}
+              onSubmit={handleSubmitMessage}
+              onCancel={handleCancelMessage}
+              onUploadDocument={uploadAgentDocument}
+              onUploadError={handleAttachmentUploadNotice}
+              onUploadImage={uploadAgentImage}
+            />
+            <Typography className="composer-disclaimer" component="p">
+              AI 生成内容可能有误，请核实重要信息和工具结果。
+            </Typography>
+          </Box>
         </Box>
 
-        <Box component="aside" className={isTracePanelCollapsed ? "trace-column collapsed" : "trace-column"} aria-hidden={isTracePanelCollapsed ? true : undefined}>
-          <Paper component="section" className="panel knowledge-panel" elevation={0}>
-            <KnowledgeAdminPanel
-              documents={knowledgeDocuments}
-              isLoading={isKnowledgeLoading}
-              isUploading={isKnowledgeUploading}
-              error={knowledgeError}
-              onRefresh={loadKnowledgeDocuments}
-              onUpload={handleUploadKnowledgeDocument}
-              onDelete={handleDeleteKnowledgeDocument}
-              onReindex={handleReindexKnowledgeDocument}
-            />
-          </Paper>
-          <Paper component="section" className="panel trace-panel" elevation={0}>
-            <Box className="panel-heading compact">
-              <Box>
-                <span className="eyebrow">Trace</span>
-                <Typography component="h2" variant="h6">
-                  事件时间线
-                </Typography>
-              </Box>
-              <Chip className="count-pill" size="small" label={events.length} />
-            </Box>
-            <AgentTimeline events={events} />
-          </Paper>
-        </Box>
       </Box>
+      <Drawer
+        anchor="right"
+        className="inspector-drawer"
+        classes={{ paper: "inspector-drawer-paper" }}
+        id="run-inspector"
+        ModalProps={{ keepMounted: true }}
+        open={isInspectorOpen}
+        onClose={() => setIsInspectorOpen(false)}
+        slotProps={{ paper: { "aria-labelledby": "run-inspector-title" } }}
+      >
+        <Box component="aside" className="inspector-shell" aria-label="运行详情">
+          <Box component="header" className="inspector-header">
+            <Box>
+              <Typography component="h2" id="run-inspector-title" variant="h6">
+                运行详情
+              </Typography>
+              <Typography component="p" className="inspector-session-title">
+                {activeSessionTitle}
+              </Typography>
+            </Box>
+            <IconButton
+              aria-label="关闭运行详情"
+              className="inspector-close"
+              onClick={() => setIsInspectorOpen(false)}
+              size="small"
+              type="button"
+            >
+              <X size={18} />
+            </IconButton>
+          </Box>
+
+          <Tabs
+            aria-label="运行详情分类"
+            className="inspector-tabs"
+            onChange={(_event, nextTab: InspectorTab) => setInspectorTab(nextTab)}
+            value={inspectorTab}
+            variant="fullWidth"
+          >
+            <Tab aria-controls="inspector-panel-events" id="inspector-tab-events" label="事件" value="events" />
+            <Tab aria-controls="inspector-panel-knowledge" id="inspector-tab-knowledge" label="知识库" value="knowledge" />
+          </Tabs>
+
+          <Box className="inspector-content">
+            <Box
+              aria-labelledby="inspector-tab-events"
+              className="inspector-panel run-events-panel trace-panel"
+              hidden={inspectorTab !== "events"}
+              id="inspector-panel-events"
+              role="tabpanel"
+            >
+              <Box className="inspector-panel-heading">
+                <Box>
+                  <Typography component="h3" variant="subtitle1">
+                    运行事件
+                  </Typography>
+                  <Typography component="p">查看模型、工具与结果的实时事件。</Typography>
+                </Box>
+                <Chip className="count-pill" size="small" label={events.length} />
+              </Box>
+              <AgentTimeline events={events} />
+            </Box>
+
+            <Box
+              aria-labelledby="inspector-tab-knowledge"
+              className="inspector-panel knowledge-panel"
+              hidden={inspectorTab !== "knowledge"}
+              id="inspector-panel-knowledge"
+              role="tabpanel"
+            >
+              <KnowledgeAdminPanel
+                documents={knowledgeDocuments}
+                isLoading={isKnowledgeLoading}
+                isUploading={isKnowledgeUploading}
+                error={knowledgeError}
+                onRefresh={loadKnowledgeDocuments}
+                onUpload={handleUploadKnowledgeDocument}
+                onDelete={handleDeleteKnowledgeDocument}
+                onReindex={handleReindexKnowledgeDocument}
+              />
+            </Box>
+
+          </Box>
+        </Box>
+      </Drawer>
+      <Snackbar
+        className="attachment-toast"
+        open={Boolean(attachmentToastMessage)}
+        autoHideDuration={3600}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+        onClose={handleAttachmentToastClose}
+      >
+        <Alert className="attachment-toast-alert" severity="warning" variant="filled" onClose={closeAttachmentToast}>
+          {attachmentToastMessage}
+        </Alert>
+      </Snackbar>
     </Box>
   );
 }

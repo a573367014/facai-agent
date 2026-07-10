@@ -5,7 +5,7 @@ import {
   ensureAppendableTextPart,
   partsToLlmText,
   stripRuntimePartFields,
-  upsertGeneratedImageParts,
+  upsertGeneratedResourceParts,
   type MessagePart
 } from "../../src/agent/message-parts.js";
 
@@ -39,11 +39,11 @@ describe("message parts", () => {
     expect(partsToLlmText(parts)).toBe("帮我生成\n风格：温馨田园风\n小猪图片");
   });
 
-  it("does not project pending media into LLM context", () => {
+  it("does not project pending resource into LLM context", () => {
     const parts: MessagePart[] = [
       { type: "text", value: "正在生成图片" },
       {
-        type: "media",
+        type: "resource",
         mime: "image/png",
         url: "",
         extra: { lifecycle: { state: "pending" } }
@@ -53,11 +53,11 @@ describe("message parts", () => {
     expect(partsToLlmText(parts)).toBe("正在生成图片");
   });
 
-  it("projects media URL into LLM context so image editing tools can reference it", () => {
+  it("projects resource URL into LLM context so image editing tools can reference it", () => {
     const parts: MessagePart[] = [
       { type: "text", value: "把这张图改成水彩风格" },
       {
-        type: "media",
+        type: "resource",
         mime: "image/png",
         name: "小猪原图",
         url: "http://127.0.0.1:4001/uploads/images/source-pig.png"
@@ -73,10 +73,10 @@ describe("message parts", () => {
     expect(appendTextDelta([createTextPart("")], 0, "你好")).toEqual([{ type: "text", value: "你好" }]);
   });
 
-  it("appends a new text part after existing media when text arrives later", () => {
+  it("appends a new text part after existing resource when text arrives later", () => {
     const parts: MessagePart[] = [
       {
-        type: "media",
+        type: "resource",
         mime: "image/png",
         url: "https://example.com/generated.png",
         extra: { lifecycle: { state: "succeeded" } }
@@ -94,8 +94,8 @@ describe("message parts", () => {
     });
   });
 
-  it("creates and updates generated image parts by tool call id and output index", () => {
-    const pending = upsertGeneratedImageParts([], {
+  it("creates and updates generated resource parts by tool call id and output index", () => {
+    const pending = upsertGeneratedResourceParts([], {
       state: "pending",
       resourceId: "res_1",
       toolName: "generate_image",
@@ -107,7 +107,7 @@ describe("message parts", () => {
 
     expect(pending).toEqual([
       {
-        type: "media",
+        type: "resource",
         mime: "image/png",
         extra: {
           placeholder: { type: "image", label: "图片生成中" },
@@ -118,7 +118,7 @@ describe("message parts", () => {
       }
     ]);
 
-    const completed = upsertGeneratedImageParts(pending, {
+    const completed = upsertGeneratedResourceParts(pending, {
       state: "succeeded",
       resourceId: "res_1",
       toolName: "generate_image",
@@ -137,7 +137,7 @@ describe("message parts", () => {
     });
 
     expect(completed[0]).toEqual({
-      type: "media",
+      type: "resource",
       mime: "image/png",
       url: "https://example.com/generated-pig.png",
       name: "温馨田园小猪",
@@ -156,7 +156,7 @@ describe("message parts", () => {
   });
 
   it("creates generated video parts with video placeholder", () => {
-    const pending = upsertGeneratedImageParts([], {
+    const pending = upsertGeneratedResourceParts([], {
       state: "pending",
       resourceId: "res_video",
       toolName: "generate_video",
@@ -168,13 +168,40 @@ describe("message parts", () => {
 
     expect(pending).toEqual([
       {
-        type: "media",
+        type: "resource",
         mime: "video/mp4",
         extra: {
           placeholder: { type: "video", label: "视频生成中" },
           lifecycle: { state: "pending" },
           resource: { id: "res_video" },
           tool: { name: "generate_video", toolCallId: "call_video", toolCallRowId: "tool_call_video", outputIndex: 0 }
+        }
+      }
+    ]);
+  });
+
+  it("creates generated document parts with document placeholder", () => {
+    const pending = upsertGeneratedResourceParts([], {
+      state: "pending",
+      resourceId: "res_doc",
+      toolName: "generate_document",
+      toolCallId: "call_doc",
+      toolCallRowId: "tool_call_doc",
+      outputIndex: 0,
+      mime: "text/markdown",
+      name: "年度复盘.md"
+    });
+
+    expect(pending).toEqual([
+      {
+        type: "resource",
+        mime: "text/markdown",
+        name: "年度复盘.md",
+        extra: {
+          placeholder: { type: "document", label: "文档生成中" },
+          lifecycle: { state: "pending" },
+          resource: { id: "res_doc" },
+          tool: { name: "generate_document", toolCallId: "call_doc", toolCallRowId: "tool_call_doc", outputIndex: 0 }
         }
       }
     ]);

@@ -1,11 +1,11 @@
 import { Box, Chip, Paper, Stack } from "@mui/material";
 import { CheckCircle2, Clock3, Loader2, XCircle } from "lucide-react";
-import { ToolResultPreview, type ToolImageActionPayload } from "./ToolResultPreview";
+import { ToolResultPreview, type ToolResourceActionPayload } from "./ToolResultPreview";
 import type { ToolTrace, ToolTraceStatus } from "../utils/tool-traces";
 
 interface ToolTraceCardProps {
   trace: ToolTrace;
-  onImageAction?: (payload: ToolImageActionPayload) => void;
+  onResourceAction?: (payload: ToolResourceActionPayload) => void;
 }
 
 const statusText: Record<ToolTraceStatus, string> = {
@@ -53,7 +53,7 @@ function getPrimaryArgument(trace: ToolTrace) {
   return typeof value === "string" ? value : JSON.stringify(value);
 }
 
-export function ToolTraceCard({ trace, onImageAction }: ToolTraceCardProps) {
+export function ToolTraceCard({ trace, onResourceAction }: ToolTraceCardProps) {
   const duration = formatDuration(trace.durationMs);
   const primaryArgument = getPrimaryArgument(trace);
 
@@ -69,7 +69,7 @@ export function ToolTraceCard({ trace, onImageAction }: ToolTraceCardProps) {
           {duration ? <Chip className="tool-duration" size="small" label={duration} /> : null}
         </Stack>
       </Box>
-      <ToolResultPreview trace={trace} onImageAction={onImageAction} />
+      <ToolResultPreview trace={trace} onResourceAction={onResourceAction} />
     </Paper>
   );
 }

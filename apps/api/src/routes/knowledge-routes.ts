@@ -8,6 +8,7 @@ import { AppError } from "../errors/app-error.js";
 import { isSupportedKnowledgeDocument } from "../knowledge/document-parser.js";
 import type { KnowledgeIndexQueue } from "../knowledge/knowledge-run-queue.js";
 import type { KnowledgeRetriever } from "../knowledge/retriever.js";
+import { readAttachmentBuffer } from "../uploads/attachment-upload.js";
 
 const documentParamsSchema = z.object({
   documentId: z.string().min(1)
@@ -43,7 +44,7 @@ export async function registerKnowledgeRoutes(app: FastifyInstance, options: Reg
       throw new AppError("VALIDATION_ERROR", "当前只支持上传 PDF、Word、Markdown 和 TXT 文档", 400);
     }
 
-    const buffer = await file.toBuffer();
+    const buffer = await readAttachmentBuffer(file);
 
     if (buffer.length === 0) {
       throw new AppError("VALIDATION_ERROR", "文档内容不能为空", 400);

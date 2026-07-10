@@ -80,6 +80,40 @@ describe("loadEnv", () => {
     expect(env.AGENT_TOOL_RESOURCE_DOWNLOAD_TIMEOUT_MS).toBe(30000);
   });
 
+  it("解析上传响应延迟配置", () => {
+    const env = loadEnv({
+      AGENT_UPLOAD_RESPONSE_DELAY_MS: "1500"
+    });
+
+    expect(env.AGENT_UPLOAD_RESPONSE_DELAY_MS).toBe(1500);
+  });
+
+  it("解析 GitHub 登录和 JWT 授权配置", () => {
+    const env = loadEnv({
+      GITHUB_OAUTH_CLIENT_ID: "github-client-id",
+      GITHUB_OAUTH_CLIENT_SECRET: "github-client-secret",
+      GITHUB_OAUTH_REDIRECT_URI: "http://localhost:4000/auth/github/callback",
+      JWT_ACCESS_SECRET: "access-secret",
+      JWT_REFRESH_SECRET: "refresh-secret",
+      AUTH_ACCESS_TOKEN_TTL_SECONDS: "600",
+      AUTH_REFRESH_TOKEN_TTL_SECONDS: "1296000"
+    });
+
+    expect(env.GITHUB_OAUTH_CLIENT_ID).toBe("github-client-id");
+    expect(env.GITHUB_OAUTH_CLIENT_SECRET).toBe("github-client-secret");
+    expect(env.GITHUB_OAUTH_REDIRECT_URI).toBe("http://localhost:4000/auth/github/callback");
+    expect(env.JWT_ACCESS_SECRET).toBe("access-secret");
+    expect(env.JWT_REFRESH_SECRET).toBe("refresh-secret");
+    expect(env.AUTH_ACCESS_TOKEN_TTL_SECONDS).toBe(600);
+    expect(env.AUTH_REFRESH_TOKEN_TTL_SECONDS).toBe(15 * 24 * 60 * 60);
+  });
+
+  it("默认 refreshToken 过期时间为 15 天", () => {
+    const env = loadEnv({});
+
+    expect(env.AUTH_REFRESH_TOKEN_TTL_SECONDS).toBe(15 * 24 * 60 * 60);
+  });
+
   it("解析 CORS 白名单配置", () => {
     const env = loadEnv({
       CORS_ORIGINS: "https://app.example.com, http://127.0.0.1:4000 "

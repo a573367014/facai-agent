@@ -32,6 +32,13 @@ describe("ToolRegistry", () => {
     ]);
   });
 
+  it("默认注册文档生成工具", () => {
+    const registry = createDefaultToolRegistry();
+
+    expect(registry.getTool("generate_document")).toBeDefined();
+    expect(registry.getDefinitions().map((tool) => tool.name)).toContain("generate_document");
+  });
+
   it("配置 Tavily Key 后注册 web_search 工具", () => {
     const withoutSearch = createDefaultToolRegistry();
     const withSearch = createDefaultToolRegistry({

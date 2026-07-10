@@ -2,22 +2,28 @@ import { forwardRef, useEffect, useImperativeHandle, useRef, type MutableRefObje
 import { baseKeymap } from "prosemirror-commands";
 import { history, redo, undo } from "prosemirror-history";
 import { keymap } from "prosemirror-keymap";
+import type { Node as ProseMirrorNode } from "prosemirror-model";
 import { EditorState, Plugin, TextSelection } from "prosemirror-state";
 import type { Command } from "prosemirror-state";
 import { EditorView } from "prosemirror-view";
 import { docToParts, partsToDoc, stripRuntimeFields, type RuntimePart } from "../prosemirror/part-serialization";
 import { partSchema } from "../prosemirror/part-schema";
 import {
-  createAtomicMediaDeletePlugin,
+  createAtomicResourceDeletePlugin,
+  createAttachmentUploadEntryPlugin,
   createClearSelectionOnOutsidePointerPlugin,
   createDropSelectionPlugin,
-  createImageUploadEntryPlugin,
   createInlineAtomSelectionHighlightPlugin,
   createInlineAtomArrowNavigationPlugin,
   createInlineBoundaryCaretPlugin,
   createPlainTextPastePlugin,
   dropCursor
 } from "../prosemirror/plugins/part-editor-plugins";
+import {
+  getAttachmentUploadKind,
+  getAttachmentValidationMessage,
+  type AttachmentUploadKind
+} from "../utils/attachment-upload";
 
 interface PartComposerProps {
   parts: RuntimePart[];
@@ -27,10 +33,13 @@ interface PartComposerProps {
   onSubmit: () => void;
   onCancel: () => void;
   onUploadImage?: (file: File) => Promise<RuntimePart>;
+  onUploadDocument?: (file: File) => Promise<RuntimePart>;
+  onUploadError?: (message: string | null) => void;
 }
 
 export interface PartComposerHandle {
   openImagePicker: () => void;
+  openDocumentPicker: () => void;
 }
 
 interface ReplacementRange {
@@ -38,24 +47,44 @@ interface ReplacementRange {
   to: number;
 }
 
+type RuntimeResourcePart = Extract<RuntimePart, { type: "resource" }> & {
+  $uploading?: unknown;
+  $uploadId?: unknown;
+};
+
+type UploadTaskRecord =
+  | { status: "pending"; previousNode?: ProseMirrorNode }
+  | { status: "completed"; part: RuntimeResourcePart; previousNode?: ProseMirrorNode }
+  | { status: "failed"; previousNode?: ProseMirrorNode };
+
+type UploadTaskRegistry = Map<string, UploadTaskRecord>;
+
+let uploadSequence = 0;
+
 export const PartComposer = forwardRef<PartComposerHandle, PartComposerProps>(function PartComposer(
-  { parts, disabled = false, focusToken = 0, onChange, onSubmit, onCancel, onUploadImage },
+  { parts, disabled = false, focusToken = 0, onChange, onSubmit, onCancel, onUploadImage, onUploadDocument, onUploadError },
   ref
 ) {
   const editorRootRef = useRef<HTMLDivElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const documentInputRef = useRef<HTMLInputElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
   const onSubmitRef = useRef(onSubmit);
   const onCancelRef = useRef(onCancel);
   const onUploadImageRef = useRef(onUploadImage);
+  const onUploadDocumentRef = useRef(onUploadDocument);
+  const onUploadErrorRef = useRef(onUploadError);
   const disabledRef = useRef(disabled);
   const pendingReplacementRangeRef = useRef<ReplacementRange>();
+  const uploadTasksRef = useRef<UploadTaskRegistry>(new Map());
 
   onChangeRef.current = onChange;
   onSubmitRef.current = onSubmit;
   onCancelRef.current = onCancel;
   onUploadImageRef.current = onUploadImage;
+  onUploadDocumentRef.current = onUploadDocument;
+  onUploadErrorRef.current = onUploadError;
   disabledRef.current = disabled;
 
   // 回调和 disabled 都放到 ref 里，是为了让 ProseMirror 插件始终读到最新值。
@@ -64,6 +93,10 @@ export const PartComposer = forwardRef<PartComposerHandle, PartComposerProps>(fu
     openImagePicker: () => {
       pendingReplacementRangeRef.current = undefined;
       imageInputRef.current?.click();
+    },
+    openDocumentPicker: () => {
+      pendingReplacementRangeRef.current = undefined;
+      documentInputRef.current?.click();
     }
   }));
 
@@ -78,8 +111,12 @@ export const PartComposer = forwardRef<PartComposerHandle, PartComposerProps>(fu
         onSubmitRef,
         onCancelRef,
         onUploadImageRef,
+        onUploadDocumentRef,
+        onUploadErrorRef,
         imageInputRef,
-        pendingReplacementRangeRef
+        documentInputRef,
+        pendingReplacementRangeRef,
+        uploadTasksRef
       }),
       editable: () => !disabledRef.current,
       attributes: {
@@ -128,8 +165,12 @@ export const PartComposer = forwardRef<PartComposerHandle, PartComposerProps>(fu
       onSubmitRef,
       onCancelRef,
       onUploadImageRef,
+      onUploadDocumentRef,
+      onUploadErrorRef,
       imageInputRef,
-      pendingReplacementRangeRef
+      documentInputRef,
+      pendingReplacementRangeRef,
+      uploadTasksRef
     }));
     updateEmptyClass(view);
   }, [parts]);
@@ -151,11 +192,38 @@ export const PartComposer = forwardRef<PartComposerHandle, PartComposerProps>(fu
       return;
     }
 
-    await uploadAndInsertImage(file, viewRef, onUploadImageRef, pendingReplacementRangeRef.current);
+    await uploadAndInsertAttachment(
+      file,
+      viewRef,
+      { onUploadImageRef, onUploadDocumentRef, onUploadErrorRef },
+      uploadTasksRef.current,
+      "image",
+      pendingReplacementRangeRef.current
+    );
     pendingReplacementRangeRef.current = undefined;
 
     if (imageInputRef.current) {
       imageInputRef.current.value = "";
+    }
+  }
+
+  async function handleDocumentInputChange() {
+    const file = documentInputRef.current?.files?.[0];
+
+    if (!file) {
+      return;
+    }
+
+    await uploadAndInsertAttachment(
+      file,
+      viewRef,
+      { onUploadImageRef, onUploadDocumentRef, onUploadErrorRef },
+      uploadTasksRef.current,
+      "document"
+    );
+
+    if (documentInputRef.current) {
+      documentInputRef.current.value = "";
     }
   }
 
@@ -172,6 +240,16 @@ export const PartComposer = forwardRef<PartComposerHandle, PartComposerProps>(fu
           void handleImageInputChange();
         }}
       />
+      <input
+        ref={documentInputRef}
+        aria-label="选择文档"
+        accept=".txt,.md,.markdown,.doc,.docx,text/plain,text/markdown,application/markdown,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        className="part-composer-image-input"
+        type="file"
+        onChange={() => {
+          void handleDocumentInputChange();
+        }}
+      />
     </div>
   );
 });
@@ -181,19 +259,24 @@ function createEditorState(input: {
   onSubmitRef: MutableRefObject<() => void>;
   onCancelRef: MutableRefObject<() => void>;
   onUploadImageRef: MutableRefObject<((file: File) => Promise<RuntimePart>) | undefined>;
+  onUploadDocumentRef: MutableRefObject<((file: File) => Promise<RuntimePart>) | undefined>;
+  onUploadErrorRef: MutableRefObject<((message: string | null) => void) | undefined>;
   imageInputRef: MutableRefObject<HTMLInputElement | null>;
+  documentInputRef: MutableRefObject<HTMLInputElement | null>;
   pendingReplacementRangeRef: MutableRefObject<ReplacementRange | undefined>;
+  uploadTasksRef: MutableRefObject<UploadTaskRegistry>;
 }) {
   const doc = partsToDoc(input.parts);
 
-  // 一个消息编辑器里同时混有普通文本和媒体 atom。
-  // 文本走 ProseMirror 默认编辑能力，媒体通过自定义插件处理上传、删除、选择和方向键导航。
+  // 一个消息编辑器里同时混有普通文本和 resource atom。
+  // 文本走 ProseMirror 默认编辑能力，resource 通过自定义插件处理上传、删除、选择和方向键导航。
   return EditorState.create({
     schema: partSchema,
     doc,
     selection: TextSelection.atEnd(doc),
     plugins: [
       history(),
+      createUploadTaskReconciliationPlugin(input.uploadTasksRef),
       keymap({
         Enter: () => {
           input.onSubmitRef.current();
@@ -212,9 +295,13 @@ function createEditorState(input: {
         color: "#247a73",
         width: 2
       }),
-      createImageUploadEntryPlugin({
-        onImageFile: (view, file) => {
-          void uploadAndInsertImage(file, { current: view }, input.onUploadImageRef);
+      createAttachmentUploadEntryPlugin({
+        onAttachmentFile: (view, file) => {
+          void uploadAndInsertAttachment(file, { current: view }, {
+            onUploadImageRef: input.onUploadImageRef,
+            onUploadDocumentRef: input.onUploadDocumentRef,
+            onUploadErrorRef: input.onUploadErrorRef
+          }, input.uploadTasksRef.current);
         }
       }),
       createPlainTextPastePlugin(),
@@ -222,7 +309,7 @@ function createEditorState(input: {
         props: {
           handleDOMEvents: {
             mousedown(view, event) {
-              const removeButton = closestMediaRemoveButtonElement(event.target);
+              const removeButton = closestResourceRemoveButtonElement(event.target);
 
               if (removeButton) {
                 event.preventDefault();
@@ -243,15 +330,15 @@ function createEditorState(input: {
               return false;
             },
             click(view, event) {
-              const removeButton = closestMediaRemoveButtonElement(event.target);
+              const removeButton = closestResourceRemoveButtonElement(event.target);
 
               if (removeButton) {
                 event.preventDefault();
-                deleteMediaPartFromRemoveButton(view, removeButton);
+                deleteResourcePartFromRemoveButton(view, removeButton);
                 return true;
               }
 
-              const target = closestMediaPartElement(event.target);
+              const target = closestResourcePartElement(event.target);
 
               if (!(target instanceof HTMLElement)) {
                 if (event.target === view.dom) {
@@ -261,11 +348,11 @@ function createEditorState(input: {
                 return false;
               }
 
-              const replacementRange = findMediaReplacementRange(view, target);
+              const replacementRange = findResourceReplacementRange(view, target);
               input.pendingReplacementRangeRef.current = replacementRange;
-              clearMediaClickSelection(view, replacementRange);
+              clearResourceClickSelection(view, replacementRange);
 
-              if (isVideoMediaElement(target)) {
+              if (!isImageResourceElement(target)) {
                 event.preventDefault();
                 return true;
               }
@@ -277,43 +364,126 @@ function createEditorState(input: {
           }
         }
       }),
-      createInlineBoundaryCaretPlugin({ beforeNodeNames: ["media_part"] }),
-      createInlineAtomSelectionHighlightPlugin({ nodeNames: ["media_part"] }),
+      createInlineBoundaryCaretPlugin({ beforeNodeNames: ["resource_part"] }),
+      createInlineAtomSelectionHighlightPlugin({ nodeNames: ["resource_part"] }),
       createClearSelectionOnOutsidePointerPlugin(),
       createDropSelectionPlugin(),
-      createAtomicMediaDeletePlugin({ nodeNames: ["media_part"] }),
-      createInlineAtomArrowNavigationPlugin({ nodeNames: ["media_part"] }),
+      createAtomicResourceDeletePlugin({ nodeNames: ["resource_part"] }),
+      createInlineAtomArrowNavigationPlugin({ nodeNames: ["resource_part"] }),
       keymap(baseKeymap)
     ]
   });
 }
 
-async function uploadAndInsertImage(
+async function uploadAndInsertAttachment(
   file: File,
   viewRef: MutableRefObject<EditorView | null>,
-  onUploadImageRef: MutableRefObject<((file: File) => Promise<RuntimePart>) | undefined>,
+  uploadRefs: {
+    onUploadImageRef: MutableRefObject<((file: File) => Promise<RuntimePart>) | undefined>;
+    onUploadDocumentRef: MutableRefObject<((file: File) => Promise<RuntimePart>) | undefined>;
+    onUploadErrorRef: MutableRefObject<((message: string | null) => void) | undefined>;
+  },
+  uploadTasks: UploadTaskRegistry,
+  expectedKind?: AttachmentUploadKind,
   replacementRange?: ReplacementRange
 ) {
   const view = viewRef.current;
-  const onUploadImage = onUploadImageRef.current;
 
-  if (!view || !onUploadImage || !file.type.startsWith("image/")) {
+  if (!view) {
     return;
   }
 
-  const part = await onUploadImage(file);
-  if (part.type !== "media") {
+  const validationMessage = getAttachmentValidationMessage(file, expectedKind);
+
+  if (validationMessage) {
+    uploadRefs.onUploadErrorRef.current?.(validationMessage);
     return;
   }
 
-  // 点击已有图片会记录 replacementRange，此时上传完成后替换旧媒体；
-  // 直接粘贴/拖拽/选择文件则插入到当前光标位置。
-  const node = partSchema.nodes.media_part.create({
-    mime: part.mime ?? "",
-    url: part.url ?? "",
-    name: part.name ?? "",
-    size: part.size ?? null
+  const kind = getAttachmentUploadKind(file);
+  const onUpload = kind === "image" ? uploadRefs.onUploadImageRef.current : uploadRefs.onUploadDocumentRef.current;
+
+  if (!onUpload) {
+    return;
+  }
+
+  const uploadId = createUploadId();
+  const previousNode = replacementRange ? view.state.doc.nodeAt(replacementRange.from) ?? undefined : undefined;
+  uploadTasks.set(uploadId, { status: "pending", previousNode });
+  insertUploadingResourceNode(view, createUploadingPart(file, kind, uploadId), replacementRange);
+
+  let part: RuntimePart;
+  try {
+    uploadRefs.onUploadErrorRef.current?.(null);
+    part = await onUpload(file);
+  } catch (error) {
+    uploadTasks.set(uploadId, { status: "failed", previousNode });
+    restoreOrRemoveUploadingResourceNode(view, uploadId, previousNode);
+    uploadRefs.onUploadErrorRef.current?.(formatUploadError(error));
+    return;
+  }
+
+  if (part.type !== "resource") {
+    uploadTasks.set(uploadId, { status: "failed", previousNode });
+    restoreOrRemoveUploadingResourceNode(view, uploadId, previousNode);
+    return;
+  }
+
+  const completedPart = stripUploadRuntimeFields(part);
+  uploadTasks.set(uploadId, { status: "completed", part: completedPart, previousNode });
+  const node = createResourceNode(completedPart);
+  replaceUploadingResourceNode(view, uploadId, node);
+}
+
+function createUploadTaskReconciliationPlugin(uploadTasksRef: MutableRefObject<UploadTaskRegistry>) {
+  return new Plugin({
+    appendTransaction(_transactions, _oldState, newState) {
+      const replacements: Array<{ from: number; to: number; node?: ProseMirrorNode }> = [];
+
+      newState.doc.descendants((node, position) => {
+        if (node.type.name !== "resource_part" || node.attrs.uploading !== true) {
+          return true;
+        }
+
+        const uploadId = typeof node.attrs.uploadId === "string" ? node.attrs.uploadId : "";
+        const uploadTask = uploadId ? uploadTasksRef.current.get(uploadId) : undefined;
+
+        if (!uploadTask || uploadTask.status === "pending") {
+          return true;
+        }
+
+        replacements.push({
+          from: position,
+          to: position + node.nodeSize,
+          node: uploadTask.status === "completed" ? createResourceNode(uploadTask.part) : uploadTask.previousNode
+        });
+        return true;
+      });
+
+      if (!replacements.length) {
+        return null;
+      }
+
+      let transaction = newState.tr;
+      for (const replacement of replacements.reverse()) {
+        transaction = replacement.node
+          ? transaction.replaceWith(replacement.from, replacement.to, replacement.node)
+          : transaction.delete(replacement.from, replacement.to);
+      }
+
+      return transaction
+        .setMeta("addToHistory", false)
+        .setMeta("actionType", "resource.upload.reconcile");
+    }
   });
+}
+
+function insertUploadingResourceNode(
+  view: EditorView,
+  part: RuntimeResourcePart,
+  replacementRange?: ReplacementRange
+) {
+  const node = createResourceNode(part);
   const transaction = replacementRange
     ? view.state.tr.replaceWith(replacementRange.from, replacementRange.to, node)
     : view.state.tr.replaceSelectionWith(node);
@@ -323,42 +493,169 @@ async function uploadAndInsertImage(
   view.focus();
 }
 
-function closestMediaPartElement(target: EventTarget | null): HTMLElement | null {
-  if (target instanceof Element) {
-    return target.closest(".pm-part--media") as HTMLElement | null;
-  }
+function replaceUploadingResourceNode(view: EditorView, uploadId: string, node: ReturnType<typeof createResourceNode>) {
+  const found = findUploadingResourceNode(view, uploadId);
 
-  if (target instanceof Text) {
-    return target.parentElement?.closest(".pm-part--media") as HTMLElement | null;
-  }
-
-  return null;
-}
-
-function isVideoMediaElement(element: HTMLElement) {
-  return element.dataset.mime?.startsWith("video/") ?? false;
-}
-
-function closestMediaRemoveButtonElement(target: EventTarget | null): HTMLElement | null {
-  if (target instanceof Element) {
-    return target.closest(".pm-part-media-remove") as HTMLElement | null;
-  }
-
-  if (target instanceof Text) {
-    return target.parentElement?.closest(".pm-part-media-remove") as HTMLElement | null;
-  }
-
-  return null;
-}
-
-function deleteMediaPartFromRemoveButton(view: EditorView, button: HTMLElement) {
-  const mediaElement = button.closest(".pm-part--media");
-
-  if (!(mediaElement instanceof HTMLElement)) {
+  if (!found) {
     return;
   }
 
-  const range = findMediaReplacementRange(view, mediaElement);
+  view.dispatch(
+    view.state.tr
+      .replaceWith(found.position, found.position + found.node.nodeSize, node)
+      .setMeta("addToHistory", false)
+      .setMeta("actionType", "resource.upload.completed")
+      .scrollIntoView()
+  );
+  updateEmptyClass(view);
+  view.focus();
+}
+
+function restoreOrRemoveUploadingResourceNode(view: EditorView, uploadId: string, previousNode?: ReturnType<typeof createResourceNode>) {
+  const found = findUploadingResourceNode(view, uploadId);
+
+  if (!found) {
+    return;
+  }
+
+  const transaction = previousNode
+    ? view.state.tr.replaceWith(found.position, found.position + found.node.nodeSize, previousNode)
+    : view.state.tr.delete(found.position, found.position + found.node.nodeSize);
+  view.dispatch(
+    transaction
+      .setMeta("addToHistory", false)
+      .setMeta("actionType", "resource.upload.failed")
+      .scrollIntoView()
+  );
+  updateEmptyClass(view);
+  view.focus();
+}
+
+function findUploadingResourceNode(view: EditorView, uploadId: string) {
+  let found: { position: number; node: ReturnType<typeof createResourceNode> } | undefined;
+
+  view.state.doc.descendants((node, position) => {
+    if (found || node.type.name !== "resource_part") {
+      return !found;
+    }
+
+    if (node.attrs.uploadId === uploadId) {
+      found = { position, node };
+      return false;
+    }
+
+    return true;
+  });
+
+  return found;
+}
+
+function createUploadingPart(file: File, kind: AttachmentUploadKind | undefined, uploadId: string): RuntimeResourcePart {
+  return {
+    type: "resource",
+    mime: getUploadingPartMime(file, kind),
+    name: file.name || "附件",
+    size: file.size,
+    $uploading: true,
+    $uploadId: uploadId
+  };
+}
+
+function getUploadingPartMime(file: File, kind: AttachmentUploadKind | undefined) {
+  if (file.type.trim()) {
+    return file.type;
+  }
+
+  if (kind === "image") {
+    return "image/*";
+  }
+
+  const lowerName = file.name.toLowerCase();
+
+  if (lowerName.endsWith(".md") || lowerName.endsWith(".markdown")) {
+    return "text/markdown";
+  }
+
+  if (lowerName.endsWith(".txt")) {
+    return "text/plain";
+  }
+
+  if (lowerName.endsWith(".docx")) {
+    return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  }
+
+  if (lowerName.endsWith(".doc")) {
+    return "application/msword";
+  }
+
+  return "application/octet-stream";
+}
+
+function createUploadId() {
+  uploadSequence += 1;
+  return `upload_${Date.now()}_${uploadSequence}`;
+}
+
+function stripUploadRuntimeFields(part: RuntimeResourcePart): RuntimeResourcePart {
+  const { $uploading: _uploading, $uploadId: _uploadId, ...stablePart } = part;
+  return stablePart as RuntimeResourcePart;
+}
+
+function createResourceNode(part: RuntimeResourcePart) {
+  const runtimePart = part as RuntimeResourcePart;
+  return partSchema.nodes.resource_part.create({
+    mime: part.mime ?? "",
+    url: part.url ?? "",
+    name: part.name ?? "",
+    size: part.size ?? null,
+    width: part.width ?? null,
+    height: part.height ?? null,
+    extra: part.extra ?? null,
+    uploading: runtimePart.$uploading === true,
+    uploadId: typeof runtimePart.$uploadId === "string" ? runtimePart.$uploadId : null
+  });
+}
+
+function formatUploadError(error: unknown): string {
+  return error instanceof Error ? error.message : "附件上传失败";
+}
+
+function closestResourcePartElement(target: EventTarget | null): HTMLElement | null {
+  if (target instanceof Element) {
+    return target.closest(".pm-part--resource") as HTMLElement | null;
+  }
+
+  if (target instanceof Text) {
+    return target.parentElement?.closest(".pm-part--resource") as HTMLElement | null;
+  }
+
+  return null;
+}
+
+function isImageResourceElement(element: HTMLElement) {
+  return element.dataset.mime?.startsWith("image/") ?? false;
+}
+
+function closestResourceRemoveButtonElement(target: EventTarget | null): HTMLElement | null {
+  if (target instanceof Element) {
+    return target.closest(".pm-part-resource-remove") as HTMLElement | null;
+  }
+
+  if (target instanceof Text) {
+    return target.parentElement?.closest(".pm-part-resource-remove") as HTMLElement | null;
+  }
+
+  return null;
+}
+
+function deleteResourcePartFromRemoveButton(view: EditorView, button: HTMLElement) {
+  const resourceElement = button.closest(".pm-part--resource");
+
+  if (!(resourceElement instanceof HTMLElement)) {
+    return;
+  }
+
+  const range = findResourceReplacementRange(view, resourceElement);
 
   if (!range) {
     return;
@@ -379,15 +676,15 @@ function moveSelectionToEndWhenAtDocumentStart(view: EditorView) {
   view.dispatch(view.state.tr.setSelection(TextSelection.atEnd(view.state.doc)));
 }
 
-function findMediaReplacementRange(view: EditorView, element: HTMLElement): ReplacementRange | undefined {
+function findResourceReplacementRange(view: EditorView, element: HTMLElement): ReplacementRange | undefined {
   // ProseMirror 的 posAtDOM 对 atom 节点有时会落在节点前后边界。
-  // 同时检查当前位置和前一位，能稳定找到 media_part 的真实范围。
+  // 同时检查当前位置和前一位，能稳定找到 resource_part 的真实范围。
   const candidatePositions = [view.posAtDOM(element, 0), Math.max(0, view.posAtDOM(element, 0) - 1)];
 
   for (const from of candidatePositions) {
     const node = view.state.doc.nodeAt(from);
 
-    if (node?.type.name === "media_part") {
+    if (node?.type.name === "resource_part") {
       return { from, to: from + node.nodeSize };
     }
   }
@@ -395,7 +692,7 @@ function findMediaReplacementRange(view: EditorView, element: HTMLElement): Repl
   return undefined;
 }
 
-function clearMediaClickSelection(view: EditorView, replacementRange?: ReplacementRange) {
+function clearResourceClickSelection(view: EditorView, replacementRange?: ReplacementRange) {
   if (!replacementRange) {
     return;
   }
@@ -411,7 +708,7 @@ function clearMediaClickSelection(view: EditorView, replacementRange?: Replaceme
     view.state.tr
       .setSelection(selection)
       .setMeta("addToHistory", false)
-      .setMeta("actionType", "media.click.clear-selection")
+      .setMeta("actionType", "resource.click.clear-selection")
   );
 }
 

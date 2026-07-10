@@ -11,7 +11,7 @@ const stylesPath = join(process.cwd(), "src/styles.css");
 function createParts() {
   return [
     { type: "text" as const, value: "看这个 " },
-    { type: "media" as const, mime: "image/png", url: "https://example.com/image.png", name: "image.png" },
+    { type: "resource" as const, mime: "image/png", url: "https://example.com/image.png", name: "image.png" },
     { type: "text" as const, value: " 继续" }
   ];
 }
@@ -21,55 +21,55 @@ afterEach(() => {
 });
 
 describe("UserPartSurface", () => {
-  it("readonly media part 点击后不会聚焦编辑器或进入 ProseMirror 选中态", async () => {
+  it("readonly resource part 点击后不会聚焦编辑器或进入 ProseMirror 选中态", async () => {
     const { container } = render(
       <UserPartSurface
         parts={[
           { type: "text", value: "看这个 " },
-          { type: "media", mime: "image/png", url: "https://example.com/image.png", name: "image.png" }
+          { type: "resource", mime: "image/png", url: "https://example.com/image.png", name: "image.png" }
         ]}
       />
     );
 
     const editor = container.querySelector(".user-part-surface-editor");
-    const mediaPart = screen.getByText("image.png").closest(".pm-part--media");
+    const resourcePart = screen.getByText("image.png").closest(".pm-part--resource");
     expect(editor).toBeInstanceOf(HTMLElement);
-    expect(mediaPart).toBeInstanceOf(HTMLElement);
+    expect(resourcePart).toBeInstanceOf(HTMLElement);
 
-    await userEvent.click(mediaPart as HTMLElement);
+    await userEvent.click(resourcePart as HTMLElement);
 
     expect(editor).not.toHaveFocus();
-    expect(mediaPart).not.toHaveClass("ProseMirror-selectednode");
-    expect(mediaPart).not.toHaveClass("is-range-selected");
+    expect(resourcePart).not.toHaveClass("ProseMirror-selectednode");
+    expect(resourcePart).not.toHaveClass("is-range-selected");
   });
 
-  it("readonly media part 不暴露可替换图片的交互提示和 pointer cursor", () => {
+  it("readonly resource part 不暴露可替换图片的交互提示和 pointer cursor", () => {
     render(
       <UserPartSurface
         parts={[
           { type: "text", value: "看这个 " },
-          { type: "media", mime: "image/png", url: "https://example.com/image.png", name: "image.png" }
+          { type: "resource", mime: "image/png", url: "https://example.com/image.png", name: "image.png" }
         ]}
       />
     );
     const styles = readFileSync(stylesPath, "utf8");
-    const mediaPart = screen.getByText("image.png").closest(".pm-part--media");
+    const resourcePart = screen.getByText("image.png").closest(".pm-part--resource");
 
-    expect(mediaPart).not.toHaveAttribute("title", "点击替换图片");
-    expect(styles).toMatch(/\.user-part-surface-editor\s+\.pm-part--media,\s*\.user-part-surface-editor\s+\.pm-part--media:hover\s*{[^}]*cursor:\s*default;/s);
+    expect(resourcePart).not.toHaveAttribute("title", "点击替换图片");
+    expect(styles).toMatch(/\.user-part-surface-editor\s+\.pm-part--resource,\s*\.user-part-surface-editor\s+\.pm-part--resource:hover\s*{[^}]*cursor:\s*default;/s);
   });
 
-  it("拖选经过 readonly media part 后不会被后续 click 事件清掉", () => {
+  it("拖选经过 readonly resource part 后不会被后续 click 事件清掉", () => {
     const { container } = render(<UserPartSurface parts={createParts()} />);
     const editor = container.querySelector(".user-part-surface-editor");
     const textParts = editor?.querySelectorAll("[data-user-part-kind='text']");
     const firstTextNode = textParts?.[0]?.firstChild;
-    const mediaPart = screen.getByText("image.png").closest(".pm-part--media");
+    const resourcePart = screen.getByText("image.png").closest(".pm-part--resource");
     const lastTextNode = textParts?.[1]?.firstChild;
 
     expect(editor).toBeInstanceOf(HTMLElement);
     expect(firstTextNode).toBeInstanceOf(Text);
-    expect(mediaPart).toBeInstanceOf(HTMLElement);
+    expect(resourcePart).toBeInstanceOf(HTMLElement);
     expect(lastTextNode).toBeInstanceOf(Text);
 
     const firstText = firstTextNode as Text;
@@ -83,12 +83,12 @@ describe("UserPartSurface", () => {
     fireEvent(document, new Event("selectionchange"));
 
     expect(selection?.isCollapsed).toBe(false);
-    expect(mediaPart).toHaveClass("is-range-selected");
+    expect(resourcePart).toHaveClass("is-range-selected");
 
-    fireEvent.click(mediaPart as HTMLElement);
+    fireEvent.click(resourcePart as HTMLElement);
 
     expect(document.getSelection()?.isCollapsed).toBe(false);
-    expect(mediaPart).toHaveClass("is-range-selected");
+    expect(resourcePart).toHaveClass("is-range-selected");
   });
 
   it("用户气泡不使用 ProseMirror 接管原生框选", () => {
@@ -97,17 +97,17 @@ describe("UserPartSurface", () => {
     expect(container.querySelector(".ProseMirror")).toBeNull();
   });
 
-  it("从用户气泡原生 DOM 选区提取 text 和 media parts", () => {
+  it("从用户气泡原生 DOM 选区提取 text 和 resource parts", () => {
     const surfaceRef = createRef<UserPartSurfaceHandle>();
     const { container } = render(<UserPartSurface ref={surfaceRef} parts={createParts()} />);
     const editor = container.querySelector(".user-part-surface-editor");
     const textParts = editor?.querySelectorAll("[data-user-part-kind='text']");
     const firstTextNode = textParts?.[0]?.firstChild;
-    const mediaPart = screen.getByText("image.png").closest(".pm-part--media");
+    const resourcePart = screen.getByText("image.png").closest(".pm-part--resource");
     const lastTextNode = textParts?.[1]?.firstChild;
 
     expect(firstTextNode).toBeInstanceOf(Text);
-    expect(mediaPart).toBeInstanceOf(HTMLElement);
+    expect(resourcePart).toBeInstanceOf(HTMLElement);
     expect(lastTextNode).toBeInstanceOf(Text);
 
     const range = document.createRange();
@@ -120,17 +120,17 @@ describe("UserPartSurface", () => {
 
     expect(surfaceRef.current?.getSelectedParts()).toEqual([
       { type: "text", value: "这个 " },
-      { type: "media", mime: "image/png", url: "https://example.com/image.png", name: "image.png" },
+      { type: "resource", mime: "image/png", url: "https://example.com/image.png", name: "image.png" },
       { type: "text", value: " 继" }
     ]);
   });
 
-  it("复制用户气泡选区时不会把 media 文件名写进 plain text", () => {
+  it("复制用户气泡选区时不会把 resource 文件名写进 plain text", () => {
     const { container } = render(<UserPartSurface parts={createParts()} />);
     const editor = container.querySelector(".user-part-surface-editor");
     const textParts = editor?.querySelectorAll("[data-user-part-kind='text']");
     const firstTextNode = textParts?.[0]?.firstChild;
-    const mediaPart = screen.getByText("image.png").closest(".pm-part--media");
+    const resourcePart = screen.getByText("image.png").closest(".pm-part--resource");
     const lastTextNode = textParts?.[1]?.firstChild;
     const clipboardValues = new Map<string, string>();
     const clipboardData = {
@@ -141,7 +141,7 @@ describe("UserPartSurface", () => {
 
     expect(editor).toBeInstanceOf(HTMLElement);
     expect(firstTextNode).toBeInstanceOf(Text);
-    expect(mediaPart).toBeInstanceOf(HTMLElement);
+    expect(resourcePart).toBeInstanceOf(HTMLElement);
     expect(lastTextNode).toBeInstanceOf(Text);
 
     const firstText = firstTextNode as Text;
@@ -157,6 +157,6 @@ describe("UserPartSurface", () => {
 
     expect(clipboardValues.get("text/plain")).toBe("看这个  继续");
     expect(clipboardValues.get("text/plain")).not.toContain("image.png");
-    expect(clipboardValues.get("application/x-agent-message-parts")).toContain("\"type\":\"media\"");
+    expect(clipboardValues.get("application/x-agent-message-parts")).toContain("\"type\":\"resource\"");
   });
 });

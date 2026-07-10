@@ -1,5 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { extname } from "node:path";
+import type { Readable } from "node:stream";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { trace, SpanStatusCode } from "@opentelemetry/api";
 import { AppError } from "../errors/app-error.js";
@@ -10,12 +11,27 @@ import {
 } from "../observability/agent-observability.js";
 import { getS3Bucket, getS3Client, getS3ObjectUrl } from "../storage/s3-client.js";
 
-export type ToolResourceType = "image" | "video";
+export type ToolResourceType = "image" | "video" | "document";
 
 export interface StoreRemoteToolResourceInput {
   url: string;
   type: ToolResourceType;
   mime?: string;
+}
+
+export interface StoreGeneratedToolResourceInput {
+  bytes: Buffer | Uint8Array | ArrayBuffer | string;
+  type: ToolResourceType;
+  mime?: string;
+  fileName?: string;
+}
+
+export interface StoreGeneratedToolResourceStreamInput {
+  stream: Readable;
+  size: number;
+  type: ToolResourceType;
+  mime?: string;
+  fileName?: string;
 }
 
 export interface StoredToolResource {
@@ -28,6 +44,8 @@ export interface StoredToolResource {
 
 export interface ToolResourceStorage {
   storeRemoteResource(input: StoreRemoteToolResourceInput): Promise<StoredToolResource>;
+  storeGeneratedResource?(input: StoreGeneratedToolResourceInput): Promise<StoredToolResource>;
+  storeGeneratedResourceStream?(input: StoreGeneratedToolResourceStreamInput): Promise<StoredToolResource>;
 }
 
 export class PassthroughToolResourceStorage implements ToolResourceStorage {
@@ -39,6 +57,30 @@ export class PassthroughToolResourceStorage implements ToolResourceStorage {
       size: 0,
       relativePath: ""
     };
+  }
+
+  async storeGeneratedResource(input: StoreGeneratedToolResourceInput): Promise<StoredToolResource> {
+    const buffer = toBuffer(input.bytes);
+    const mime = normalizeMime(input.mime) ?? getDefaultMime(input.type);
+    const name = normalizeGeneratedFileName(input.fileName, getExtension(mime));
+
+    return {
+      url: `data:${mime};base64,${buffer.toString("base64")}`,
+      mime,
+      name,
+      size: buffer.length,
+      relativePath: ""
+    };
+  }
+
+  async storeGeneratedResourceStream(input: StoreGeneratedToolResourceStreamInput): Promise<StoredToolResource> {
+    const buffer = await readReadableStream(input.stream);
+    return this.storeGeneratedResource({
+      bytes: buffer,
+      type: input.type,
+      mime: input.mime,
+      fileName: input.fileName
+    });
   }
 }
 
@@ -65,7 +107,11 @@ const mimeExtensions: Record<string, string> = {
   "image/svg+xml": ".svg",
   "video/mp4": ".mp4",
   "video/webm": ".webm",
-  "video/quicktime": ".mov"
+  "video/quicktime": ".mov",
+  "text/plain": ".txt",
+  "text/markdown": ".md",
+  "application/markdown": ".md",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx"
 };
 
 export class S3ToolResourceStorage implements ToolResourceStorage {
@@ -119,17 +165,9 @@ export class S3ToolResourceStorage implements ToolResourceStorage {
         const extension = getExtension(mime, parsedUrl);
         const contentHash = createHash("md5").update(buffer).digest("hex");
         const fileName = `${contentHash}${extension}`;
-        const s3Key = `resources/${input.type}s/${fileName}`;
+        const s3Key = this.buildResourceKey(input.type, fileName);
 
-        // S3 putObject 对相同 key 是幂等覆盖，不需要本地文件系统的 "wx" 去重逻辑。
-        await this.getS3Client().send(
-          new PutObjectCommand({
-            Bucket: this.getS3Bucket(),
-            Key: s3Key,
-            Body: buffer,
-            ContentType: mime
-          })
-        );
+        await this.putBuffer(s3Key, buffer, mime);
 
         this.observability.recordResourceTransfer({
           resourceType: input.type,
@@ -148,6 +186,132 @@ export class S3ToolResourceStorage implements ToolResourceStorage {
           mime,
           name: fileName,
           size: buffer.length,
+          relativePath: s3Key
+        };
+      } catch (error) {
+        const errorCode = toObservationErrorCode(error, "TOOL_EXECUTION_ERROR");
+        this.observability.recordResourceTransfer({
+          resourceType: input.type,
+          mime,
+          status: "failed",
+          durationMs: this.durationSince(startedAt),
+          bytes,
+          errorCode
+        });
+        span.recordException(error as Error);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: error instanceof Error ? error.message : errorCode });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
+  }
+
+  async storeGeneratedResource(input: StoreGeneratedToolResourceInput): Promise<StoredToolResource> {
+    const startedAt = Date.now();
+    const mime = normalizeMime(input.mime) ?? getDefaultMime(input.type);
+    let bytes: number | undefined;
+
+    return tracer.startActiveSpan(`resource.store.${input.type}`, async (span) => {
+      span.setAttributes({
+        "resource.type": input.type,
+        "resource.mime": mime
+      });
+
+      try {
+        const buffer = toBuffer(input.bytes);
+        bytes = buffer.length;
+
+        if (bytes > this.maxBytes) {
+          throw new AppError("VALIDATION_ERROR", `工具资源超过最大转储限制 ${this.maxBytes} 字节`, 413);
+        }
+
+        const extension = getExtension(mime, undefined, input.fileName);
+        const contentHash = createHash("md5").update(buffer).digest("hex");
+        const objectName = `${contentHash}${extension}`;
+        const s3Key = this.buildResourceKey(input.type, objectName);
+        const name = normalizeGeneratedFileName(input.fileName, extension);
+
+        await this.putBuffer(s3Key, buffer, mime, name);
+
+        this.observability.recordResourceTransfer({
+          resourceType: input.type,
+          mime,
+          status: "succeeded",
+          durationMs: this.durationSince(startedAt),
+          bytes
+        });
+        span.setAttributes({
+          "resource.bytes": bytes,
+          "resource.duration_ms": this.durationSince(startedAt)
+        });
+
+        return {
+          url: this.getS3ObjectUrl(s3Key),
+          mime,
+          name,
+          size: buffer.length,
+          relativePath: s3Key
+        };
+      } catch (error) {
+        const errorCode = toObservationErrorCode(error, "TOOL_EXECUTION_ERROR");
+        this.observability.recordResourceTransfer({
+          resourceType: input.type,
+          mime,
+          status: "failed",
+          durationMs: this.durationSince(startedAt),
+          bytes,
+          errorCode
+        });
+        span.recordException(error as Error);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: error instanceof Error ? error.message : errorCode });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
+  }
+
+  async storeGeneratedResourceStream(input: StoreGeneratedToolResourceStreamInput): Promise<StoredToolResource> {
+    const startedAt = Date.now();
+    const mime = normalizeMime(input.mime) ?? getDefaultMime(input.type);
+    let bytes: number | undefined = input.size;
+
+    return tracer.startActiveSpan(`resource.store.${input.type}`, async (span) => {
+      span.setAttributes({
+        "resource.type": input.type,
+        "resource.mime": mime
+      });
+
+      try {
+        if (input.size > this.maxBytes) {
+          throw new AppError("VALIDATION_ERROR", `工具资源超过最大转储限制 ${this.maxBytes} 字节`, 413);
+        }
+
+        const extension = getExtension(mime, undefined, input.fileName);
+        const objectName = `${randomUUID()}${extension}`;
+        const s3Key = this.buildResourceKey(input.type, objectName);
+        const name = normalizeGeneratedFileName(input.fileName, extension);
+
+        await this.putStream(s3Key, input.stream, mime, input.size, name);
+
+        this.observability.recordResourceTransfer({
+          resourceType: input.type,
+          mime,
+          status: "succeeded",
+          durationMs: this.durationSince(startedAt),
+          bytes
+        });
+        span.setAttributes({
+          "resource.bytes": input.size,
+          "resource.duration_ms": this.durationSince(startedAt)
+        });
+
+        return {
+          url: this.getS3ObjectUrl(s3Key),
+          mime,
+          name,
+          size: input.size,
           relativePath: s3Key
         };
       } catch (error) {
@@ -197,6 +361,36 @@ export class S3ToolResourceStorage implements ToolResourceStorage {
     return this.options.objectUrlFactory?.(key) ?? getS3ObjectUrl(key);
   }
 
+  private buildResourceKey(type: ToolResourceType, fileName: string) {
+    return `resources/${type}s/${fileName}`;
+  }
+
+  private async putBuffer(s3Key: string, buffer: Buffer, mime: string, fileName?: string) {
+    // S3 putObject 对相同 key 是幂等覆盖，不需要本地文件系统的 "wx" 去重逻辑。
+    await this.getS3Client().send(
+      new PutObjectCommand({
+        Bucket: this.getS3Bucket(),
+        Key: s3Key,
+        Body: buffer,
+        ContentType: mime,
+        ContentDisposition: fileName ? buildContentDisposition(fileName) : undefined
+      })
+    );
+  }
+
+  private async putStream(s3Key: string, stream: Readable, mime: string, size: number, fileName?: string) {
+    await this.getS3Client().send(
+      new PutObjectCommand({
+        Bucket: this.getS3Bucket(),
+        Key: s3Key,
+        Body: stream,
+        ContentType: mime,
+        ContentLength: size,
+        ContentDisposition: fileName ? buildContentDisposition(fileName) : undefined
+      })
+    );
+  }
+
   private durationSince(startedAt: number) {
     return Math.max(0, Date.now() - startedAt);
   }
@@ -237,17 +431,31 @@ function normalizeMime(value?: string | null): string | undefined {
 }
 
 function getDefaultMime(type: ToolResourceType): string {
-  return type === "video" ? "video/mp4" : "image/png";
+  if (type === "video") {
+    return "video/mp4";
+  }
+
+  if (type === "document") {
+    return "application/octet-stream";
+  }
+
+  return "image/png";
 }
 
-function getExtension(mime: string, url: URL): string {
+function getExtension(mime: string, url?: URL, fileName?: string): string {
   const extensionFromMime = mimeExtensions[mime];
 
   if (extensionFromMime) {
     return extensionFromMime;
   }
 
-  const extensionFromUrl = extname(url.pathname);
+  const extensionFromName = fileName ? extname(fileName) : "";
+
+  if (extensionFromName) {
+    return extensionFromName;
+  }
+
+  const extensionFromUrl = url ? extname(url.pathname) : "";
 
   return extensionFromUrl || ".bin";
 }
@@ -262,3 +470,40 @@ function getFileNameFromUrl(url: string): string | undefined {
   }
 }
 
+function toBuffer(bytes: StoreGeneratedToolResourceInput["bytes"]): Buffer {
+  if (typeof bytes === "string") {
+    return Buffer.from(bytes, "utf8");
+  }
+
+  if (bytes instanceof ArrayBuffer) {
+    return Buffer.from(bytes);
+  }
+
+  return Buffer.from(bytes);
+}
+
+async function readReadableStream(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  return Buffer.concat(chunks);
+}
+
+function normalizeGeneratedFileName(fileName: string | undefined, extension: string): string {
+  const fallback = `generated-document${extension}`;
+  const rawName = fileName?.trim() || fallback;
+  const pathlessName = rawName.replace(/\\/g, "/").split("/").filter(Boolean).at(-1) ?? fallback;
+  const withoutUnsafeCharacters = pathlessName.replace(/[:*?"<>|]/g, "-").trim();
+  const name = withoutUnsafeCharacters || fallback;
+  const currentExtension = extname(name);
+  const stem = currentExtension ? name.slice(0, -currentExtension.length) : name;
+
+  return `${stem || "generated-document"}${extension}`;
+}
+
+function buildContentDisposition(fileName: string): string {
+  return `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`;
+}

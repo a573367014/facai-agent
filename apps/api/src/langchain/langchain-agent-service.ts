@@ -34,12 +34,12 @@ import { toBindingsTools } from "./tools-bridge.js";
 
 const tracer = trace.getTracer("langchain-agent-service");
 
-const MEDIA_SUMMARY_TOOL_NAMES = new Set(["generate_image", "edit_image", "generate_video"]);
-const MEDIA_FAILURE_SUMMARY_INSTRUCTION = [
-  "请基于上面的媒体生成工具结果给出最终回复。",
+const RESOURCE_SUMMARY_TOOL_NAMES = new Set(["generate_image", "edit_image", "generate_video", "generate_document"]);
+const RESOURCE_FAILURE_SUMMARY_INSTRUCTION = [
+  "请基于上面的资源生成工具结果给出最终回复。",
   "回复必须简短直接，最多 2 句；不要表格、不要标题、不要分点或长篇原因分析。",
   "只说明成功/失败数量和最关键失败原因；必要时用一句话提示调整提示词或稍后重试。",
-  "不要再次调用工具，不要自动重试，不要输出图片链接、下载链接、任务 ID 或 base64 内容。"
+  "不要再次调用工具，不要自动重试，不要输出资源链接、下载链接、任务 ID 或 base64 内容。"
 ].join("\n");
 
 const MAX_ITERATIONS_REACHED_PROMPT = [
@@ -84,8 +84,8 @@ function extractTextContent(content: unknown): string {
   return "";
 }
 
-function shouldSummarizeMediaFailure(toolName: string, data: unknown): boolean {
-  if (!MEDIA_SUMMARY_TOOL_NAMES.has(toolName) || typeof data !== "object" || data === null || Array.isArray(data)) {
+function shouldSummarizeResourceFailure(toolName: string, data: unknown): boolean {
+  if (!RESOURCE_SUMMARY_TOOL_NAMES.has(toolName) || typeof data !== "object" || data === null || Array.isArray(data)) {
     return false;
   }
   const record = data as Record<string, unknown>;
@@ -308,7 +308,7 @@ export class LangChainAgentService {
       const toolMessages: ToolMessage[] = [];
       let hasRecoverableError = false;
       let hasSuccess = false;
-      let shouldSummarizeMedia = false;
+      let shouldSummarizeResource = false;
 
       for (const toolCall of toolCalls) {
         await toolEvents.onToolStart(toolCall.id, toolCall.name, toolCall.args);
@@ -346,7 +346,7 @@ export class LangChainAgentService {
 
         hasSuccess = true;
         await toolEvents.onToolResult(toolCall.id, toolCall.name, execution.data, execution.durationMs, execution.llmContent);
-        shouldSummarizeMedia ||= shouldSummarizeMediaFailure(toolCall.name, execution.data);
+        shouldSummarizeResource ||= shouldSummarizeResourceFailure(toolCall.name, execution.data);
 
         toolMessages.push(
           new ToolMessage({
@@ -365,14 +365,14 @@ export class LangChainAgentService {
             : "工具结果已写回上下文";
       await emit({ type: "agent_state", iteration: currentIteration, state: "observing", label: observationLabel });
 
-      if (shouldSummarizeMedia) {
+      if (shouldSummarizeResource) {
         await emit({ type: "iteration_end", iteration: currentIteration, outcome: "tool_calls" });
-        return { messages: toolMessages, needsMediaSummary: true };
+        return { messages: toolMessages, needsResourceSummary: true };
       }
 
       await emit({ type: "iteration_end", iteration: currentIteration, outcome: "tool_calls" });
       currentIteration += 1;
-      return { messages: toolMessages, needsMediaSummary: false };
+      return { messages: toolMessages, needsResourceSummary: false };
     }
 
     function shouldContinue(state: AgentStateType): "tools" | typeof END {
@@ -385,15 +385,15 @@ export class LangChainAgentService {
       return "tools";
     }
 
-    async function summarizeMedia(state: AgentStateType, config: RunnableConfig): Promise<Partial<AgentStateType>> {
+    async function summarizeResource(state: AgentStateType, config: RunnableConfig): Promise<Partial<AgentStateType>> {
       const signal = config.signal as AbortSignal | undefined;
       const messagesWithInstruction = [
         ...state.messages,
-        new HumanMessage({ content: MEDIA_FAILURE_SUMMARY_INSTRUCTION })
+        new HumanMessage({ content: RESOURCE_FAILURE_SUMMARY_INSTRUCTION })
       ];
       const iteration = currentIteration;
       await emit({ type: "iteration_start", iteration });
-      await emit({ type: "agent_state", iteration, state: "thinking", label: "生成媒体总结" });
+      await emit({ type: "agent_state", iteration, state: "thinking", label: "生成资源总结" });
       await emit({ type: "llm_start", iteration });
 
       const contentParts: string[] = [];
@@ -423,19 +423,19 @@ export class LangChainAgentService {
     const graph = new StateGraph(AgentState)
       .addNode("agent", callModel)
       .addNode("tools", governedTools)
-      .addNode("summarize_media", summarizeMedia)
+      .addNode("summarize_resource", summarizeResource)
       .addEdge("__start__", "agent")
       .addConditionalEdges("agent", shouldContinue, {
         tools: "tools",
         [END]: END
       })
       .addConditionalEdges("tools", (state: AgentStateType) => {
-        return state.needsMediaSummary ? "summarize_media" : "agent";
+        return state.needsResourceSummary ? "summarize_resource" : "agent";
       }, {
         agent: "agent",
-        summarize_media: "summarize_media"
+        summarize_resource: "summarize_resource"
       })
-      .addEdge("summarize_media", END)
+      .addEdge("summarize_resource", END)
       .compile();
 
     const messages: BaseMessage[] = [
