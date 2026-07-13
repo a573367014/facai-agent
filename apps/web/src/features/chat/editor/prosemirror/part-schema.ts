@@ -63,7 +63,7 @@ export const partSchema = new Schema({
           "data-mime": String(node.attrs.mime ?? ""),
           "data-url": String(node.attrs.url ?? ""),
           "data-name": String(node.attrs.name ?? ""),
-          title: isUploading ? `正在上传${resourceLabel}` : isImage ? "点击替换图片" : `已引用${resourceLabel}`
+          title: isUploading ? `正在上传${resourceLabel}` : `点击预览${resourceLabel}`
         };
 
         if (node.attrs.size !== null && node.attrs.size !== undefined) {
@@ -101,6 +101,18 @@ export const partSchema = new Schema({
           attrs,
           leadingNode,
           nameNode,
+          [
+            "button",
+            {
+              class: "pm-part-resource-replace",
+              type: "button",
+              title: `替换${resourceLabel}`,
+              "aria-label": `替换${resourceLabel} ${label}`,
+              contenteditable: "false",
+              tabindex: "-1"
+            },
+            "↻"
+          ],
           [
             "button",
             {

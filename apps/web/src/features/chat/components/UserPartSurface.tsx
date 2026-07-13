@@ -1,10 +1,20 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef, type ClipboardEvent as ReactClipboardEvent } from "react";
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+  type ClipboardEvent as ReactClipboardEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent
+} from "react";
 import type { ResourcePart, MessagePart, PartExtra } from "@/features/chat/api/agent-types";
 import {
   AGENT_MESSAGE_PARTS_MIME,
   messagePartsToPlainText,
   serializeMessagePartsForClipboard
 } from "@/features/chat/lib/message-part-clipboard";
+import { ResourcePreviewDialog, type ResourcePreviewItem } from "@/features/resources/components/ResourcePreviewDialog";
 
 interface UserPartSurfaceProps {
   parts: MessagePart[];
@@ -16,6 +26,7 @@ export interface UserPartSurfaceHandle {
 
 export const UserPartSurface = forwardRef<UserPartSurfaceHandle, UserPartSurfaceProps>(function UserPartSurface({ parts }, ref) {
   const editorRef = useRef<HTMLDivElement | null>(null);
+  const [previewResource, setPreviewResource] = useState<ResourcePreviewItem>();
 
   useImperativeHandle(ref, () => ({
     getSelectedParts: () => getSelectedDomParts(editorRef.current)
@@ -44,9 +55,17 @@ export const UserPartSurface = forwardRef<UserPartSurfaceHandle, UserPartSurface
 
   return (
     <div className="user-part-surface">
-      <div className="part-composer-editor user-part-surface-editor" aria-label="用户消息内容" onCopy={handleCopy} ref={editorRef}>
+      <div
+        className="part-composer-editor user-part-surface-editor"
+        aria-label="用户消息内容"
+        onClick={(event) => handleResourcePreviewClick(event, setPreviewResource)}
+        onCopy={handleCopy}
+        onKeyDown={(event) => handleResourcePreviewKeyDown(event, setPreviewResource)}
+        ref={editorRef}
+      >
         {parts.map((part, index) => renderUserPart(part, index))}
       </div>
+      <ResourcePreviewDialog item={previewResource} onClose={() => setPreviewResource(undefined)} />
     </div>
   );
 });
@@ -77,7 +96,7 @@ function renderUserPart(part: MessagePart, index: number) {
   const resourceAttrs = createResourceDataAttrs(part, index);
 
   return (
-    <span className="pm-part pm-part--resource" key={`resource-${index}`} {...resourceAttrs}>
+    <span className="pm-part pm-part--resource" key={`resource-${index}`} {...resourceAttrs} role="button" tabIndex={0} title={`预览${resourceLabel}`}>
       {part.url && isImageMime(part.mime) ? (
         <img className="pm-part-resource-thumb" src={part.url} alt={label} draggable={false} />
       ) : (
@@ -86,6 +105,63 @@ function renderUserPart(part: MessagePart, index: number) {
       <span className="pm-part-resource-name">{label}</span>
     </span>
   );
+}
+
+function handleResourcePreviewClick(
+  event: ReactMouseEvent<HTMLDivElement>,
+  onPreview: (item: ResourcePreviewItem) => void
+) {
+  const resourceElement = closestUserResourceElement(event.target);
+
+  if (!resourceElement || isResourceRangeSelected(resourceElement)) {
+    return;
+  }
+
+  openResourcePreview(resourceElement, onPreview);
+}
+
+function handleResourcePreviewKeyDown(
+  event: ReactKeyboardEvent<HTMLDivElement>,
+  onPreview: (item: ResourcePreviewItem) => void
+) {
+  if (event.key !== "Enter" && event.key !== " ") {
+    return;
+  }
+
+  const resourceElement = closestUserResourceElement(event.target);
+
+  if (!resourceElement) {
+    return;
+  }
+
+  event.preventDefault();
+  openResourcePreview(resourceElement, onPreview);
+}
+
+function openResourcePreview(resourceElement: HTMLElement, onPreview: (item: ResourcePreviewItem) => void) {
+  const url = resourceElement.dataset.url?.trim();
+
+  if (!url) {
+    return;
+  }
+
+  onPreview({
+    url,
+    mime: resourceElement.dataset.mime ?? undefined,
+    prompt: resourceElement.dataset.name ?? undefined
+  });
+}
+
+function closestUserResourceElement(target: EventTarget | null): HTMLElement | null {
+  if (target instanceof Element) {
+    return target.closest<HTMLElement>("[data-user-part-kind='resource']");
+  }
+
+  if (target instanceof Text) {
+    return target.parentElement?.closest<HTMLElement>("[data-user-part-kind='resource']") ?? null;
+  }
+
+  return null;
 }
 
 function createResourceDataAttrs(part: ResourcePart, index: number) {
@@ -265,4 +341,8 @@ function isRangeSelectionIntersectingNode(selection: Selection | null, node: Nod
   }
 
   return false;
+}
+
+function isResourceRangeSelected(element: HTMLElement) {
+  return isRangeSelectionIntersectingNode(element.ownerDocument.getSelection(), element);
 }

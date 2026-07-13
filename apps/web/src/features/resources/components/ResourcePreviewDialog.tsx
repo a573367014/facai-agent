@@ -1,5 +1,5 @@
 import { Dialog, DialogContent, IconButton } from "@mui/material";
-import { ChevronLeft, ChevronRight, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, RefreshCw, X } from "lucide-react";
 import { lazy, Suspense } from "react";
 
 export interface ResourcePreviewItem {
@@ -11,6 +11,7 @@ export interface ResourcePreviewItem {
 interface ResourcePreviewDialogProps {
   item?: ResourcePreviewItem;
   canNavigate?: boolean;
+  onReplace?: () => void;
   onClose: () => void;
   onNavigate?: (offset: number) => void;
 }
@@ -21,7 +22,7 @@ const OpenFileViewerPreview = lazy(() =>
   }))
 );
 
-export function ResourcePreviewDialog({ item, canNavigate = false, onClose, onNavigate }: ResourcePreviewDialogProps) {
+export function ResourcePreviewDialog({ item, canNavigate = false, onReplace, onClose, onNavigate }: ResourcePreviewDialogProps) {
   const kind = getResourcePreviewKind(item);
   const label = getResourcePreviewLabel(kind);
 
@@ -41,6 +42,11 @@ export function ResourcePreviewDialog({ item, canNavigate = false, onClose, onNa
         <IconButton type="button" className="message-resource-lightbox-close" aria-label={`关闭${label}预览`} onClick={onClose}>
           <X size={18} />
         </IconButton>
+        {onReplace ? (
+          <IconButton type="button" className="message-resource-lightbox-replace" aria-label="替换资源" title="替换资源" onClick={onReplace}>
+            <RefreshCw size={16} />
+          </IconButton>
+        ) : null}
         {canNavigate ? (
           <IconButton
             type="button"

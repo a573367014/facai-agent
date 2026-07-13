@@ -11,6 +11,7 @@ interface AgentComposerProps {
   onPartsChange: (parts: RuntimePart[]) => void;
   onSubmit: () => void;
   onCancel: () => void;
+  onUploadResource?: (file: File) => Promise<RuntimePart>;
   onUploadImage?: (file: File) => Promise<RuntimePart>;
   onUploadDocument?: (file: File) => Promise<RuntimePart>;
   onUploadError?: (message: string | null) => void;
@@ -22,7 +23,7 @@ export function AgentComposer(props: AgentComposerProps) {
   const [attachmentMenuAnchor, setAttachmentMenuAnchor] = useState<HTMLElement | null>(null);
   const isUploading = hasUploadingParts(props.parts);
   const canSubmit = !isUploading && hasSubmittableParts(props.parts);
-  const canAttach = Boolean(props.onUploadImage || props.onUploadDocument);
+  const canAttach = Boolean(props.onUploadResource || props.onUploadImage || props.onUploadDocument);
   const isAttachmentMenuOpen = Boolean(attachmentMenuAnchor);
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -51,8 +52,13 @@ export function AgentComposer(props: AgentComposerProps) {
     setAttachmentMenuAnchor(null);
   }
 
-  function handleAttachmentSelect(kind: "image" | "document") {
+  function handleAttachmentSelect(kind: "resource" | "image" | "document") {
     handleAttachmentMenuClose();
+
+    if (kind === "resource") {
+      composerRef.current?.openResourcePicker();
+      return;
+    }
 
     if (kind === "image") {
       composerRef.current?.openImagePicker();
@@ -79,6 +85,7 @@ export function AgentComposer(props: AgentComposerProps) {
         onChange={props.onPartsChange}
         onSubmit={handleComposerSubmit}
         onCancel={props.onCancel}
+        onUploadResource={props.onUploadResource}
         onUploadImage={props.onUploadImage}
         onUploadDocument={props.onUploadDocument}
         onUploadError={props.onUploadError}
@@ -113,7 +120,18 @@ export function AgentComposer(props: AgentComposerProps) {
           transformOrigin={{ vertical: "bottom", horizontal: "left" }}
           onClose={handleAttachmentMenuClose}
         >
-          <MenuItem
+          {props.onUploadResource ? (
+            <MenuItem
+              className="composer-attachment-menu-item"
+              onClick={() => handleAttachmentSelect("resource")}
+            >
+              <ListItemIcon className="composer-attachment-menu-icon">
+                <Paperclip size={18} />
+              </ListItemIcon>
+              <ListItemText primary="上传资源" />
+            </MenuItem>
+          ) : null}
+          {!props.onUploadResource ? <MenuItem
             className="composer-attachment-menu-item"
             disabled={!props.onUploadImage}
             onClick={() => handleAttachmentSelect("image")}
@@ -122,8 +140,8 @@ export function AgentComposer(props: AgentComposerProps) {
               <ImagePlus size={18} />
             </ListItemIcon>
             <ListItemText primary="上传图片" />
-          </MenuItem>
-          <MenuItem
+          </MenuItem> : null}
+          {!props.onUploadResource ? <MenuItem
             className="composer-attachment-menu-item"
             disabled={!props.onUploadDocument}
             onClick={() => handleAttachmentSelect("document")}
@@ -132,7 +150,7 @@ export function AgentComposer(props: AgentComposerProps) {
               <Paperclip size={18} />
             </ListItemIcon>
             <ListItemText primary="上传文档" />
-          </MenuItem>
+          </MenuItem> : null}
         </Menu>
 
         <Box aria-hidden="true" className="composer-hint composer-shortcut-hint" component="span">

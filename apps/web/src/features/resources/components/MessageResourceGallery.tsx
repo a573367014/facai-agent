@@ -324,7 +324,7 @@ function renderDocumentFrame(
       <ButtonBase
         type="button"
         className="message-document-main"
-        aria-label={`预览文档 ${index + 1}`}
+        aria-label={`查看文档 ${displayName}`}
         title="预览"
         onClick={() => openPreview(index)}
       >

@@ -19,7 +19,7 @@ afterEach(() => {
 });
 
 describe("UserPartSurface", () => {
-  it("readonly resource part 点击后不会聚焦编辑器或进入 ProseMirror 选中态", async () => {
+  it("readonly resource part 点击后打开预览，但不会进入 ProseMirror 选中态", async () => {
     const { container } = render(
       <UserPartSurface
         parts={[
@@ -39,9 +39,10 @@ describe("UserPartSurface", () => {
     expect(editor).not.toHaveFocus();
     expect(resourcePart).not.toHaveClass("ProseMirror-selectednode");
     expect(resourcePart).not.toHaveClass("is-range-selected");
+    expect(screen.getByRole("dialog", { name: "图片预览" })).toBeInTheDocument();
   });
 
-  it("readonly resource part 不暴露可替换图片的交互提示和 pointer cursor", () => {
+  it("readonly resource part 暴露预览入口，但不暴露替换动作", () => {
     render(
       <UserPartSurface
         parts={[
@@ -53,8 +54,9 @@ describe("UserPartSurface", () => {
     const styles = readAppStyles();
     const resourcePart = screen.getByText("image.png").closest(".pm-part--resource");
 
+    expect(resourcePart).toHaveAttribute("title", "预览图片");
     expect(resourcePart).not.toHaveAttribute("title", "点击替换图片");
-    expect(styles).toMatch(/\.user-part-surface-editor\s+\.pm-part--resource,\s*\.user-part-surface-editor\s+\.pm-part--resource:hover\s*{[^}]*cursor:\s*default;/s);
+    expect(styles).toMatch(/\.user-part-surface-editor\s+\.pm-part--resource,\s*\.user-part-surface-editor\s+\.pm-part--resource:hover\s*{[^}]*cursor:\s*pointer;/s);
   });
 
   it("拖选经过 readonly resource part 后不会被后续 click 事件清掉", () => {

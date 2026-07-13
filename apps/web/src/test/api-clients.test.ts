@@ -3,7 +3,7 @@ import { getGithubAuthorizeUrl, loginWithGithubCode } from "@/features/auth/api/
 import { clearAuthSession, readAuthSession, writeAuthSession } from "@/features/auth/api/auth-session";
 import { startAgentRun } from "@/features/chat/api/agent-api";
 import { uploadKnowledgeDocument } from "@/features/knowledge/api/knowledge-api";
-import { uploadAgentDocument, uploadAgentImage } from "@/features/resources/api/uploads-api";
+import { uploadAgentDocument, uploadAgentImage, uploadAgentResource } from "@/features/resources/api/uploads-api";
 import { resolveApiBaseUrl } from "@/shared/api/api-base-url";
 import { parseTraceId } from "@/shared/api/tracing";
 
@@ -312,6 +312,43 @@ describe("resolveApiBaseUrl", () => {
     clearAuthSession();
 
     expect(readAuthSession()).toBeUndefined();
+  });
+});
+
+describe("uploadAgentResource", () => {
+  it("使用 resource 字段上传统一资源并返回 resource part", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          file: {
+            type: "resource",
+            mime: "video/mp4",
+            url: "http://localhost:4001/uploads/resources/demo.mp4",
+            name: "demo.mp4",
+            size: 3
+          }
+        }),
+        { status: 201, headers: { "content-type": "application/json" } }
+      )
+    );
+
+    await expect(uploadAgentResource(new File(["abc"], "demo.mp4", { type: "video/mp4" }))).resolves.toEqual({
+      type: "resource",
+      mime: "video/mp4",
+      url: "http://localhost:4001/uploads/resources/demo.mp4",
+      name: "demo.mp4",
+      size: 3
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4001/agents/uploads/resources",
+      expect.objectContaining({
+        method: "POST",
+        body: expect.any(FormData)
+      })
+    );
+    const body = fetchMock.mock.calls[0][1]?.body as FormData;
+    expect(body.get("resource")).toBeInstanceOf(File);
   });
 });
 

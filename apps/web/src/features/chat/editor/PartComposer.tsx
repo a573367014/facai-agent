@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef, type MutableRefObject } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type MutableRefObject } from "react";
 import { baseKeymap } from "prosemirror-commands";
 import { history, redo, undo } from "prosemirror-history";
 import { keymap } from "prosemirror-keymap";
@@ -22,8 +22,10 @@ import {
 import {
   getAttachmentUploadKind,
   getAttachmentValidationMessage,
+  getAttachmentSizeValidationMessage,
   type AttachmentUploadKind
 } from "@/features/resources/lib/attachment-upload";
+import { ResourcePreviewDialog, type ResourcePreviewItem } from "@/features/resources/components/ResourcePreviewDialog";
 
 interface PartComposerProps {
   parts: RuntimePart[];
@@ -32,12 +34,14 @@ interface PartComposerProps {
   onChange: (parts: RuntimePart[]) => void;
   onSubmit: () => void;
   onCancel: () => void;
+  onUploadResource?: (file: File) => Promise<RuntimePart>;
   onUploadImage?: (file: File) => Promise<RuntimePart>;
   onUploadDocument?: (file: File) => Promise<RuntimePart>;
   onUploadError?: (message: string | null) => void;
 }
 
 export interface PartComposerHandle {
+  openResourcePicker: () => void;
   openImagePicker: () => void;
   openDocumentPicker: () => void;
 }
@@ -62,34 +66,60 @@ type UploadTaskRegistry = Map<string, UploadTaskRecord>;
 let uploadSequence = 0;
 
 export const PartComposer = forwardRef<PartComposerHandle, PartComposerProps>(function PartComposer(
-  { parts, disabled = false, focusToken = 0, onChange, onSubmit, onCancel, onUploadImage, onUploadDocument, onUploadError },
+  {
+    parts,
+    disabled = false,
+    focusToken = 0,
+    onChange,
+    onSubmit,
+    onCancel,
+    onUploadResource,
+    onUploadImage,
+    onUploadDocument,
+    onUploadError
+  },
   ref
 ) {
   const editorRootRef = useRef<HTMLDivElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const documentInputRef = useRef<HTMLInputElement | null>(null);
+  const resourceInputRef = useRef<HTMLInputElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
   const onSubmitRef = useRef(onSubmit);
   const onCancelRef = useRef(onCancel);
   const onUploadImageRef = useRef(onUploadImage);
   const onUploadDocumentRef = useRef(onUploadDocument);
+  const onUploadResourceRef = useRef(onUploadResource);
   const onUploadErrorRef = useRef(onUploadError);
   const disabledRef = useRef(disabled);
   const pendingReplacementRangeRef = useRef<ReplacementRange>();
+  const previewReplacementRangeRef = useRef<ReplacementRange>();
   const uploadTasksRef = useRef<UploadTaskRegistry>(new Map());
+  const onPreviewResourceRef = useRef<(item: ResourcePreviewItem, replacementRange?: ReplacementRange) => void>(() => undefined);
+  const [previewResource, setPreviewResource] = useState<ResourcePreviewItem>();
+
+  onPreviewResourceRef.current = (item, replacementRange) => {
+    previewReplacementRangeRef.current = replacementRange;
+    setPreviewResource(item);
+  };
 
   onChangeRef.current = onChange;
   onSubmitRef.current = onSubmit;
   onCancelRef.current = onCancel;
   onUploadImageRef.current = onUploadImage;
   onUploadDocumentRef.current = onUploadDocument;
+  onUploadResourceRef.current = onUploadResource;
   onUploadErrorRef.current = onUploadError;
   disabledRef.current = disabled;
 
   // 回调和 disabled 都放到 ref 里，是为了让 ProseMirror 插件始终读到最新值。
   // EditorView 只初始化一次，如果直接闭包捕获 props，很容易拿到旧的 onSubmit/onUploadImage。
   useImperativeHandle(ref, () => ({
+    openResourcePicker: () => {
+      pendingReplacementRangeRef.current = undefined;
+      resourceInputRef.current?.click();
+    },
     openImagePicker: () => {
       pendingReplacementRangeRef.current = undefined;
       imageInputRef.current?.click();
@@ -112,9 +142,12 @@ export const PartComposer = forwardRef<PartComposerHandle, PartComposerProps>(fu
         onCancelRef,
         onUploadImageRef,
         onUploadDocumentRef,
+        onUploadResourceRef,
         onUploadErrorRef,
         imageInputRef,
         documentInputRef,
+        resourceInputRef,
+        onPreviewResourceRef,
         pendingReplacementRangeRef,
         uploadTasksRef
       }),
@@ -166,9 +199,12 @@ export const PartComposer = forwardRef<PartComposerHandle, PartComposerProps>(fu
       onCancelRef,
       onUploadImageRef,
       onUploadDocumentRef,
+      onUploadResourceRef,
       onUploadErrorRef,
       imageInputRef,
       documentInputRef,
+      resourceInputRef,
+      onPreviewResourceRef,
       pendingReplacementRangeRef,
       uploadTasksRef
     }));
@@ -195,7 +231,7 @@ export const PartComposer = forwardRef<PartComposerHandle, PartComposerProps>(fu
     await uploadAndInsertAttachment(
       file,
       viewRef,
-      { onUploadImageRef, onUploadDocumentRef, onUploadErrorRef },
+      { onUploadImageRef, onUploadDocumentRef, onUploadResourceRef, onUploadErrorRef },
       uploadTasksRef.current,
       "image",
       pendingReplacementRangeRef.current
@@ -217,7 +253,7 @@ export const PartComposer = forwardRef<PartComposerHandle, PartComposerProps>(fu
     await uploadAndInsertAttachment(
       file,
       viewRef,
-      { onUploadImageRef, onUploadDocumentRef, onUploadErrorRef },
+      { onUploadImageRef, onUploadDocumentRef, onUploadResourceRef, onUploadErrorRef },
       uploadTasksRef.current,
       "document"
     );
@@ -227,9 +263,40 @@ export const PartComposer = forwardRef<PartComposerHandle, PartComposerProps>(fu
     }
   }
 
+  async function handleResourceInputChange() {
+    const file = resourceInputRef.current?.files?.[0];
+
+    if (!file) {
+      return;
+    }
+
+    await uploadAndInsertAttachment(
+      file,
+      viewRef,
+      { onUploadImageRef, onUploadDocumentRef, onUploadResourceRef, onUploadErrorRef },
+      uploadTasksRef.current,
+      undefined,
+      pendingReplacementRangeRef.current
+    );
+    pendingReplacementRangeRef.current = undefined;
+
+    if (resourceInputRef.current) {
+      resourceInputRef.current.value = "";
+    }
+  }
+
   return (
     <div className="part-composer">
       <div ref={editorRootRef} />
+      <input
+        ref={resourceInputRef}
+        aria-label="选择资源"
+        className="part-composer-image-input"
+        type="file"
+        onChange={() => {
+          void handleResourceInputChange();
+        }}
+      />
       <input
         ref={imageInputRef}
         aria-label="选择图片"
@@ -250,6 +317,23 @@ export const PartComposer = forwardRef<PartComposerHandle, PartComposerProps>(fu
           void handleDocumentInputChange();
         }}
       />
+      <ResourcePreviewDialog
+        item={previewResource}
+        onReplace={() => {
+          const replacementRange = previewReplacementRangeRef.current;
+          setPreviewResource(undefined);
+          previewReplacementRangeRef.current = undefined;
+
+          if (replacementRange) {
+            pendingReplacementRangeRef.current = replacementRange;
+            resourceInputRef.current?.click();
+          }
+        }}
+        onClose={() => {
+          previewReplacementRangeRef.current = undefined;
+          setPreviewResource(undefined);
+        }}
+      />
     </div>
   );
 });
@@ -260,9 +344,12 @@ function createEditorState(input: {
   onCancelRef: MutableRefObject<() => void>;
   onUploadImageRef: MutableRefObject<((file: File) => Promise<RuntimePart>) | undefined>;
   onUploadDocumentRef: MutableRefObject<((file: File) => Promise<RuntimePart>) | undefined>;
+  onUploadResourceRef: MutableRefObject<((file: File) => Promise<RuntimePart>) | undefined>;
   onUploadErrorRef: MutableRefObject<((message: string | null) => void) | undefined>;
   imageInputRef: MutableRefObject<HTMLInputElement | null>;
   documentInputRef: MutableRefObject<HTMLInputElement | null>;
+  resourceInputRef: MutableRefObject<HTMLInputElement | null>;
+  onPreviewResourceRef: MutableRefObject<(item: ResourcePreviewItem, replacementRange?: ReplacementRange) => void>;
   pendingReplacementRangeRef: MutableRefObject<ReplacementRange | undefined>;
   uploadTasksRef: MutableRefObject<UploadTaskRegistry>;
 }) {
@@ -300,6 +387,7 @@ function createEditorState(input: {
           void uploadAndInsertAttachment(file, { current: view }, {
             onUploadImageRef: input.onUploadImageRef,
             onUploadDocumentRef: input.onUploadDocumentRef,
+            onUploadResourceRef: input.onUploadResourceRef,
             onUploadErrorRef: input.onUploadErrorRef
           }, input.uploadTasksRef.current);
         }
@@ -309,6 +397,13 @@ function createEditorState(input: {
         props: {
           handleDOMEvents: {
             mousedown(view, event) {
+              const replaceButton = closestResourceReplaceButtonElement(event.target);
+
+              if (replaceButton) {
+                event.preventDefault();
+                return true;
+              }
+
               const removeButton = closestResourceRemoveButtonElement(event.target);
 
               if (removeButton) {
@@ -330,6 +425,14 @@ function createEditorState(input: {
               return false;
             },
             click(view, event) {
+              const replaceButton = closestResourceReplaceButtonElement(event.target);
+
+              if (replaceButton) {
+                event.preventDefault();
+                replaceResourcePartFromReplaceButton(view, replaceButton, input);
+                return true;
+              }
+
               const removeButton = closestResourceRemoveButtonElement(event.target);
 
               if (removeButton) {
@@ -349,15 +452,17 @@ function createEditorState(input: {
               }
 
               const replacementRange = findResourceReplacementRange(view, target);
-              input.pendingReplacementRangeRef.current = replacementRange;
+              input.pendingReplacementRangeRef.current = undefined;
               clearResourceClickSelection(view, replacementRange);
+              const url = target.dataset.url?.trim();
 
-              if (!isImageResourceElement(target)) {
-                event.preventDefault();
-                return true;
+              if (url) {
+                input.onPreviewResourceRef.current({
+                  url,
+                  mime: target.dataset.mime ?? undefined,
+                  prompt: target.dataset.name ?? undefined
+                }, replacementRange);
               }
-
-              input.imageInputRef.current?.click();
               event.preventDefault();
               return true;
             }
@@ -381,6 +486,7 @@ async function uploadAndInsertAttachment(
   uploadRefs: {
     onUploadImageRef: MutableRefObject<((file: File) => Promise<RuntimePart>) | undefined>;
     onUploadDocumentRef: MutableRefObject<((file: File) => Promise<RuntimePart>) | undefined>;
+    onUploadResourceRef: MutableRefObject<((file: File) => Promise<RuntimePart>) | undefined>;
     onUploadErrorRef: MutableRefObject<((message: string | null) => void) | undefined>;
   },
   uploadTasks: UploadTaskRegistry,
@@ -393,7 +499,9 @@ async function uploadAndInsertAttachment(
     return;
   }
 
-  const validationMessage = getAttachmentValidationMessage(file, expectedKind);
+  const validationMessage = uploadRefs.onUploadResourceRef.current
+    ? getAttachmentSizeValidationMessage(file)
+    : getAttachmentValidationMessage(file, expectedKind);
 
   if (validationMessage) {
     uploadRefs.onUploadErrorRef.current?.(validationMessage);
@@ -401,7 +509,8 @@ async function uploadAndInsertAttachment(
   }
 
   const kind = getAttachmentUploadKind(file);
-  const onUpload = kind === "image" ? uploadRefs.onUploadImageRef.current : uploadRefs.onUploadDocumentRef.current;
+  const onUpload =
+    uploadRefs.onUploadResourceRef.current ?? (kind === "image" ? uploadRefs.onUploadImageRef.current : uploadRefs.onUploadDocumentRef.current);
 
   if (!onUpload) {
     return;
@@ -632,8 +741,16 @@ function closestResourcePartElement(target: EventTarget | null): HTMLElement | n
   return null;
 }
 
-function isImageResourceElement(element: HTMLElement) {
-  return element.dataset.mime?.startsWith("image/") ?? false;
+function closestResourceReplaceButtonElement(target: EventTarget | null): HTMLElement | null {
+  if (target instanceof Element) {
+    return target.closest(".pm-part-resource-replace") as HTMLElement | null;
+  }
+
+  if (target instanceof Text) {
+    return target.parentElement?.closest(".pm-part-resource-replace") as HTMLElement | null;
+  }
+
+  return null;
 }
 
 function closestResourceRemoveButtonElement(target: EventTarget | null): HTMLElement | null {
@@ -664,6 +781,28 @@ function deleteResourcePartFromRemoveButton(view: EditorView, button: HTMLElemen
   view.dispatch(view.state.tr.delete(range.from, range.to).scrollIntoView());
   updateEmptyClass(view);
   view.focus();
+}
+
+function replaceResourcePartFromReplaceButton(
+  view: EditorView,
+  button: HTMLElement,
+  input: Parameters<typeof createEditorState>[0]
+) {
+  const resourceElement = button.closest(".pm-part--resource");
+
+  if (!(resourceElement instanceof HTMLElement)) {
+    return;
+  }
+
+  const range = findResourceReplacementRange(view, resourceElement);
+
+  if (!range) {
+    return;
+  }
+
+  input.pendingReplacementRangeRef.current = range;
+  clearResourceClickSelection(view, range);
+  input.resourceInputRef.current?.click();
 }
 
 function moveSelectionToEndWhenAtDocumentStart(view: EditorView) {

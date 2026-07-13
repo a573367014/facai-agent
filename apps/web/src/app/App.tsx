@@ -56,7 +56,7 @@ import {
 import type { KnowledgeDocumentRecord } from "@/features/knowledge/api/knowledge-types";
 import { KnowledgeAdminPanel } from "@/features/knowledge/components/KnowledgeAdminPanel";
 import type { ToolResourceActionPayload } from "@/features/inspector/model/tool-resource-action";
-import { uploadAgentDocument, uploadAgentImage } from "@/features/resources/api/uploads-api";
+import { uploadAgentDocument, uploadAgentImage, uploadAgentResource } from "@/features/resources/api/uploads-api";
 import {
   deleteAgentSession,
   getAgentSession,
@@ -1285,6 +1285,7 @@ export default function App() {
               onPartsChange={setComposerParts}
               onSubmit={handleSubmitMessage}
               onCancel={handleCancelMessage}
+              onUploadResource={uploadAgentResource}
               onUploadDocument={uploadAgentDocument}
               onUploadError={handleAttachmentUploadNotice}
               onUploadImage={uploadAgentImage}

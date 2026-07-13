@@ -370,7 +370,7 @@ describe("PartComposer", () => {
     expect(onUploadError).toHaveBeenCalledWith("附件不能超过 20MB");
   });
 
-  it("点击已有图片 part 后重新上传会替换原 part", async () => {
+  it("点击资源主体会打开预览，点击替换按钮后会原位替换", async () => {
     const onChange = vi.fn();
     const onUploadImage = vi.fn().mockResolvedValue({
       type: "resource",
@@ -394,7 +394,10 @@ describe("PartComposer", () => {
     );
 
     await userEvent.click(screen.getByText("old.png"));
-    await userEvent.upload(screen.getByLabelText("选择图片"), new File(["image"], "new.png", { type: "image/png" }));
+    expect(screen.getByRole("dialog", { name: "图片预览" })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "替换资源" }));
+    await userEvent.upload(screen.getByLabelText("选择资源"), new File(["image"], "new.png", { type: "image/png" }));
 
     await waitFor(() => {
       expect(onChange).toHaveBeenLastCalledWith([
@@ -553,6 +556,7 @@ describe("PartComposer", () => {
     await userEvent.click(screen.getByText("节日主图动态视频"));
 
     expect(inputClick).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "视频预览" })).toBeInTheDocument();
   });
 
   it("resource part 不使用外部 margin，并让拖选态和文本选区颜色一致", () => {

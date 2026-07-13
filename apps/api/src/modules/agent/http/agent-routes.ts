@@ -132,6 +132,18 @@ const documentMimeExtensions: Record<string, string> = {
   "application/msword": ".doc",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx"
 };
+
+const resourceMimeExtensions: Record<string, string> = {
+  ...imageMimeExtensions,
+  ...documentMimeExtensions,
+  "application/pdf": ".pdf",
+  "audio/mpeg": ".mp3",
+  "audio/wav": ".wav",
+  "audio/ogg": ".ogg",
+  "video/mp4": ".mp4",
+  "video/webm": ".webm",
+  "video/quicktime": ".mov"
+};
 /**
  * 未认证请求的默认用户标识。
  * 当 auth-guard 取不到用户身份时用这个兜底，保证路由不会因为缺认证而崩溃。
@@ -375,6 +387,16 @@ function getDocumentExtension(name: string, mimeType: string) {
   return documentMimeExtensions[mimeType.toLowerCase()] ?? ".bin";
 }
 
+function getResourceExtension(name: string, mimeType: string) {
+  const extension = extname(name);
+
+  if (extension) {
+    return extension.toLowerCase();
+  }
+
+  return resourceMimeExtensions[mimeType.toLowerCase()] ?? ".bin";
+}
+
 /**
  * 根据文档文件名反推 MIME 类型。
  *
@@ -415,6 +437,16 @@ function normalizeAgentDocumentMime(mimeType: string, name: string): string {
 
   if (normalizedMime === "application/octet-stream") {
     return getDocumentMimeTypeFromName(name);
+  }
+
+  return normalizedMime;
+}
+
+function normalizeAgentResourceMime(mimeType: string, name: string): string {
+  const normalizedMime = mimeType.split(";")[0]?.trim().toLowerCase();
+
+  if (!normalizedMime || normalizedMime === "application/octet-stream") {
+    return getDocumentMimeTypeFromName(name) === "application/octet-stream" ? "application/octet-stream" : getDocumentMimeTypeFromName(name);
   }
 
   return normalizedMime;
@@ -630,6 +662,80 @@ export async function registerAgentRoutes(
             type: "document"
           }
         }
+      }
+    });
+  });
+
+  app.post("/agents/uploads/resources", async (request, reply) => {
+    const file = await request.file();
+
+    if (!file) {
+      throw new AppError("VALIDATION_ERROR", "请选择要上传的资源", 400);
+    }
+
+    const name = basename(file.filename);
+    const mimeType = normalizeAgentResourceMime(file.mimetype, name);
+    const buffer = await readAttachmentBuffer(file);
+
+    if (buffer.length === 0) {
+      throw new AppError("VALIDATION_ERROR", "资源内容不能为空", 400);
+    }
+
+    if (isSupportedAgentInputDocument({ mimeType, name })) {
+      if (!options.uploadDirectory) {
+        throw new AppError("RUNTIME_DEPENDENCY_ERROR", "未配置附件上传目录", 503);
+      }
+
+      const contentHash = createHash("sha256").update(buffer).digest("hex");
+      const extension = getDocumentExtension(name, mimeType);
+      const storedFileName = `${contentHash}${extension}`;
+      const targetDirectory = join(options.uploadDirectory, "agent-documents");
+      const sourcePath = join(targetDirectory, storedFileName);
+
+      await mkdir(targetDirectory, { recursive: true });
+      await writeFile(sourcePath, buffer);
+      await waitForUploadResponseDelay(options.uploadResponseDelayMs ?? 0);
+
+      reply.status(201).send({
+        file: {
+          type: "resource",
+          mime: mimeType,
+          url: `${getPublicBaseUrl(options, request)}/uploads/agent-documents/${storedFileName}`,
+          name,
+          size: buffer.length,
+          extra: {
+            inputResource: {
+              type: "document"
+            }
+          }
+        }
+      });
+      return;
+    }
+
+    const contentHash = createHash("sha256").update(buffer).digest("hex");
+    const extension = getResourceExtension(name, mimeType);
+    const storedFileName = `${contentHash}${extension}`;
+    const s3Key = `resources/${storedFileName}`;
+
+    await getS3Client().send(
+      new PutObjectCommand({
+        Bucket: getS3Bucket(),
+        Key: s3Key,
+        Body: buffer,
+        ContentType: mimeType
+      })
+    );
+
+    await waitForUploadResponseDelay(options.uploadResponseDelayMs ?? 0);
+
+    reply.status(201).send({
+      file: {
+        type: "resource",
+        mime: mimeType,
+        url: getS3ObjectUrl(s3Key),
+        name,
+        size: buffer.length
       }
     });
   });

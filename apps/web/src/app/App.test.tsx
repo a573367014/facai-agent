@@ -1074,7 +1074,7 @@ describe("App", () => {
 
   it("附件前端预检失败时用 toast 提示且不调用上传接口", async () => {
     mockAppFetch((url) => {
-      if (url.endsWith("/agents/uploads/documents")) {
+      if (url.endsWith("/agents/uploads/resources")) {
         return jsonResponse({ error: { code: "VALIDATION_ERROR", message: "附件不能超过 20MB" } }, false);
       }
 
@@ -1084,16 +1084,16 @@ describe("App", () => {
     render(<App />);
 
     await userEvent.click(screen.getByRole("button", { name: "添加附件" }));
-    await userEvent.click(screen.getByRole("menuitem", { name: "上传文档" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: "上传资源" }));
     await userEvent.upload(
-      screen.getByLabelText("选择文档"),
+      screen.getByLabelText("选择资源"),
       createFileWithSize("large.md", "text/markdown", maxAttachmentBytes + 1)
     );
 
     await waitFor(() => {
       expect(document.querySelector(".attachment-toast")).toHaveTextContent("附件不能超过 20MB");
     });
-    expect(vi.mocked(globalThis.fetch).mock.calls.some(([url]) => String(url).endsWith("/agents/uploads/documents"))).toBe(false);
+    expect(vi.mocked(globalThis.fetch).mock.calls.some(([url]) => String(url).endsWith("/agents/uploads/resources"))).toBe(false);
   });
 
   it("左下角展示 GitHub 登录状态并移除 API 健康状态", async () => {

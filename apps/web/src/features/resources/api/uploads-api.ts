@@ -2,7 +2,24 @@ import type { ResourcePart } from "@agent/contracts";
 import { apiBaseUrl } from "@/shared/api/api-base-url";
 import { getApiErrorMessage, type ApiErrorResponse } from "@/shared/api/types";
 import { authenticatedFetch } from "@/features/auth/api/authenticated-fetch";
-import type { UploadAgentDocumentResponse, UploadAgentImageResponse } from "./upload-types";
+import type { UploadAgentDocumentResponse, UploadAgentImageResponse, UploadAgentResourceResponse } from "./upload-types";
+
+export async function uploadAgentResource(file: File): Promise<ResourcePart> {
+  const body = new FormData();
+  body.append("resource", file);
+
+  const response = await authenticatedFetch(`${apiBaseUrl}/agents/uploads/resources`, {
+    method: "POST",
+    body
+  });
+  const payload = (await response.json()) as UploadAgentResourceResponse | ApiErrorResponse;
+
+  if (!response.ok) {
+    throw new Error(getApiErrorMessage(payload as ApiErrorResponse));
+  }
+
+  return (payload as UploadAgentResourceResponse).file;
+}
 
 export async function uploadAgentImage(file: File): Promise<ResourcePart> {
   const body = new FormData();

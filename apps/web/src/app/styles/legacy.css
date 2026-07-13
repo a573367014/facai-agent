@@ -815,9 +815,10 @@ button:not(:disabled):hover {
 .user-part-surface-editor .pm-part--resource:hover {
   background: #e9f4ed;
   color: var(--eye-primary);
-  cursor: default;
+  cursor: pointer;
 }
 
+.user-part-surface-editor .pm-part-resource-replace,
 .user-part-surface-editor .pm-part-resource-remove {
   display: none;
   cursor: default;
@@ -930,6 +931,7 @@ button:not(:disabled):hover {
   white-space: nowrap;
 }
 
+.pm-part-resource-replace,
 .pm-part-resource-remove {
   display: inline-flex;
   align-items: center;
@@ -950,11 +952,14 @@ button:not(:disabled):hover {
   transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease, opacity 0.16s ease;
 }
 
+.pm-part--resource:hover .pm-part-resource-replace,
 .pm-part--resource:hover .pm-part-resource-remove,
+.pm-part--resource:focus-within .pm-part-resource-replace,
 .pm-part--resource:focus-within .pm-part-resource-remove {
   opacity: 1;
 }
 
+.pm-part-resource-replace:hover,
 .pm-part-resource-remove:hover {
   border-color: var(--eye-primary);
   background: var(--eye-primary);
@@ -2234,6 +2239,11 @@ textarea {
   right: 0;
 }
 
+.message-resource-lightbox-replace.message-resource-lightbox-replace.MuiIconButton-root {
+  top: -42px;
+  right: 42px;
+}
+
 .message-resource-lightbox-nav.previous {
   top: 50%;
   left: -46px;
@@ -3079,4 +3089,3 @@ pre {
     padding: 15px;
   }
 }
-

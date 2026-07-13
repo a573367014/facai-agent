@@ -547,6 +547,42 @@ describe("agent routes", () => {
     });
   });
 
+  it("POST /agents/uploads/resources 保存视频等统一资源到对象存储", async () => {
+    const uploadDirectory = mkdtempSync(join(tmpdir(), "agent-upload-resources-"));
+    tempDirs.push(uploadDirectory);
+    const app = await buildTestApp({ agentService: createTestAgentService(), uploadDirectory });
+    const multipart = createMultipartPayload({
+      fieldName: "resource",
+      fileName: "demo.mp4",
+      contentType: "video/mp4",
+      content: Buffer.from("video")
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/agents/uploads/resources",
+      headers: {
+        host: "127.0.0.1:4001",
+        ...multipart.headers
+      },
+      payload: multipart.payload
+    });
+    const payload = response.json() as { file: { type: string; mime: string; name: string; url: string; size: number } };
+
+    expect(response.statusCode).toBe(201);
+    expect(payload.file).toMatchObject({
+      type: "resource",
+      mime: "video/mp4",
+      name: "demo.mp4",
+      size: 5
+    });
+    expect(payload.file.url).toMatch(/^http:\/\/localhost:9000\/agent-uploads\/resources\/.+\.mp4$/);
+
+    const fileResponse = await fetch(payload.file.url);
+    expect(fileResponse.status).toBe(200);
+    expect(fileResponse.headers.get("content-type")).toContain("video/mp4");
+  });
+
   it("允许 127.0.0.1 前端访问 API", async () => {
     const app = await buildTestApp({ agentService: createTestAgentService() });
     const response = await app.inject({

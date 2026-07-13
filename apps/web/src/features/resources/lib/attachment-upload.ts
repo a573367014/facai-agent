@@ -28,14 +28,24 @@ export function getAttachmentUploadKind(file: File): AttachmentUploadKind | unde
 }
 
 export function getAttachmentValidationMessage(file: File, expectedKind?: AttachmentUploadKind): string | undefined {
-  if (file.size > MAX_ATTACHMENT_BYTES) {
-    return ATTACHMENT_TOO_LARGE_MESSAGE;
+  const sizeMessage = getAttachmentSizeValidationMessage(file);
+
+  if (sizeMessage) {
+    return sizeMessage;
   }
 
   const kind = getAttachmentUploadKind(file);
 
   if (!kind || (expectedKind && kind !== expectedKind)) {
     return UNSUPPORTED_ATTACHMENT_MESSAGE;
+  }
+
+  return undefined;
+}
+
+export function getAttachmentSizeValidationMessage(file: File): string | undefined {
+  if (file.size > MAX_ATTACHMENT_BYTES) {
+    return ATTACHMENT_TOO_LARGE_MESSAGE;
   }
 
   return undefined;
