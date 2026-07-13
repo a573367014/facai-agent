@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createTavilySearchTool } from "../../src/tools/web-search.js";
+import { createTavilySearchTool } from "../../src/modules/tools/web-search.js";
 
 describe("createTavilySearchTool", () => {
   it("调用 Tavily Search API 并返回标准化搜索结果", async () => {

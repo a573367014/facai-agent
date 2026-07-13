@@ -1,7 +1,7 @@
 import Fastify from "fastify";
 import { describe, expect, it } from "vitest";
-import { AuthTokenService } from "../../src/auth/auth-token-service.js";
-import { registerAuthGuard } from "../../src/auth/auth-guard.js";
+import { AuthTokenService } from "../../src/modules/auth/auth-token-service.js";
+import { registerAuthGuard } from "../../src/modules/auth/auth-guard.js";
 
 function createTokenService() {
   return new AuthTokenService({

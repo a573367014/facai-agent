@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AppError } from "../../src/errors/app-error.js";
-import { createJimengImageEditTool, createJimengImageTool } from "../../src/tools/jimeng-image.js";
+import { AppError } from "../../src/shared/errors/app-error.js";
+import { createJimengImageEditTool, createJimengImageTool } from "../../src/modules/tools/jimeng-image.js";
 
 describe("createJimengImageTool", () => {
   it("SeedEdit3.0 会把本地上传图片转成 base64，避免火山下载 localhost URL", async () => {

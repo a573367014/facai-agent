@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   RedisRunningMessageStateStore,
   type RedisRunningMessageClient
-} from "../../src/agent/redis-running-message-state-store.js";
+} from "../../src/platform/redis/redis-running-message-state-store.js";
 
 class FakeRedisClient implements RedisRunningMessageClient {
   readonly values = new Map<string, string>();

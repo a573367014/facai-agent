@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildApp } from "../../src/app.js";
-import { AuthTokenService } from "../../src/auth/auth-token-service.js";
-import type { GithubOAuthClient, GithubUserProfile } from "../../src/auth/github-oauth-client.js";
-import { InMemoryUserStore } from "../../src/auth/user-store.js";
+import { buildApp } from "../../src/bootstrap/app.js";
+import { AuthTokenService } from "../../src/modules/auth/auth-token-service.js";
+import type { GithubOAuthClient, GithubUserProfile } from "../../src/modules/auth/github-oauth-client.js";
+import { InMemoryUserStore } from "../../src/modules/auth/user-store.js";
 
 class FakeGithubOAuthClient implements GithubOAuthClient {
   readonly exchangedCodes: Array<{ code: string; redirectUri?: string }> = [];

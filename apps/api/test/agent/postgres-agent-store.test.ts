@@ -1,16 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { InMemoryAgentCancellationStore } from "../../src/agent/agent-cancellation-store.js";
-import type { AgentEventBus } from "../../src/agent/agent-event-bus.js";
-import { InMemoryAgentRunLock } from "../../src/agent/agent-run-lock.js";
-import type { AgentRunJobPayload, AgentRunQueue } from "../../src/agent/agent-run-queue.js";
-import { LangChainAgentService } from "../../src/langchain/langchain-agent-service.js";
-import { PostgresAgentStore } from "../../src/agent/postgres-agent-store.js";
-import { InMemoryRunningMessageStateStore } from "../../src/agent/running-message-state-store.js";
-import { buildApp } from "../../src/app.js";
+import { InMemoryAgentCancellationStore } from "../../src/modules/agent/agent-cancellation-store.js";
+import type { AgentEventBus } from "../../src/modules/agent/agent-event-bus.js";
+import { InMemoryAgentRunLock } from "../../src/modules/agent/agent-run-lock.js";
+import type { AgentRunJobPayload, AgentRunQueue } from "../../src/modules/agent/agent-run-queue.js";
+import { LangChainAgentService } from "../../src/modules/agent/runtime/langchain-agent-service.js";
+import { PostgresAgentStore } from "../../src/platform/postgres/postgres-agent-store.js";
+import { InMemoryRunningMessageStateStore } from "../../src/modules/agent/running-message-state-store.js";
+import { buildApp } from "../../src/bootstrap/app.js";
 import { createMockModel } from "../helpers/mock-model.js";
-import { ToolExecutor } from "../../src/tools/executor.js";
-import { ToolRegistry } from "../../src/tools/registry.js";
-import type { MessagePart } from "../../src/agent/message-parts.js";
+import { ToolExecutor } from "../../src/modules/tools/executor.js";
+import { ToolRegistry } from "../../src/modules/tools/registry.js";
+import type { MessagePart } from "../../src/modules/agent/message-parts.js";
 
 const noopEventBus: AgentEventBus = {
   async publishRunEvent() {},
@@ -20,6 +20,11 @@ const noopEventBus: AgentEventBus = {
 };
 
 const TEST_DATABASE_URL = process.env.DATABASE_URL ?? "postgres://postgres:postgres@localhost:5432/agent_test";
+const TEST_VECTOR_DIMENSION = 768;
+
+function unitEmbedding(axis: number): number[] {
+  return Array.from({ length: TEST_VECTOR_DIMENSION }, (_, index) => (index === axis ? 1 : 0));
+}
 
 class NoopAgentRunQueue implements AgentRunQueue {
   async enqueueRun(_payload: AgentRunJobPayload): Promise<void> {}
@@ -41,7 +46,7 @@ function createTestAgentService(): LangChainAgentService {
 
 describe("PostgresAgentStore", () => {
   it("保存知识库文档并且只搜索 ready 文档的 chunk", async () => {
-    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL, vectorDimension: 2 });
+    const store = await PostgresAgentStore.create({ connectionString: TEST_DATABASE_URL });
     await store.reset();
     const readyDocument = await store.createKnowledgeDocument({
       name: "员工手册.pdf",
@@ -62,7 +67,7 @@ describe("PostgresAgentStore", () => {
         content: "请假需要直属主管审批。",
         sourceLabel: "员工手册.pdf 第 3 页",
         embeddingModel: "test-embedding",
-        embedding: [1, 0],
+        embedding: unitEmbedding(0),
         metadata: { page: 3 }
       },
       {
@@ -70,7 +75,7 @@ describe("PostgresAgentStore", () => {
         content: "报销需要提交发票。",
         sourceLabel: "员工手册.pdf 第 5 页",
         embeddingModel: "test-embedding",
-        embedding: [0, 1]
+        embedding: unitEmbedding(1)
       }
     ]);
     await store.replaceKnowledgeChunks(indexingDocument.id, [
@@ -79,7 +84,7 @@ describe("PostgresAgentStore", () => {
         content: "草稿制度暂不应该被搜索。",
         sourceLabel: "草稿制度.docx",
         embeddingModel: "test-embedding",
-        embedding: [1, 0]
+        embedding: unitEmbedding(0)
       }
     ]);
     await store.updateKnowledgeDocument(readyDocument.id, {
@@ -92,7 +97,7 @@ describe("PostgresAgentStore", () => {
     });
 
     const results = await store.searchKnowledgeChunks({
-      queryEmbedding: [1, 0],
+      queryEmbedding: unitEmbedding(0),
       limit: 5
     });
 
@@ -107,7 +112,7 @@ describe("PostgresAgentStore", () => {
 
     await store.deleteKnowledgeDocument(readyDocument.id);
     expect(await store.getKnowledgeDocument(readyDocument.id)).toBeUndefined();
-    expect(await store.searchKnowledgeChunks({ queryEmbedding: [1, 0], limit: 5 })).toEqual([]);
+    expect(await store.searchKnowledgeChunks({ queryEmbedding: unitEmbedding(0), limit: 5 })).toEqual([]);
     await store.close();
   });
 

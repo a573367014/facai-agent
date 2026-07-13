@@ -1,6 +1,6 @@
 import { Readable } from "node:stream";
 import { describe, expect, it } from "vitest";
-import { S3ToolResourceStorage } from "../../src/agent/tool-resource-storage.js";
+import { S3ToolResourceStorage } from "../../src/modules/agent/tool-resource-storage.js";
 
 describe("S3ToolResourceStorage", () => {
   it("下载工具生成的图片资源，按内容 hash 转储到 S3 兼容对象存储", async () => {

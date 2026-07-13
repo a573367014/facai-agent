@@ -2,9 +2,9 @@ import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { AgentMessageCoordinator, type AgentRunner } from "../../src/agent/agent-message-coordinator.js";
-import { LocalUploadInputResourceResolver } from "../../src/agent/input-resource-resolver.js";
-import { PostgresAgentStore } from "../../src/agent/postgres-agent-store.js";
+import { AgentMessageCoordinator, type AgentRunner } from "../../src/modules/agent/agent-message-coordinator.js";
+import { LocalUploadInputResourceResolver } from "../../src/modules/agent/input-resource-resolver.js";
+import { PostgresAgentStore } from "../../src/platform/postgres/postgres-agent-store.js";
 
 const TEST_DATABASE_URL = process.env.DATABASE_URL ?? "postgres://postgres:postgres@localhost:5432/agent_test";
 

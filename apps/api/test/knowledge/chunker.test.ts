@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { splitKnowledgeText } from "../../src/knowledge/chunker.js";
+import { splitKnowledgeText } from "../../src/modules/knowledge/chunker.js";
 
 describe("splitKnowledgeText", () => {
   it("按最大长度切块并保留相邻重叠文本", () => {

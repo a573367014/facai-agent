@@ -3,26 +3,31 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { InMemoryAgentCancellationStore } from "../../src/agent/agent-cancellation-store.js";
-import type { AgentEventBus } from "../../src/agent/agent-event-bus.js";
-import { InMemoryAgentRunLock } from "../../src/agent/agent-run-lock.js";
-import type { AgentRunJobPayload, AgentRunQueue } from "../../src/agent/agent-run-queue.js";
-import { LangChainAgentService } from "../../src/langchain/langchain-agent-service.js";
-import { PostgresAgentStore } from "../../src/agent/postgres-agent-store.js";
-import { InMemoryRunningMessageStateStore } from "../../src/agent/running-message-state-store.js";
-import { buildApp } from "../../src/app.js";
-import { AuthTokenService } from "../../src/auth/auth-token-service.js";
-import type { GithubOAuthClient } from "../../src/auth/github-oauth-client.js";
-import { InMemoryUserStore } from "../../src/auth/user-store.js";
-import type { EmbeddingService } from "../../src/knowledge/embedding-service.js";
-import type { KnowledgeIndexJobPayload, KnowledgeIndexQueue } from "../../src/knowledge/knowledge-run-queue.js";
-import type { KnowledgeIndexingService } from "../../src/knowledge/indexing-service.js";
-import type { KnowledgeDocumentRecord } from "../../src/knowledge/types.js";
+import type { KnowledgeDocumentDto } from "@agent/contracts";
+import { InMemoryAgentCancellationStore } from "../../src/modules/agent/agent-cancellation-store.js";
+import type { AgentEventBus } from "../../src/modules/agent/agent-event-bus.js";
+import { InMemoryAgentRunLock } from "../../src/modules/agent/agent-run-lock.js";
+import type { AgentRunJobPayload, AgentRunQueue } from "../../src/modules/agent/agent-run-queue.js";
+import { LangChainAgentService } from "../../src/modules/agent/runtime/langchain-agent-service.js";
+import { PostgresAgentStore } from "../../src/platform/postgres/postgres-agent-store.js";
+import { InMemoryRunningMessageStateStore } from "../../src/modules/agent/running-message-state-store.js";
+import { buildApp } from "../../src/bootstrap/app.js";
+import { AuthTokenService } from "../../src/modules/auth/auth-token-service.js";
+import type { GithubOAuthClient } from "../../src/modules/auth/github-oauth-client.js";
+import { InMemoryUserStore } from "../../src/modules/auth/user-store.js";
+import type { EmbeddingService } from "../../src/modules/knowledge/embedding-service.js";
+import type { KnowledgeIndexJobPayload, KnowledgeIndexQueue } from "../../src/modules/knowledge/knowledge-run-queue.js";
+import type { KnowledgeIndexingService } from "../../src/modules/knowledge/indexing-service.js";
 import { createMockModel } from "../helpers/mock-model.js";
-import { ToolExecutor } from "../../src/tools/executor.js";
-import { ToolRegistry } from "../../src/tools/registry.js";
+import { ToolExecutor } from "../../src/modules/tools/executor.js";
+import { ToolRegistry } from "../../src/modules/tools/registry.js";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? "postgres://postgres:postgres@localhost:5432/agent_test";
+const TEST_VECTOR_DIMENSION = 768;
+
+function unitEmbedding(axis: number): number[] {
+  return Array.from({ length: TEST_VECTOR_DIMENSION }, (_, index) => (index === axis ? 1 : 0));
+}
 
 const apps: FastifyInstance[] = [];
 const uploadDirs: string[] = [];
@@ -44,7 +49,7 @@ class FakeEmbeddingService implements EmbeddingService {
   readonly model = "test-embedding";
 
   async embedTexts(texts: string[]): Promise<number[][]> {
-    return texts.map((text) => (text.includes("请假") ? [1, 0] : [0, 1]));
+    return texts.map((text) => unitEmbedding(text.includes("请假") ? 0 : 1));
   }
 }
 
@@ -187,7 +192,7 @@ describe("knowledge routes", () => {
       headers: multipart.headers,
       payload: multipart.payload
     });
-    const payload = uploadResponse.json() as { document: KnowledgeDocumentRecord };
+    const payload = uploadResponse.json() as { document: KnowledgeDocumentDto };
 
     expect(uploadResponse.statusCode).toBe(201);
     expect(payload.document).toMatchObject({
@@ -196,7 +201,9 @@ describe("knowledge routes", () => {
       status: "pending",
       chunkCount: 0
     });
-    expect(existsSync(payload.document.sourcePath)).toBe(true);
+    expect(payload.document).not.toHaveProperty("sourcePath");
+    const storedDocument = await agentStore.getKnowledgeDocument(payload.document.id);
+    expect(storedDocument && existsSync(storedDocument.sourcePath)).toBe(true);
     expect(queue.jobs).toEqual([{ documentId: payload.document.id }]);
 
     const listResponse = await app.inject({ method: "GET", url: "/knowledge/documents" });
@@ -227,7 +234,7 @@ describe("knowledge routes", () => {
       headers: multipart.headers,
       payload: multipart.payload
     });
-    const { document } = uploadResponse.json() as { document: KnowledgeDocumentRecord };
+    const { document } = uploadResponse.json() as { document: KnowledgeDocumentDto };
 
     await app.knowledgeIndexingService?.indexDocument(document.id);
 
@@ -283,7 +290,7 @@ describe("knowledge routes", () => {
       },
       payload: multipart.payload
     });
-    const { document } = uploadResponse.json() as { document: KnowledgeDocumentRecord };
+    const { document } = uploadResponse.json() as { document: KnowledgeDocumentDto };
 
     await app.knowledgeIndexingService?.indexDocument(document.id);
 

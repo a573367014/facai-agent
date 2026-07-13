@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PostgresUserStore } from "../../src/auth/postgres-user-store.js";
+import { PostgresUserStore } from "../../src/platform/postgres/postgres-user-store.js";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? "postgres://postgres:postgres@localhost:5432/agent_test";
 

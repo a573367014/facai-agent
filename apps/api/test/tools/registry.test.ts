@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { createDefaultToolRegistry } from "../../src/tools/index.js";
-import { ToolRegistry } from "../../src/tools/registry.js";
+import { createDefaultToolRegistry } from "../../src/modules/tools/index.js";
+import { ToolRegistry } from "../../src/modules/tools/registry.js";
 
 describe("ToolRegistry", () => {
   it("注册工具并暴露模型可用定义", () => {

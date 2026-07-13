@@ -5,23 +5,23 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import type { FastifyInstance } from "fastify";
-import { InMemoryAgentCancellationStore } from "../../src/agent/agent-cancellation-store.js";
-import type { AgentEventBus } from "../../src/agent/agent-event-bus.js";
-import { AgentContextBuilder } from "../../src/agent/context-builder.js";
-import { AgentMessageCoordinator } from "../../src/agent/agent-message-coordinator.js";
-import { InMemoryAgentRunLock } from "../../src/agent/agent-run-lock.js";
-import type { AgentRunJobPayload, AgentRunQueue } from "../../src/agent/agent-run-queue.js";
-import { AgentSummaryService } from "../../src/agent/agent-summary-service.js";
-import { InMemoryRunningMessageStateStore } from "../../src/agent/running-message-state-store.js";
-import { PostgresAgentStore } from "../../src/agent/postgres-agent-store.js";
-import { buildApp } from "../../src/app.js";
-import { AuthTokenService } from "../../src/auth/auth-token-service.js";
-import type { GithubOAuthClient } from "../../src/auth/github-oauth-client.js";
-import { InMemoryUserStore } from "../../src/auth/user-store.js";
-import { LangChainAgentService } from "../../src/langchain/langchain-agent-service.js";
-import type { LlmProvider } from "../../src/providers/types.js";
-import { ToolExecutor } from "../../src/tools/executor.js";
-import { ToolRegistry } from "../../src/tools/registry.js";
+import { InMemoryAgentCancellationStore } from "../../src/modules/agent/agent-cancellation-store.js";
+import type { AgentEventBus } from "../../src/modules/agent/agent-event-bus.js";
+import { AgentContextBuilder } from "../../src/modules/agent/context-builder.js";
+import { AgentMessageCoordinator } from "../../src/modules/agent/agent-message-coordinator.js";
+import { InMemoryAgentRunLock } from "../../src/modules/agent/agent-run-lock.js";
+import type { AgentRunJobPayload, AgentRunQueue } from "../../src/modules/agent/agent-run-queue.js";
+import { AgentSummaryService } from "../../src/modules/agent/agent-summary-service.js";
+import { InMemoryRunningMessageStateStore } from "../../src/modules/agent/running-message-state-store.js";
+import { PostgresAgentStore } from "../../src/platform/postgres/postgres-agent-store.js";
+import { buildApp } from "../../src/bootstrap/app.js";
+import { AuthTokenService } from "../../src/modules/auth/auth-token-service.js";
+import type { GithubOAuthClient } from "../../src/modules/auth/github-oauth-client.js";
+import { InMemoryUserStore } from "../../src/modules/auth/user-store.js";
+import { LangChainAgentService } from "../../src/modules/agent/runtime/langchain-agent-service.js";
+import type { LlmProvider } from "../../src/modules/agent/providers/types.js";
+import { ToolExecutor } from "../../src/modules/tools/executor.js";
+import { ToolRegistry } from "../../src/modules/tools/registry.js";
 import { createMockModel, type MockModelResponse } from "../helpers/mock-model.js";
 
 const noopEventBus: AgentEventBus = {
@@ -272,6 +272,8 @@ describe("agent routes", () => {
     const bobListResponse = await app.inject({ method: "GET", url: "/agents/sessions", headers: bobHeaders });
 
     expect(createSessionResponse.statusCode).toBe(201);
+    expect(createSessionResponse.json().session).not.toHaveProperty("userId");
+    expect(aliceListResponse.json().sessions[0]).not.toHaveProperty("userId");
     expect((aliceListResponse.json() as { sessions: Array<{ id: string }> }).sessions.map((item) => item.id)).toEqual([
       session.id
     ]);
@@ -543,6 +545,42 @@ describe("agent routes", () => {
         message: "附件不能超过 20MB"
       }
     });
+  });
+
+  it("POST /agents/uploads/resources 保存视频等统一资源到对象存储", async () => {
+    const uploadDirectory = mkdtempSync(join(tmpdir(), "agent-upload-resources-"));
+    tempDirs.push(uploadDirectory);
+    const app = await buildTestApp({ agentService: createTestAgentService(), uploadDirectory });
+    const multipart = createMultipartPayload({
+      fieldName: "resource",
+      fileName: "demo.mp4",
+      contentType: "video/mp4",
+      content: Buffer.from("video")
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/agents/uploads/resources",
+      headers: {
+        host: "127.0.0.1:4001",
+        ...multipart.headers
+      },
+      payload: multipart.payload
+    });
+    const payload = response.json() as { file: { type: string; mime: string; name: string; url: string; size: number } };
+
+    expect(response.statusCode).toBe(201);
+    expect(payload.file).toMatchObject({
+      type: "resource",
+      mime: "video/mp4",
+      name: "demo.mp4",
+      size: 5
+    });
+    expect(payload.file.url).toMatch(/^http:\/\/localhost:9000\/agent-uploads\/resources\/.+\.mp4$/);
+
+    const fileResponse = await fetch(payload.file.url);
+    expect(fileResponse.status).toBe(200);
+    expect(fileResponse.headers.get("content-type")).toContain("video/mp4");
   });
 
   it("允许 127.0.0.1 前端访问 API", async () => {

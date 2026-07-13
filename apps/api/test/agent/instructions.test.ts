@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { SYSTEM_INSTRUCTIONS } from "../../src/agent/instructions.js";
+import { SYSTEM_INSTRUCTIONS } from "../../src/modules/agent/instructions.js";
 
 describe("SYSTEM_INSTRUCTIONS", () => {
   it("要求图片资源由界面展示，不让 LLM 在正文输出图片链接", () => {

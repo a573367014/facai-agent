@@ -1,46 +1,46 @@
-# Redis Runtime Implementation Plan
+# Redis 运行时实施计划
 
-> 2026-07-01 update: runtime configuration has been productized. The app now assumes `API + Worker + Redis + SQLite` as the main path, and the old environment switches for local memory state, inline run execution, and event bus selection are superseded. This plan remains as the historical implementation trail for the Redis runtime primitives.
+> 2026-07-01 更新：运行时配置已经产品化。应用现在以 `API + Worker + Redis + SQLite` 为主路径，原先用于本地内存状态、内联运行执行和事件总线选择的环境变量开关已被取代。本计划作为 Redis 运行时基础能力的历史实施记录保留。
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **面向智能体执行者：** 必需子技能：使用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans` 逐项实施本计划。步骤使用复选框（`- [ ]`）语法跟踪进度。
 
-**Goal:** Move Agent run execution toward a Redis-backed runtime with running draft, event bus, queue, worker, cancellation, and lock primitives.
+**目标：** 将 Agent 运行执行迁移到由 Redis 支撑的运行时，其中包含运行中草稿、事件总线、队列、Worker、取消和锁等基础能力。
 
-**Architecture:** SQLite remains the durable source of truth for sessions, messages, runs, resources, tool calls, and stored events. Redis owns short-lived runtime coordination: running draft, live event fanout, BullMQ jobs, cancellation flags, and run locks. The first implementation keeps `startMessage` inline and focuses queue execution on the run path used by `/agents/runs` and `/agents/sessions/:sessionId/runs`.
+**架构：** SQLite 仍是会话、消息、运行、资源、工具调用和已存储事件的持久化事实来源。Redis 负责短期运行时协调：运行中草稿、实时事件扇出、BullMQ 任务、取消标记和运行锁。首个实现保留 `startMessage` 内联执行，并让队列执行聚焦于 `/agents/runs` 和 `/agents/sessions/:sessionId/runs` 使用的运行路径。
 
-**Tech Stack:** Fastify, TypeScript, ioredis, BullMQ, Vitest, SQLite/sql.js, npm workspaces.
+**技术栈：** Fastify、TypeScript、ioredis、BullMQ、Vitest、SQLite/sql.js、npm 工作区。
 
 ---
 
-## File Map
+## 文件清单
 
-- Modify `apps/api/package.json`: add `bullmq`, `dev:worker`, and `worker` scripts.
-- Modify root `package.json`: start `api`, `web`, and `worker` together in dev mode.
-- Modify `apps/api/src/config/env.ts`: add execution mode, queue, worker, lock, cancel, and event bus config.
-- Create `docker-compose.yml`: local Redis service.
-- Create `apps/api/src/redis/runtime.ts`: Redis client factory and lifecycle container.
-- Create `apps/api/src/agent/agent-event-bus.ts`: in-memory and Redis live event bus.
-- Create `apps/api/src/agent/agent-cancellation-store.ts`: in-memory and Redis cancellation flags.
-- Create `apps/api/src/agent/agent-run-lock.ts`: in-memory and Redis run locks.
-- Create `apps/api/src/agent/agent-run-queue.ts`: BullMQ queue wrapper.
-- Create `apps/api/src/worker.ts`: worker process entry.
-- Modify `apps/api/src/agent/agent-message-coordinator.ts`: split run creation from run execution and support queue mode.
-- Modify `apps/api/src/app.ts`: wire Redis runtime, event bus, queue, cancellation store, and lock.
-- Modify `README.md` and `.env.example`: document Redis Runtime setup.
-- Add tests under `apps/api/test/agent/` and `apps/api/test/config/`.
+- 修改 `apps/api/package.json`：添加 `bullmq`、`dev:worker` 和 `worker` 脚本。
+- 修改根 `package.json`：在开发模式下一起启动 `api`、`web` 和 `worker`。
+- 修改 `apps/api/src/config/env.ts`：添加执行模式、队列、Worker、锁、取消和事件总线配置。
+- 创建 `docker-compose.yml`：本地 Redis 服务。
+- 创建 `apps/api/src/redis/runtime.ts`：Redis 客户端工厂和生命周期容器。
+- 创建 `apps/api/src/agent/agent-event-bus.ts`：内存与 Redis 实时事件总线。
+- 创建 `apps/api/src/agent/agent-cancellation-store.ts`：内存与 Redis 取消标记。
+- 创建 `apps/api/src/agent/agent-run-lock.ts`：内存与 Redis 运行锁。
+- 创建 `apps/api/src/agent/agent-run-queue.ts`：BullMQ 队列封装。
+- 创建 `apps/api/src/worker.ts`：Worker 进程入口。
+- 修改 `apps/api/src/agent/agent-message-coordinator.ts`：分离运行创建和运行执行，并支持队列模式。
+- 修改 `apps/api/src/app.ts`：装配 Redis 运行时、事件总线、队列、取消存储和锁。
+- 修改 `README.md` 和 `.env.example`：记录 Redis 运行时设置。
+- 在 `apps/api/test/agent/` 和 `apps/api/test/config/` 下添加测试。
 
-## Task 1: Config And Local Redis
+## 任务 1：配置与本地 Redis
 
-**Files:**
-- Modify: `apps/api/src/config/env.ts`
-- Modify: `.env.example`
-- Modify: `README.md`
-- Create: `docker-compose.yml`
-- Test: `apps/api/test/config/env.test.ts`
+**文件：**
+- 修改：`apps/api/src/config/env.ts`
+- 修改：`.env.example`
+- 修改：`README.md`
+- 创建：`docker-compose.yml`
+- 测试：`apps/api/test/config/env.test.ts`
 
-- [x] **Step 1: Write failing env tests**
+- [x] **步骤 1：编写失败的环境变量测试**
 
-Add tests that assert default inline/memory behavior and Redis queue config parsing:
+添加测试，断言默认的内联/内存行为和 Redis 队列配置解析：
 
 ```ts
 const env = loadEnv({});
@@ -67,19 +67,19 @@ expect(redisEnv.AGENT_RUN_LOCK_TTL_SECONDS).toBe(900);
 expect(redisEnv.AGENT_CANCEL_TTL_SECONDS).toBe(3600);
 ```
 
-- [x] **Step 2: Verify RED**
+- [x] **步骤 2：验证测试失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- apps/api/test/config/env.test.ts
 ```
 
-Expected: fail because the new env fields do not exist.
+预期：由于新的环境变量字段不存在而失败。
 
-- [x] **Step 3: Implement config and docs**
+- [x] **步骤 3：实现配置并更新文档**
 
-Add zod env fields:
+添加 zod 环境变量字段：
 
 ```ts
 AGENT_RUN_EXECUTION_MODE: z.enum(["inline", "queue"]).default("inline"),
@@ -90,7 +90,7 @@ AGENT_CANCEL_TTL_SECONDS: z.coerce.number().int().min(60).max(86_400).default(72
 AGENT_EVENT_BUS: z.enum(["memory", "redis"]).default("memory")
 ```
 
-Add `.env.example` entries and a `docker-compose.yml` Redis service:
+添加 `.env.example` 条目和 `docker-compose.yml` Redis 服务：
 
 ```yaml
 services:
@@ -106,37 +106,37 @@ volumes:
   redis-data:
 ```
 
-- [x] **Step 4: Verify GREEN**
+- [x] **步骤 4：验证测试通过**
 
-Run the env test again and expect pass.
+再次运行环境变量测试，并预期通过。
 
-## Task 2: Redis Runtime Primitives
+## 任务 2：Redis 运行时基础能力
 
-**Files:**
-- Create: `apps/api/src/agent/agent-cancellation-store.ts`
-- Create: `apps/api/src/agent/agent-run-lock.ts`
-- Create: `apps/api/src/agent/agent-event-bus.ts`
-- Test: `apps/api/test/agent/agent-cancellation-store.test.ts`
-- Test: `apps/api/test/agent/agent-run-lock.test.ts`
-- Test: `apps/api/test/agent/agent-event-bus.test.ts`
+**文件：**
+- 创建：`apps/api/src/agent/agent-cancellation-store.ts`
+- 创建：`apps/api/src/agent/agent-run-lock.ts`
+- 创建：`apps/api/src/agent/agent-event-bus.ts`
+- 测试：`apps/api/test/agent/agent-cancellation-store.test.ts`
+- 测试：`apps/api/test/agent/agent-run-lock.test.ts`
+- 测试：`apps/api/test/agent/agent-event-bus.test.ts`
 
-- [x] **Step 1: Write failing primitive tests**
+- [x] **步骤 1：编写失败的基础能力测试**
 
-Test cancellation TTL behavior, lock `NX EX` behavior, and event bus publish/subscribe behavior using fake Redis clients.
+使用模拟 Redis 客户端测试取消 TTL 行为、锁的 `NX EX` 行为，以及事件总线的发布/订阅行为。
 
-- [x] **Step 2: Verify RED**
+- [x] **步骤 2：验证测试失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- apps/api/test/agent/agent-cancellation-store.test.ts apps/api/test/agent/agent-run-lock.test.ts apps/api/test/agent/agent-event-bus.test.ts
 ```
 
-Expected: fail because modules do not exist.
+预期：由于模块不存在而失败。
 
-- [x] **Step 3: Implement minimal primitives**
+- [x] **步骤 3：实现最小化基础能力**
 
-Expose these contracts:
+公开以下契约：
 
 ```ts
 export interface AgentCancellationStore {
@@ -157,156 +157,156 @@ export interface AgentEventBus {
 }
 ```
 
-- [x] **Step 4: Verify GREEN**
+- [x] **步骤 4：验证测试通过**
 
-Run primitive tests and expect pass.
+运行基础能力测试，并预期通过。
 
-## Task 3: Queue Wrapper And Worker Entry
+## 任务 3：队列封装与 Worker 入口
 
-**Files:**
-- Modify: `apps/api/package.json`
-- Modify: root `package.json`
-- Create: `apps/api/src/agent/agent-run-queue.ts`
-- Create: `apps/api/src/worker.ts`
-- Test: `apps/api/test/agent/agent-run-queue.test.ts`
+**文件：**
+- 修改：`apps/api/package.json`
+- 修改：根 `package.json`
+- 创建：`apps/api/src/agent/agent-run-queue.ts`
+- 创建：`apps/api/src/worker.ts`
+- 测试：`apps/api/test/agent/agent-run-queue.test.ts`
 
-- [x] **Step 1: Install BullMQ**
+- [x] **步骤 1：安装 BullMQ**
 
-Run:
+运行：
 
 ```bash
 npm install bullmq -w @agent/api
 ```
 
-- [x] **Step 2: Write failing queue wrapper test**
+- [x] **步骤 2：编写失败的队列封装测试**
 
-Test that `AgentRunQueue.enqueueRun` writes a stable job name, job id, and payload containing only IDs.
+测试 `AgentRunQueue.enqueueRun` 会写入稳定的任务名称、任务 ID，以及仅包含 ID 的载荷。
 
-- [x] **Step 3: Verify RED**
+- [x] **步骤 3：验证测试失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- apps/api/test/agent/agent-run-queue.test.ts
 ```
 
-Expected: fail because wrapper does not exist.
+预期：由于封装不存在而失败。
 
-- [x] **Step 4: Implement queue wrapper and worker entry**
+- [x] **步骤 4：实现队列封装和 Worker 入口**
 
-Create a wrapper around BullMQ `Queue` and a worker entry that builds the app runtime dependencies and consumes jobs.
+为 BullMQ `Queue` 创建封装，并创建负责构建应用运行时依赖和消费任务的 Worker 入口。
 
-- [x] **Step 5: Verify GREEN**
+- [x] **步骤 5：验证测试通过**
 
-Run queue wrapper tests and `npm run typecheck -w @agent/api`.
+运行队列封装测试和 `npm run typecheck -w @agent/api`。
 
-## Task 4: Coordinator Queue Mode
+## 任务 4：协调器队列模式
 
-**Files:**
-- Modify: `apps/api/src/agent/agent-message-coordinator.ts`
-- Modify: `apps/api/src/app.ts`
-- Test: `apps/api/test/agent/agent-message-coordinator.test.ts`
-- Test: `apps/api/test/routes/agent-routes.test.ts`
+**文件：**
+- 修改：`apps/api/src/agent/agent-message-coordinator.ts`
+- 修改：`apps/api/src/app.ts`
+- 测试：`apps/api/test/agent/agent-message-coordinator.test.ts`
+- 测试：`apps/api/test/routes/agent-routes.test.ts`
 
-- [x] **Step 1: Write failing queue-mode coordinator test**
+- [x] **步骤 1：编写失败的队列模式协调器测试**
 
-Create a fake run queue. Assert `startRun` creates user/run/assistant records and enqueues the run instead of executing `AgentService` inline when queue mode is enabled.
+创建模拟运行队列。断言启用队列模式时，`startRun` 会创建用户、运行和助手记录，并将运行加入队列，而不是内联执行 `AgentService`。
 
-- [x] **Step 2: Verify RED**
+- [x] **步骤 2：验证测试失败**
 
-Run:
+运行：
 
 ```bash
 npm run test -w @agent/api -- apps/api/test/agent/agent-message-coordinator.test.ts
 ```
 
-Expected: fail because coordinator cannot accept queue mode yet.
+预期：由于协调器尚不支持队列模式而失败。
 
-- [x] **Step 3: Implement queue mode**
+- [x] **步骤 3：实现队列模式**
 
-Add optional queue dependency to coordinator. Keep inline mode as default. Extract an executable run method that Worker can call with a `runId`.
+为协调器添加可选队列依赖。保持内联模式为默认值。提取一个 Worker 可使用 `runId` 调用的运行执行方法。
 
-- [x] **Step 4: Verify GREEN**
+- [x] **步骤 4：验证测试通过**
 
-Run coordinator and route tests.
+运行协调器和路由测试。
 
-## Task 5: Event Bus Wiring
+## 任务 5：事件总线装配
 
-**Files:**
-- Modify: `apps/api/src/agent/agent-message-coordinator.ts`
-- Modify: `apps/api/src/routes/agent-routes.ts`
-- Modify: `apps/api/src/app.ts`
-- Test: `apps/api/test/routes/agent-routes.test.ts`
+**文件：**
+- 修改：`apps/api/src/agent/agent-message-coordinator.ts`
+- 修改：`apps/api/src/routes/agent-routes.ts`
+- 修改：`apps/api/src/app.ts`
+- 测试：`apps/api/test/routes/agent-routes.test.ts`
 
-- [x] **Step 1: Write failing SSE event bus test**
+- [x] **步骤 1：编写失败的 SSE 事件总线测试**
 
-Use an in-memory event bus in route tests. Assert an event published after SSE subscription is delivered to the response.
+在路由测试中使用内存事件总线。断言在 SSE 订阅后发布的事件会被传递到响应。
 
-- [x] **Step 2: Verify RED**
+- [x] **步骤 2：验证测试失败**
 
-Run the targeted route test and expect failure.
+运行目标路由测试，并预期失败。
 
-- [x] **Step 3: Implement event bus publish/subscribe integration**
+- [x] **步骤 3：实现事件总线发布/订阅集成**
 
-Coordinator publishes stored events to event bus after appending them. Routes subscribe through coordinator so existing in-memory store subscribers still work in inline mode.
+协调器追加已存储事件后，将其发布到事件总线。路由通过协调器订阅，使现有内存存储订阅者在内联模式下仍能工作。
 
-- [x] **Step 4: Verify GREEN**
+- [x] **步骤 4：验证测试通过**
 
-Run route tests.
+运行路由测试。
 
-## Task 6: Cancellation And Lock Integration
+## 任务 6：取消与锁集成
 
-**Files:**
-- Modify: `apps/api/src/agent/agent-message-coordinator.ts`
-- Modify: `apps/api/src/agent/agent-service.ts`
-- Test: `apps/api/test/agent/agent-message-coordinator.test.ts`
+**文件：**
+- 修改：`apps/api/src/agent/agent-message-coordinator.ts`
+- 修改：`apps/api/src/agent/agent-service.ts`
+- 测试：`apps/api/test/agent/agent-message-coordinator.test.ts`
 
-- [x] **Step 1: Write failing cancel/lock tests**
+- [x] **步骤 1：编写失败的取消/锁测试**
 
-Assert `cancelRun` writes cancellation store, queued worker skips cancelled runs, and duplicate worker execution cannot acquire the same run lock.
+断言 `cancelRun` 会写入取消存储、队列 Worker 会跳过已取消的运行，并且重复的 Worker 执行无法获取同一运行锁。
 
-- [x] **Step 2: Verify RED**
+- [x] **步骤 2：验证测试失败**
 
-Run targeted coordinator tests and expect failure.
+运行目标协调器测试，并预期失败。
 
-- [x] **Step 3: Implement cancel and lock checks**
+- [x] **步骤 3：实现取消和锁检查**
 
-Worker execution checks cancellation before execution, between iterations, and before final write. Run lock is acquired before executing and released in `finally`.
+Worker 执行会在执行前、迭代之间和最终写入前检查取消状态。运行锁在执行前获取，并在 `finally` 中释放。
 
-- [x] **Step 4: Verify GREEN**
+- [x] **步骤 4：验证测试通过**
 
-Run coordinator tests.
+运行协调器测试。
 
-## Task 7: Final Verification
+## 任务 7：最终验证
 
-**Files:**
-- All modified files
+**文件：**
+- 所有已修改文件
 
-- [x] **Step 1: Run targeted API tests**
+- [x] **步骤 1：运行目标 API 测试**
 
 ```bash
 npm run test -w @agent/api -- apps/api/test/config/env.test.ts apps/api/test/agent/agent-cancellation-store.test.ts apps/api/test/agent/agent-run-lock.test.ts apps/api/test/agent/agent-event-bus.test.ts apps/api/test/agent/agent-run-queue.test.ts apps/api/test/agent/agent-message-coordinator.test.ts apps/api/test/routes/agent-routes.test.ts
 ```
 
-- [x] **Step 2: Run typecheck**
+- [x] **步骤 2：运行类型检查**
 
 ```bash
 npm run typecheck -w @agent/api
 ```
 
-- [x] **Step 3: Run full API tests if time allows**
+- [x] **步骤 3：时间允许时运行完整 API 测试**
 
 ```bash
 npm run test -w @agent/api
 ```
 
-- [ ] **Step 4: Manual smoke**
+- [ ] **步骤 4：手动冒烟测试**
 
 ```bash
 docker compose up -d redis
 npm run dev
 ```
 
-Create a run from the UI and verify it completes. Cancel a long run and verify it is marked cancelled.
+从界面创建一次运行并验证它会完成。取消一次耗时较长的运行，并验证它被标记为已取消。
 
-Attempted on 2026-06-30, but the local Docker daemon was not running and `redis-server` was not installed on the machine. Automated coverage now includes queue enqueue/worker execution, Redis primitive contracts, cross-process event bus delivery, cancellation guard behavior, run locks, and `sql.js` multi-store file refresh.
+已于 2026-06-30 尝试执行，但本地 Docker 守护进程未运行，机器上也未安装 `redis-server`。自动化测试现已覆盖队列入队和 Worker 执行、Redis 基础能力契约、跨进程事件总线传递、取消守卫行为、运行锁，以及 `sql.js` 多存储实例文件刷新。

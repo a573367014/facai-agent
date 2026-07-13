@@ -19,6 +19,11 @@ type WebViteConfig = UserConfig & {
 const config = {
   envDir: workspaceRoot,
   plugins: [react()],
+  resolve: {
+    alias: {
+      "@": path.resolve(webRoot, "src")
+    }
+  },
   server: {
     port: 4000
   },

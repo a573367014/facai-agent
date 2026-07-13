@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ToolAccessPolicy } from "../../src/tools/access-policy.js";
-import { ToolExecutor } from "../../src/tools/executor.js";
-import { ToolRegistry } from "../../src/tools/registry.js";
+import { ToolAccessPolicy } from "../../src/modules/tools/access-policy.js";
+import { ToolExecutor } from "../../src/modules/tools/executor.js";
+import { ToolRegistry } from "../../src/modules/tools/registry.js";
 
 describe("ToolExecutor", () => {
   it("校验参数后执行工具并返回统一成功结果", async () => {
